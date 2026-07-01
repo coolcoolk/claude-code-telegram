@@ -47,5 +47,14 @@ graceful drain + relaunch (also placeholder-based).
 See `bridge/.env.example` for all keys — token, allowed users, optional Claude CLI path,
 session/timeout knobs, streaming cadence, and voice settings.
 
+## Authentication & Anthropic policy
+Run Claude Code with **API-key authentication** (Claude Console). As of 2026, Anthropic's
+terms do not permit using Free/Pro/Max **subscription OAuth** with the Agent SDK or
+third-party harnesses; programmatic use is governed by the Commercial Terms and draws from
+the Agent SDK credit pool. This project ships code only — you run it with your own account
+and your own API key. It does not proxy or resell access to anyone else's account.
+See Anthropic's [Agent SDK docs](https://code.claude.com/docs/en/agent-sdk/overview) and
+[Usage Policy](https://www.anthropic.com/legal/aup).
+
 ## License
 MIT — see [LICENSE](LICENSE). Originally built for the Dogany agent project.
