@@ -10,11 +10,11 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
 from dotenv import load_dotenv
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 
@@ -27,8 +27,11 @@ PACKAGE_ENV_PATH = PACKAGE_DIR / ".env"  # package default (lowest priority)
 def _find_dogany_env(start: Path) -> Optional[Path]:
     """Nearest ancestor .rules/.env -- shared cross-agent global config.
 
-    Agents nest at different depths (~/dogany/dev-agent vs ~/dogany/agents/<name>),
-    so resolve by walking up from PROJECT_ROOT rather than a fixed relative offset.
+    Agents may nest at different depths, so resolve by walking up from
+    PROJECT_ROOT rather than using a fixed relative offset. This shared file is
+    OPTIONAL: if absent (standalone repo), the agent's own .telegram_bot/.env is
+    sufficient -- the only key it typically carries is CLAUDE_CLI_PATH, which
+    otherwise defaults to a PATH lookup.
     """
     for d in (start, *start.parents):
         cand = d / ".rules" / ".env"
@@ -42,6 +45,13 @@ DOGANY_ENV_PATH = _find_dogany_env(PROJECT_ROOT)  # shared global fallback (may 
 LOGS_DIR = BOT_DATA_DIR / "logs"
 SESSION_STORE_PATH = BOT_DATA_DIR / "sessions.json"
 CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+
+# Born-locked ownership state files (see bridge/ownership.py). Plain text files
+# under BOT_DATA_DIR: a fresh bot with an empty allowed_user_ids is NOT open to
+# all -- it stays in claim mode until the first user claims it with a code.
+OWNER_LOCK_PATH = BOT_DATA_DIR / "owner.lock"
+CLAIM_CODE_PATH = BOT_DATA_DIR / "claim_code"
+CLAIMED_FLAG_PATH = BOT_DATA_DIR / ".claimed"
 
 _PLACEHOLDER_TOKENS = {"your_bot_token_here", ""}
 
@@ -73,7 +83,18 @@ class Config(BaseSettings):
     telegram_bot_token: str = Field(..., description="Telegram Bot API token")
     allowed_user_ids: List[int] = Field(
         default_factory=list,
-        description="Allowed Telegram user IDs (empty = allow all)",
+        description=(
+            "Allowed Telegram user IDs. When set, this list is AUTHORITATIVE and "
+            "claim mode is off. When empty, the bot is born-locked: it does NOT "
+            "allow all -- it stays in claim mode until claimed (see ownership.py)."
+        ),
+    )
+    extra_allowed_roots: Annotated[List[Path], NoDecode] = Field(
+        default_factory=list,
+        description=(
+            "Extra absolute roots the path guard treats as inside PROJECT_ROOT "
+            "(os.pathsep-separated absolute paths; empty = strict default)"
+        ),
     )
 
     # Claude CLI / settings
@@ -92,6 +113,10 @@ class Config(BaseSettings):
         description="Start a new session when the gap since the last user message "
         "exceeds this many hours. 0/false/off disables.",
     )
+
+    # Localization: user-facing string locale (env LOCALE). Only ko/en are
+    # recognized; anything else falls back to en. Read by bridge/i18n.
+    locale: str = Field(default="en")
 
     # Streaming
     draft_update_min_chars: int = Field(default=30)
@@ -132,6 +157,19 @@ class Config(BaseSettings):
             return [v]
         return v
 
+    @field_validator("extra_allowed_roots", mode="before")
+    @classmethod
+    def _parse_extra_roots(cls, v):
+        if isinstance(v, str):
+            if not v.strip():
+                return []
+            return [
+                Path(entry.strip()).expanduser().resolve()
+                for entry in v.split(os.pathsep)
+                if entry.strip()
+            ]
+        return v
+
     @field_validator("auto_new_session_after_hours", mode="before")
     @classmethod
     def _parse_auto_new(cls, v):
@@ -151,6 +189,13 @@ class Config(BaseSettings):
         if parsed <= 0:
             return None
         return parsed
+
+    @field_validator("locale", mode="before")
+    @classmethod
+    def _normalize_locale(cls, v):
+        # Only ko/en are supported; any other value (or empty) falls back to en.
+        value = str(v or "").strip().lower()
+        return value if value in {"ko", "en"} else "en"
 
     @field_validator("whisper_language", mode="before")
     @classmethod

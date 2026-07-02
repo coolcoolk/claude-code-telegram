@@ -2,7 +2,7 @@
 # self_restart.sh -- safe self-restart of the metal bridge with auto Telegram notify.
 #
 # Why: restarting the bridge severs the live claude session, so nobody is left
-# to tell 형님 "it came back". This detaches from the caller, SIGTERMs the bridge
+# to tell the user "it came back". This detaches from the caller, SIGTERMs the bridge
 # (launchd KeepAlive revives it with new code), waits until polling is REALLY up
 # (log marker, not just a live pid -> catches zombie-poll B2), then pushes a
 # Telegram message via push.sh on the metal bot. Optional --verify runs a
