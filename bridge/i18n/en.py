@@ -4,6 +4,10 @@ One entry per messages.py constant, keyed by the snake_case of the constant
 name. Values are RAW templates: any {placeholder}, command literal (e.g.
 /skills), or code-like token is preserved verbatim so call sites can .format().
 This is the canonical fallback catalog: every key MUST exist here.
+
+Model-facing prompts are NOT in this catalog. Anything sent to Claude (photo/doc
+prompts, resume continuation, system prompt fragment, tool denials) lives as
+plain English constants in bridge/messages.py and is never translated.
 """
 
 STRINGS = {
@@ -24,23 +28,22 @@ STRINGS = {
     ),
     # --- Commands ---
     "welcome": (
-        "Hello, {name}! Send a message to start chatting, or use /skills to view "
-        "available skills."
+        "Hello, {name}! Send a message to start chatting."
     ),
     "new_session": (
-        "Switched to new session mode. Your next message will start a new Claude "
-        "session."
+        "Switched to a new session."
     ),
-    "model_switched": "Switched to {label}",
-    "model_select": "Select Claude model:",
-    "model_switch_warning": (
-        "Note: switching the model starts a fresh conversation."
+    "model_switched": "Switched: {label}",
+    "model_select": (
+        "Select a Claude model:\n"
+        "Note: switching models starts a new session."
     ),
+    "model_switch_warning": "Note: switching models starts a new session.",
     "model_unknown": (
         "Unknown model '{name}'. Allowed models: {allowed}"
     ),
-    "stop_paused": "Paused",
-    "stop_nothing": "Nothing running",
+    "stop_paused": "Session stopped.",
+    "stop_nothing": "Nothing running.",
     "no_session": "No active session. Start a conversation first.",
     "task_terminated": "Task terminated.",
     # --- Help ---
@@ -49,7 +52,7 @@ STRINGS = {
         "/start - Start / greeting\n"
         "/new - Start a new session\n"
         "/stop - Stop the current run\n"
-        "/model - Switch model (restarts the conversation)\n"
+        "/model - Switch model (starts a new session)\n"
         "/resume - Resume a previous session\n"
         "/history - Show recent history\n"
         "/skills - List installed skills\n"
@@ -63,9 +66,9 @@ STRINGS = {
     "skills_header_project": "Project skills",
     "skills_header_global": "Global skills",
     # --- BotCommand menu descriptions ---
-    "cmd_desc_new": "New session",
+    "cmd_desc_new": "Start new session",
     "cmd_desc_stop": "Stop execution",
-    "cmd_desc_model": "Switch model",
+    "cmd_desc_model": "Switch model (new session)",
     "cmd_desc_resume": "Resume session",
     "cmd_desc_history": "View message history",
     "cmd_desc_skills": "List skills",
@@ -84,24 +87,6 @@ STRINGS = {
     # --- Slash command usage ---
     "usage_skill": "Usage: /skill <name> [args]",
     "usage_command": "Usage: /command <name> [args]",
-    # --- Inbound photo / document prompts (sent to Claude) ---
-    "photo_prompt_single": (
-        "The user sent a photo. Open the image file at the path below with the Read "
-        "tool, review it, and respond."
-    ),
-    "photo_prompt_path": "Image path: {path}",
-    "photo_prompt_album": (
-        "The user sent {count} photos at once (an album). Open all image files at "
-        "the paths below with the Read tool, review them together, and answer with a "
-        "single response."
-    ),
-    "photo_prompt_album_path": "Image {index} path: {path}",
-    "doc_prompt": (
-        "The user sent a file. Open the file at the path below with the Read tool, "
-        "review it, and respond."
-    ),
-    "doc_prompt_path": "File path: {path}",
-    "user_caption": "User caption: {caption}",
     # --- Options keyboard ---
     "select_prompt": "Please select:",
     "selected": "Selected: {choice}",
@@ -126,21 +111,13 @@ STRINGS = {
     "tap_to_continue": "Continue",
     "timeout_tap_notice": "Stopped on timeout. Tap to continue.",
     "resume_expired": (
-        "This button was already handled or has expired. Please request again if "
-        "needed."
+        "This button was already handled or has expired. Please request again."
     ),
     "resume_continuing": "Continuing...",
     "still_working": (
-        "This is taking a little while -- still working. I'll continue "
-        "automatically, one moment."
+        "Taking a little while. Still working, continuing automatically."
     ),
     "resume_failed": "Resume failed: {error}",
-    "resume_continuation_prompt": (
-        "The previous task was interrupted once by a time limit. "
-        "Continue from where it stopped. "
-        "Do not start over; skip what is already done and finish only the "
-        "remaining work."
-    ),
     # --- Voice ---
     "voice_too_long": "Voice message is too long. Max duration is {seconds} seconds.",
     "voice_download_failed": "Failed to download your voice message. Please retry.",
@@ -173,43 +150,5 @@ STRINGS = {
     "proactive_turn_failed": (
         "A background turn ended without a reply (model overloaded or an API error "
         "after retries). Nothing was delivered - please ask again."
-    ),
-    # --- System prompt fragment (sent to Claude, English on purpose) ---
-    "system_prompt": (
-        "\n\n## User Questions and Choices\n\n"
-        "The AskUserQuestion tool is NOT available in this environment. "
-        "When you need to ask the user a question with multiple choice options:\n"
-        "1. Output the question and context clearly\n"
-        "2. List options with numbers (1., 2., 3., ...)\n"
-        "3. STOP and WAIT for the user's response\n"
-        "4. Do NOT continue execution or make assumptions\n"
-        "5. Do NOT try to use the AskUserQuestion tool\n\n"
-        "## Sending Images and Files\n\n"
-        "When the user asks you to send/show/deliver an image or file, do NOT read it "
-        "with the Read tool. Instead, output a line that starts with 'send_file::' "
-        "followed by the absolute path. One file per line. The system detects these "
-        "lines and sends the files to the user.\n"
-        "Example: send_file:: /path/to/image.png\n"
-        "Supported image formats: .png, .jpg, .jpeg, .gif, .webp; other files are sent "
-        "as documents. After generating a file, always include its send_file:: line."
-    ),
-    # --- Denials returned to Claude (English on purpose) ---
-    "ask_user_question_deny": (
-        "AskUserQuestion is not available in this environment. "
-        "Do NOT mention this to the user. Instead, output the question followed by "
-        "numbered options (1., 2., 3., ...), then STOP and WAIT for the user's choice. "
-        "The system converts the numbered options into clickable buttons."
-    ),
-    "outside_path_deny": (
-        "Detected access to paths outside PROJECT_ROOT. Requires confirmation.\n"
-        "{preview}\n"
-        "Output these two options to the user and wait for a reply:\n"
-        "1. {allow_token} (Allow this external path access)\n"
-        "2. {deny_token} (Deny)"
-    ),
-    "outside_path_deny_no_confirm": (
-        "Access to a protected or out-of-root path was denied. This is a "
-        "background turn with no user available to confirm it. Skip this path or "
-        "ask the user directly in their next message."
     ),
 }

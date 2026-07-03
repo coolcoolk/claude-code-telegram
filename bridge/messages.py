@@ -11,6 +11,11 @@ and bridge/i18n/ko.py; the active locale comes from config.config.locale
 To add or change a string: edit the i18n catalogs (add the same key to both
 en.py and ko.py), then add a matching constant here. Constant names and count
 must stay in parity with the catalog keys.
+
+EXCEPTION -- model-facing strings: anything sent to Claude (photo/doc prompts,
+resume continuation, system prompt fragment, tool denials) is NOT i18n. It is
+defined here directly as a plain English constant, single source, never
+translated. Keep them short, direct, imperative.
 """
 
 from bridge.i18n import t
@@ -57,14 +62,21 @@ CMD_DESC_HELP = t("cmd_desc_help")
 USAGE_SKILL = t("usage_skill")
 USAGE_COMMAND = t("usage_command")
 
-# --- Inbound photo / document prompts (sent to Claude) ---
-PHOTO_PROMPT_SINGLE = t("photo_prompt_single")
-PHOTO_PROMPT_PATH = t("photo_prompt_path")
-PHOTO_PROMPT_ALBUM = t("photo_prompt_album")
-PHOTO_PROMPT_ALBUM_PATH = t("photo_prompt_album_path")
-DOC_PROMPT = t("doc_prompt")
-DOC_PROMPT_PATH = t("doc_prompt_path")
-USER_CAPTION = t("user_caption")
+# --- Inbound photo / document prompts (model-facing, English only) ---
+PHOTO_PROMPT_SINGLE = (
+    "User sent a photo. Read the image file at the path below, then respond."
+)
+PHOTO_PROMPT_PATH = "Image path: {path}"
+PHOTO_PROMPT_ALBUM = (
+    "User sent {count} photos as one album. Read ALL image files at the paths "
+    "below, consider them together, answer in ONE response."
+)
+PHOTO_PROMPT_ALBUM_PATH = "Image {index} path: {path}"
+DOC_PROMPT = (
+    "User sent a file. Read the file at the path below, then respond."
+)
+DOC_PROMPT_PATH = "File path: {path}"
+USER_CAPTION = "User caption: {caption}"
 
 # --- Resume (session history) ---
 NO_SESSION_HISTORY = t("no_session_history")
@@ -102,8 +114,12 @@ RESUME_CONTINUING = t("resume_continuing")
 STILL_WORKING = t("still_working")
 RESUME_FAILED = t("resume_failed")
 
-# A4 continuation prompt re-issued to Claude on resume.
-RESUME_CONTINUATION_PROMPT = t("resume_continuation_prompt")
+# A4 continuation prompt re-issued to Claude on resume (model-facing).
+RESUME_CONTINUATION_PROMPT = (
+    "Previous task was cut off by a time limit. Continue from where it "
+    "stopped. Do NOT start over. Skip parts already done, finish only the "
+    "remaining work."
+)
 
 # --- Voice ---
 VOICE_TOO_LONG = t("voice_too_long")
@@ -124,15 +140,47 @@ GENERIC_ERROR = t("generic_error")
 OUTAGE_RECOVERED = t("outage_recovered")
 PROACTIVE_TURN_FAILED = t("proactive_turn_failed")
 
-# --- System prompt fragment (sent to Claude, English on purpose) ---
-SYSTEM_PROMPT = t("system_prompt")
+# --- System prompt fragment (model-facing, English only) ---
+SYSTEM_PROMPT = (
+    "\n\n## User Questions and Choices\n\n"
+    "The AskUserQuestion tool is NOT available in this environment. "
+    "When you need to ask the user a question with multiple choice options:\n"
+    "1. Output the question and context clearly\n"
+    "2. List options with numbers (1., 2., 3., ...)\n"
+    "3. STOP and WAIT for the user's response\n"
+    "4. Do NOT continue execution or make assumptions\n"
+    "5. Do NOT try to use the AskUserQuestion tool\n\n"
+    "## Sending Images and Files\n\n"
+    "When the user asks you to send/show/deliver an image or file, do NOT read it "
+    "with the Read tool. Instead, output a line that starts with 'send_file::' "
+    "followed by the absolute path. One file per line. The system detects these "
+    "lines and sends the files to the user.\n"
+    "Example: send_file:: /path/to/image.png\n"
+    "Supported image formats: .png, .jpg, .jpeg, .gif, .webp; other files are sent "
+    "as documents. After generating a file, always include its send_file:: line."
+)
 
 # Denial message returned to Claude when it tries AskUserQuestion.
-ASK_USER_QUESTION_DENY = t("ask_user_question_deny")
+ASK_USER_QUESTION_DENY = (
+    "AskUserQuestion is not available in this environment. "
+    "Do NOT mention this to the user. Instead, output the question followed by "
+    "numbered options (1., 2., 3., ...), then STOP and WAIT for the user's choice. "
+    "The system converts the numbered options into clickable buttons."
+)
 
 # Denial message returned to Claude when an out-of-root path is detected.
-OUTSIDE_PATH_DENY = t("outside_path_deny")
+OUTSIDE_PATH_DENY = (
+    "Detected access to paths outside PROJECT_ROOT. Requires confirmation.\n"
+    "{preview}\n"
+    "Output these two options to the user and wait for a reply:\n"
+    "1. {allow_token} (Allow this external path access)\n"
+    "2. {deny_token} (Deny)"
+)
 
 # Denial returned to Claude for a protected/out-of-root path on a no-pending
 # (background/proactive) turn, where no interactive confirm is possible.
-OUTSIDE_PATH_DENY_NO_CONFIRM = t("outside_path_deny_no_confirm")
+OUTSIDE_PATH_DENY_NO_CONFIRM = (
+    "Access to a protected or out-of-root path was denied. This is a "
+    "background turn with no user available to confirm it. Skip this path or "
+    "ask the user directly in their next message."
+)
