@@ -17,6 +17,9 @@ phone — streaming replies, voice input, inline approvals, and resilient long-r
 - Self-restart script (graceful drain + relaunch + completion ping).
 - Media/album handling and message formatting for Telegram.
 - Timeout resilience (guaranteed notification instead of silent stalls).
+- `/usage` command (optional): runs a project-side `routines/claude-usage.sh`
+  and posts its report. Not bundled here — supply the script to enable it;
+  otherwise the command replies with a graceful "script not found" notice.
 
 ## Requirements
 - Claude Code CLI installed and on PATH (`claude`).
