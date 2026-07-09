@@ -19,12 +19,19 @@
 #   self_restart.sh --reason "..." --dry-run        # no kill; exercises notify path only
 #
 # Flags:
-#   --reason TEXT   (required) shown in the notify message
+#   --reason TEXT   (required) technical reason; shown in the notify message
+#                   only when --notice is absent, always kept in the worker log
+#   --notice TEXT   (optional) user-facing notify body in the agent's persona
+#                   voice. When set, the success notify is "PREFIX NOTICE" --
+#                   no pid, no technical reason. For a version-update restart,
+#                   compose it release-note style (what changed for the user,
+#                   not dev jargon). Failure notify always stays technical.
 #   --verify PROMPT (optional) headless claude -p after restart; output appended to notify
 #   --model NAME    (optional) model for --verify (default haiku)
 #   --delay N       (optional) seconds before SIGTERM, lets the current turn flush (default 6)
 #   --label LABEL   (optional) launchd label (default com.telegram-skill-bot.telegram-agent)
 #   --env PATH      (optional) agent bot .env for push.sh (default workspace .telegram_bot/.env)
+#   --prefix TEXT   (optional) prefix in notify messages (default: [agent])
 #   --dry-run       (optional) skip the kill; test the wait+notify wiring
 #
 # Exit codes: 0 restarted+polling up / 2 came back but polling marker missing / 3 setup error
@@ -32,6 +39,7 @@ set -euo pipefail
 
 LABEL="com.telegram-skill-bot.telegram-agent"
 REASON=""
+NOTICE=""
 VERIFY=""
 MODEL="haiku"
 DELAY=6
@@ -39,17 +47,20 @@ ENV_FILE="__PROJECT_ROOT__/.telegram_bot/.env"
 PUSH="__PROJECT_ROOT__/routines/push.sh"
 MARKER_LOG="__PROJECT_ROOT__/.telegram_bot/logs/bot.log"
 POLL_MARKER="Bot is running"
+PREFIX="[agent]"
 DRY_RUN=""
 WORKER=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reason)  REASON="$2"; shift 2 ;;
+    --notice)  NOTICE="$2"; shift 2 ;;
     --verify)  VERIFY="$2"; shift 2 ;;
     --model)   MODEL="$2"; shift 2 ;;
     --delay)   DELAY="$2"; shift 2 ;;
     --label)   LABEL="$2"; shift 2 ;;
     --env)     ENV_FILE="$2"; shift 2 ;;
+    --prefix)  PREFIX="$2"; shift 2 ;;
     --dry-run) DRY_RUN="true"; shift 1 ;;
     --_worker) WORKER="true"; shift 1 ;;
     *) echo "unknown arg: $1" >&2; exit 3 ;;
@@ -97,7 +108,8 @@ EOF
 # ---- Detach: re-exec ourselves in a new session so killing the bridge does not
 # take this worker (or the caller's claude session) down with it. ----
 if [[ -z "$WORKER" ]]; then
-  ARGS=(--_worker --reason "$REASON" --model "$MODEL" --delay "$DELAY" --label "$LABEL" --env "$ENV_FILE")
+  ARGS=(--_worker --reason "$REASON" --model "$MODEL" --delay "$DELAY" --label "$LABEL" --env "$ENV_FILE" --prefix "$PREFIX")
+  [[ -n "$NOTICE" ]]  && ARGS+=(--notice "$NOTICE")
   [[ -n "$VERIFY" ]]  && ARGS+=(--verify "$VERIFY")
   [[ -n "$DRY_RUN" ]] && ARGS+=(--dry-run)
   # Resolve $0 to an absolute path BEFORE re-exec. If invoked as a bare relative
@@ -109,7 +121,7 @@ if [[ -z "$WORKER" ]]; then
   # (macOS has no setsid; this is the same pattern used for prior safe restarts.)
   nohup "$SELF" "${ARGS[@]}" >>"__PROJECT_ROOT__/.telegram_bot/logs/self_restart.log" 2>&1 &
   disown 2>/dev/null || true
-  echo "[self_restart] detached worker (pid $!), restart in ${DELAY}s; you will be notified on the metal bot."
+  echo "[self_restart] detached worker (pid $!), restart in ${DELAY}s; you will be notified on the agent bot."
   exit 0
 fi
 
@@ -155,10 +167,15 @@ if [[ -n "$VERIFY" && -z "$DRY_RUN" ]]; then
 fi
 
 # ---- Notify ----
-PREFIX="[agent]"
 if [[ -n "$POLL_UP" ]]; then
-  MSG="${PREFIX} Restart complete: ${REASON}
+  if [[ -n "$NOTICE" ]]; then
+    # Persona notify: user-facing body only; pid/reason stay in this worker
+    # log (echoed at worker start + done lines).
+    MSG="${PREFIX} ${NOTICE}"
+  else
+    MSG="${PREFIX} Restart complete: ${REASON}
 pid ${OLD_PID:-?} -> ${NEW_PID:-?}, polling up."
+  fi
   [[ -n "$DRY_RUN" ]] && MSG="${PREFIX} [DRY-RUN] notify path ok: ${REASON}"
   [[ -n "$VERIFY_OUT" ]] && MSG="${MSG}
 Verify: ${VERIFY_OUT}"
@@ -167,7 +184,7 @@ Verify: ${VERIFY_OUT}"
   echo "[$(date '+%F %T')] done OK new_pid=${NEW_PID}"
   exit 0
 else
-  notify "[agent] WARNING restart anomaly: ${REASON}
+  notify "${PREFIX} WARNING restart anomaly: ${REASON}
 new pid=${NEW_PID:-none} up but '${POLL_MARKER}' marker not seen within 60s (zombie-poll suspected). Check required."
   echo "[$(date '+%F %T')] WARN polling marker missing new_pid=${NEW_PID:-none}" >&2
   exit 2
