@@ -87,6 +87,13 @@ MAX_RAPID_CRASHES = 5
 CONFLICT_BACKOFF_BASE = 5  # seconds, base backoff before re-initializing polling
 CONFLICT_BACKOFF_MAX = 30  # seconds, cap for incremental backoff
 CONFLICT_SUSTAINED_SECONDS = 300  # log an error if conflict persists past this
+# After this many seconds of unresolved conflict, switch the retry cadence from
+# linear (CONFLICT_BACKOFF_BASE -> CONFLICT_BACKOFF_MAX) to pure exponential
+# starting from CONFLICT_BACKOFF_MAX and doubling up to CONFLICT_BACKOFF_EXPO_CAP.
+# One ERROR line is emitted on the first entry into this mode; subsequent retries
+# are silent until the conflict clears.
+CONFLICT_BACKOFF_EXPONENTIAL_AFTER = 600  # 10 minutes
+CONFLICT_BACKOFF_EXPO_CAP = 300  # 5 minutes, cap for exponential backoff
 # In-process getUpdates heartbeat stall detection (layer 1; layer 2 is the
 # external bridge/watchdog.sh). The heartbeat beats on every getUpdates round
 # trip (success or transport timeout); silence past the threshold means the
@@ -221,6 +228,10 @@ class TelegramBot:
         # First wall-clock time of an ongoing Conflict streak; reset on recovery.
         conflict_since: Optional[float] = None
         conflict_backoff = CONFLICT_BACKOFF_BASE
+        # Set to True the first time we cross CONFLICT_BACKOFF_EXPONENTIAL_AFTER
+        # seconds of sustained conflict; used to gate the one-time ERROR log entry
+        # that announces the switch to the slow exponential cadence.
+        conflict_in_exponential: bool = False
         # Drop pending updates ONLY on the very first polling start of this
         # process. In-process re-inits (PollingRestart/Conflict) must NOT drop
         # -- messages sent during the gap would be lost silently.
@@ -297,10 +308,25 @@ class TelegramBot:
                     # treat it as a fresh streak (prior contention had recovered).
                     conflict_since = None
                     conflict_backoff = CONFLICT_BACKOFF_BASE
+                    conflict_in_exponential = False
                 if conflict_since is None:
                     conflict_since = time.time()
                 elapsed = time.time() - conflict_since
-                if elapsed >= CONFLICT_SUSTAINED_SECONDS:
+                if elapsed >= CONFLICT_BACKOFF_EXPONENTIAL_AFTER:
+                    # Sustained past the slow-backoff threshold: switch to
+                    # exponential cadence starting from the linear cap. One ERROR
+                    # line on first entry; subsequent retries are silent.
+                    if not conflict_in_exponential:
+                        conflict_in_exponential = True
+                        conflict_backoff = CONFLICT_BACKOFF_MAX
+                        logger.error(
+                            "getUpdates Conflict sustained for %ds; another instance "
+                            "still holds this bot token -- switching to slow "
+                            "exponential backoff (cap %ds)",
+                            int(elapsed), CONFLICT_BACKOFF_EXPO_CAP,
+                        )
+                    # No further log lines while in exponential mode.
+                elif elapsed >= CONFLICT_SUSTAINED_SECONDS:
                     logger.error(
                         "getUpdates Conflict sustained for %ds; another instance "
                         "still holds this bot token", int(elapsed)
@@ -312,11 +338,15 @@ class TelegramBot:
                     )
                 await self._graceful_shutdown(force=True)
                 await asyncio.sleep(conflict_backoff)
-                conflict_backoff = min(CONFLICT_BACKOFF_MAX, conflict_backoff * 2)
+                if conflict_in_exponential:
+                    conflict_backoff = min(CONFLICT_BACKOFF_EXPO_CAP, conflict_backoff * 2)
+                else:
+                    conflict_backoff = min(CONFLICT_BACKOFF_MAX, conflict_backoff * 2)
                 continue
             except PollingRestart:
                 conflict_since = None
                 conflict_backoff = CONFLICT_BACKOFF_BASE
+                conflict_in_exponential = False
                 uptime = time.time() - start_time
                 if uptime < MIN_UPTIME:
                     rapid_crash_count += 1
@@ -334,6 +364,7 @@ class TelegramBot:
                 # Clean exit of the wait loop (stop requested): reset conflict state.
                 conflict_since = None
                 conflict_backoff = CONFLICT_BACKOFF_BASE
+                conflict_in_exponential = False
             finally:
                 if watchdog_task and not watchdog_task.done():
                     watchdog_task.cancel()
@@ -471,6 +502,14 @@ class TelegramBot:
         try:
             if not force:
                 await asyncio.wait_for(self._do_graceful_stop(), timeout=5.0)
+            else:
+                # Force path: skip updater/application stop (the application may
+                # not be in a started state), but ALWAYS call shutdown() so the
+                # underlying HTTPXRequest/httpx.AsyncClient instances are closed.
+                # Without this, each conflict retry leaks two AsyncClient objects
+                # (one for request, one for get_updates_request), causing fd
+                # exhaustion under sustained token contention (DGN-330).
+                await self.application.shutdown()
         except (asyncio.TimeoutError, Exception):
             logger.warning("Graceful shutdown issue, forcing cleanup")
         finally:
