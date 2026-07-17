@@ -4,15 +4,15 @@
 #
 # Cross-platform (macOS + Linux). The live section needs the Claude Code OAuth
 # credential, which is resolved from the first available source:
-#   1. macOS Keychain   (service "Claude Code-credentials", via `security`)
-#   2. Plain file       (~/.claude/.credentials.json -- Linux default)
+#   1. Plain file       (~/.claude/.credentials.json -- written by `claude login`)
+#   2. macOS Keychain   (service "Claude Code-credentials", via `security`)
 #   3. libsecret        (secret-tool lookup, best-effort Linux fallback)
 # All three yield the same JSON shape: {"claudeAiOauth":{"accessToken":"..."}}.
 #
 # Dependencies: bash, curl, python3 (stdlib only). No jq required.
 #
 # Usage: claude-usage.sh [--full]   (default: live-only)
-# Exit codes: 0 ok / 1 no data
+# Exit codes: 0 ok / 1 live lookup failed or no cache data (with --full)
 #
 # The bridge passes LOCALE=<ko|en> in the environment so labels match the UI.
 
@@ -33,64 +33,78 @@ CACHE_FILE="${HOME}/.claude/stats-cache.json"
 # SECTION 1: LIVE RATE-LIMIT (from Anthropic API)
 # ============================================================
 
-_live_token=""
 _live_err=""
+_access_token=""
 
-# Resolve the credential JSON from the first available source (cross-platform).
-# The raw JSON value stays in a variable only -- never echoed, never written
-# except into a python3 heredoc via stdin.
-_resolve_cred() {
-  local _v _f
-  # 1) macOS Keychain
-  if command -v security >/dev/null 2>&1; then
-    if _v=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) \
-       && [[ -n "$_v" ]]; then
-      printf '%s' "$_v"
-      return 0
-    fi
-  fi
-  # 2) Plain credentials file (Linux default; also possible on macOS)
-  _f="${HOME}/.claude/.credentials.json"
-  if [[ -f "$_f" && -s "$_f" ]]; then
-    cat "$_f"
-    return 0
-  fi
-  # 3) libsecret / secret-tool (best-effort Linux fallback)
-  if command -v secret-tool >/dev/null 2>&1; then
-    if _v=$(secret-tool lookup service "Claude Code-credentials" 2>/dev/null) \
-       && [[ -n "$_v" ]]; then
-      printf '%s' "$_v"
-      return 0
-    fi
-  fi
-  return 1
-}
-
-if ! _live_token=$(_resolve_cred); then
-  _live_err="No Claude Code credentials found (checked macOS Keychain, ~/.claude/.credentials.json, secret-tool)"
-fi
-
-if [[ -z "$_live_err" && -z "$_live_token" ]]; then
-  _live_err="Credential value is empty"
-fi
-
-if [[ -z "$_live_err" ]]; then
-  # Extract accessToken from JSON via python3 (token value never written to file or echoed)
-  _access_token=$(python3 -c "
+# _extract_token <json_string> -> prints accessToken to stdout.
+# Exits 2 if token is absent, 3 if token is expired, 1 on parse error.
+# Never echoes the token value in errors.
+_extract_token() {
+  python3 -c "
 import json, sys
+from datetime import datetime, timezone
 raw = sys.stdin.read()
 try:
     d = json.loads(raw)
-    t = d.get('claudeAiOauth', {}).get('accessToken', '')
+    oauth = d.get('claudeAiOauth', {})
+    t = oauth.get('accessToken', '')
     if not t:
         sys.exit(2)
+    exp = oauth.get('expiresAt', '')
+    if exp:
+        try:
+            if isinstance(exp, (int, float)):
+                exp_dt = datetime.fromtimestamp(exp / 1000.0, tz=timezone.utc)
+            else:
+                exp_dt = datetime.fromisoformat(str(exp).replace('Z', '+00:00'))
+            if exp_dt <= datetime.now(timezone.utc):
+                sys.exit(3)  # expired
+        except Exception:
+            pass  # unparseable expiry: treat as non-expired (best effort)
     print(t, end='')
 except Exception:
     sys.exit(1)
-" <<< "$_live_token") || {
-    _live_err="Failed to extract accessToken from credential JSON"
+" <<< "$1"
+}
+
+# Expiry-aware token selection: try each credential source in order; skip any
+# source whose token is expired (exit 3) and fall through to the next.
+# Cross-platform: file -> macOS Keychain -> libsecret (Linux fallback).
+_live_token=""
+_f="${HOME}/.claude/.credentials.json"
+
+# 1) Plain credentials file
+if [[ -f "$_f" && -s "$_f" ]]; then
+  _live_token=$(cat "$_f")
+  if _access_token=$(_extract_token "$_live_token"); then
+    : # valid -- use it
+  elif [[ $? -eq 3 ]]; then
+    _live_token=""  # expired -- fall through to next source
     _access_token=""
-  }
+  else
+    _live_token=""
+    _access_token=""
+  fi
+fi
+
+# 2) macOS Keychain (fallback when file is absent or expired)
+if [[ -z "$_access_token" ]] && command -v security >/dev/null 2>&1; then
+  if _live_token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) \
+     && [[ -n "$_live_token" ]]; then
+    _access_token=$(_extract_token "$_live_token") || _access_token=""
+  fi
+fi
+
+# 3) libsecret / secret-tool (best-effort Linux fallback)
+if [[ -z "$_access_token" ]] && command -v secret-tool >/dev/null 2>&1; then
+  if _live_token=$(secret-tool lookup service "Claude Code-credentials" 2>/dev/null) \
+     && [[ -n "$_live_token" ]]; then
+    _access_token=$(_extract_token "$_live_token") || _access_token=""
+  fi
+fi
+
+if [[ -z "$_access_token" ]]; then
+  _live_err="No Claude Code credentials found (checked ~/.claude/.credentials.json, macOS Keychain, secret-tool)"
 fi
 
 if [[ -z "$_live_err" && -z "${_access_token:-}" ]]; then
@@ -223,6 +237,7 @@ else
   echo "  [Live Rate-Limit] live lookup failed (${_live_err})"
   echo "=================================================="
   _access_token=""
+  exit 1
 fi
 
 # ============================================================
