@@ -121,6 +121,14 @@ class Config(BaseSettings):
     # Streaming
     draft_update_min_chars: int = Field(default=30)
     draft_update_interval: float = Field(default=1.0)
+    # C-strict interim-narration suppression (DGN-426).
+    # When False (default), only the terminal AssistantMessage (stop_reason=end_turn)
+    # is live-streamed to the user; interim between-tool narration is suppressed and
+    # the typing indicator remains the only feedback during those phases.
+    # Set STREAM_INTERIM=true in .env to restore the pre-DGN-426 behavior (all
+    # AssistantMessage TextBlocks displayed live). User-facing agents should leave
+    # this at the default (False).
+    stream_interim: bool = Field(default=False)
 
     # Voice (local faster-whisper only)
     transcription_provider: str = Field(default="local")
@@ -236,6 +244,9 @@ BRIDGE_SCAFFOLD_GUARD = os.getenv("BRIDGE_SCAFFOLD_GUARD", "1").strip().lower() 
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH") or (
     str(config.claude_cli_path) if config.claude_cli_path else None
 )
+# DGN-426: expose as module-level constant so sdk_bridge.py can import once
+# rather than reaching into the Config object on every message.
+STREAM_INTERIM: bool = config.stream_interim
 
 
 def setup_logging() -> None:
