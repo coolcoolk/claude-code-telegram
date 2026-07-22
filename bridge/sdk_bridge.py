@@ -365,7 +365,12 @@ class SdkBridge:
         try:
             await asyncio.wait_for(state.client.disconnect(), timeout=3.0)
         except Exception as e:
-            logger.error("Error disconnecting client for user %s: %s", user_id, e)
+            logger.error(
+                "Error disconnecting client for user %s: %s (%s)",
+                user_id,
+                e or "<empty>",
+                type(e).__name__,
+            )
             self._force_kill_client_subprocess(state.client, user_id)
         return True
 
@@ -384,14 +389,38 @@ class SdkBridge:
             if pid is None or getattr(proc, "returncode", None) is not None:
                 return
             try:
-                os.kill(pid, signal.SIGKILL)
-                logger.warning(
-                    "Force-killed orphan CLI subprocess pid=%s for user %s",
-                    pid,
-                    user_id,
-                )
+                pgid = os.getpgid(pid)
+                own_pgid = os.getpgid(os.getpid())
+                if pgid != own_pgid:
+                    # Kill the entire process group so zsh session-leader
+                    # wrappers (PPID=1 orphans) are reaped together with the
+                    # CLI child.  Guard prevents bridge from killing itself.
+                    os.killpg(pgid, signal.SIGKILL)
+                    logger.warning(
+                        "Force-killed orphan CLI process group pgid=%s (pid=%s) for user %s",
+                        pgid,
+                        pid,
+                        user_id,
+                    )
+                else:
+                    # pgid matches bridge's own group -- fall back to single-pid
+                    # kill to avoid killing the bridge process group.
+                    os.kill(pid, signal.SIGKILL)
+                    logger.warning(
+                        "Force-killed orphan CLI subprocess pid=%s (shared pgid=%s, single-pid fallback) for user %s",
+                        pid,
+                        pgid,
+                        user_id,
+                    )
             except ProcessLookupError:
                 pass
+            except PermissionError as e:
+                logger.error(
+                    "Permission denied force-killing CLI subprocess pid=%s for user %s: %s",
+                    pid,
+                    user_id,
+                    e,
+                )
         except Exception as e:  # noqa: BLE001 - teardown fallback must never raise
             logger.error(
                 "Failed to force-kill CLI subprocess for user %s: %s", user_id, e
@@ -527,6 +556,9 @@ class SdkBridge:
             if state.typing_task and not state.typing_task.done():
                 state.typing_task.cancel()
             self._streams.pop(user_id, None)
+            # FixC: reader_loop crash path did not clean up the CLI subprocess.
+            # Force-kill here so the orphan does not outlive the session.
+            self._force_kill_client_subprocess(state.client, user_id)
             pending_copy = list(state.pending)
             state.pending.clear()
             for req in pending_copy:
