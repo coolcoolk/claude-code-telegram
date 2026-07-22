@@ -48,6 +48,7 @@ from bridge import ownership
 from bridge.formatting import (
     IMAGE_EXTS,
     code_segment_html,
+    escape_legacy_markdown_brackets,
     resolve_send_paths,
     split_into_segments,
     split_paths_by_scope,
@@ -105,6 +106,16 @@ STALL_STREAK_SUSPECT = 3  # more consecutive stall restarts than this -> CRITICA
 # media_group_id. Buffer same-group photos for this debounce window, then flush
 # them as a single task. 1.5s >> real album inter-arrival (~100ms), big margin.
 MEDIA_GROUP_DEBOUNCE = 1.5
+# Telegram splits a single long message at the 4096-char limit into N separate
+# text updates, delivered back-to-back. A message at/above this length is a
+# split-boundary candidate: buffer it and wait SPLIT_MERGE_WINDOW seconds for the
+# continuation in the same chat, then dispatch all parts as ONE turn. Short
+# messages never enter this path (zero-delay preserved). If a follow-up part is
+# itself boundary-length, the window is extended so 3+ part splits merge too.
+# Accepted false-positive: an unrelated message arriving inside the window after
+# a boundary-length message is merged -- negligible, not defended against.
+SPLIT_MERGE_THRESHOLD = 4000
+SPLIT_MERGE_WINDOW = 3.0
 # An out-of-root / protected-path one-time approval expires this many seconds
 # after the deny prompt was shown, so a stale grant can never authorize a much
 # later call (F7 hardening).
@@ -170,6 +181,11 @@ class TelegramBot:
         # media_group_id -> buffered album state, flushed as one task.
         self._media_groups: Dict[str, dict] = {}
         self._media_group_lock = asyncio.Lock()
+        # chat_id -> buffered split-message state (DGN-351). A boundary-length
+        # (>= SPLIT_MERGE_THRESHOLD) text opens a merge window; continuation parts
+        # in the same chat are concatenated and flushed as one turn.
+        self._split_buffers: Dict[int, dict] = {}
+        self._split_buffer_lock = asyncio.Lock()
         # Inbound documents land here: files worth keeping (PDF, code, data).
         # Kept indefinitely (not pruned by cleanup).
         self._inbox_dir = PROJECT_ROOT / "files" / "inbox"
@@ -1361,6 +1377,21 @@ class TelegramBot:
 
         await self._maybe_capture_outside_approval(user_id, text)
 
+        # DGN-351: Telegram splits a long owner message at 4096 chars into
+        # back-to-back updates. A boundary-length part opens a merge window in
+        # the same chat; continuation parts are concatenated and dispatched as
+        # ONE turn. Short messages skip this entirely (zero-delay unchanged).
+        chat_id = message.chat_id
+        if await self._maybe_buffer_split_part(chat_id, update, user_id, text):
+            return
+
+        await self._dispatch_text_task(update, user_id, text)
+
+    async def _dispatch_text_task(
+        self, update: Update, user_id: int, text: str
+    ) -> None:
+        message = update.message
+
         async def run_task() -> None:
             await self._process_user_message_text(update, user_id, text)
 
@@ -1368,6 +1399,99 @@ class TelegramBot:
             await message.reply_text(messages.QUEUE_BUSY)
 
         await self._enqueue_user_task(user_id, run_task, on_overflow)
+
+    async def _maybe_buffer_split_part(
+        self, chat_id: int, update: Update, user_id: int, text: str
+    ) -> bool:
+        """Conditional split-message merge (DGN-351).
+
+        Returns True when the part was buffered (caller must NOT dispatch);
+        False when the message takes the normal zero-delay path.
+
+        A boundary-length (>= SPLIT_MERGE_THRESHOLD) message either opens a new
+        merge window or continues an open one. A short message that arrives while
+        a window is open is treated as the final continuation part: it is appended
+        and the buffer flushes immediately. A short message with no open window
+        takes the normal path (returns False) -- latency untouched.
+        """
+        is_boundary = len(text) >= SPLIT_MERGE_THRESHOLD
+        async with self._split_buffer_lock:
+            buf = self._split_buffers.get(chat_id)
+            if buf is None:
+                if not is_boundary:
+                    # Common case: short message, no open window -> zero delay.
+                    return False
+                # Open a new window on the first boundary-length part.
+                buf = {
+                    "user_id": user_id,
+                    "update": update,
+                    "parts": [text],
+                    "timer": None,
+                }
+                self._split_buffers[chat_id] = buf
+                buf["timer"] = asyncio.create_task(
+                    self._flush_split_buffer_after(chat_id)
+                )
+                logger.info(
+                    "split-merge: opened window chat=%s part1_len=%d",
+                    chat_id,
+                    len(text),
+                )
+                return True
+            # A window is already open: append this part.
+            buf["parts"].append(text)
+            if buf["timer"] is not None:
+                buf["timer"].cancel()
+            if is_boundary:
+                # Another boundary-length part: more may follow. Extend the window.
+                buf["timer"] = asyncio.create_task(
+                    self._flush_split_buffer_after(chat_id)
+                )
+                logger.info(
+                    "split-merge: extended window chat=%s parts=%d last_len=%d",
+                    chat_id,
+                    len(buf["parts"]),
+                    len(text),
+                )
+                return True
+            # Short continuation: this is the tail. Flush now.
+            self._split_buffers.pop(chat_id, None)
+            merged = "".join(buf["parts"])
+            dispatch_update = buf["update"]
+            dispatch_user_id = buf["user_id"]
+            n_parts = len(buf["parts"])
+        logger.info(
+            "split-merge: flushed chat=%s parts=%d merged_len=%d (tail)",
+            chat_id,
+            n_parts,
+            len(merged),
+        )
+        await self._dispatch_text_task(dispatch_update, dispatch_user_id, merged)
+        return True
+
+    async def _flush_split_buffer_after(self, chat_id: int) -> None:
+        """Wait out the merge window; a newer part cancels us and restarts a
+        timer. When we win, pop the buffer and dispatch the concatenated parts
+        as one turn."""
+        try:
+            await asyncio.sleep(SPLIT_MERGE_WINDOW)
+        except asyncio.CancelledError:
+            return
+        async with self._split_buffer_lock:
+            buf = self._split_buffers.pop(chat_id, None)
+            if not buf or not buf["parts"]:
+                return
+            merged = "".join(buf["parts"])
+            dispatch_update = buf["update"]
+            dispatch_user_id = buf["user_id"]
+            n_parts = len(buf["parts"])
+        logger.info(
+            "split-merge: flushed chat=%s parts=%d merged_len=%d (timeout)",
+            chat_id,
+            n_parts,
+            len(merged),
+        )
+        await self._dispatch_text_task(dispatch_update, dispatch_user_id, merged)
 
     async def _handle_voice_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1866,7 +1990,14 @@ class TelegramBot:
                     if not part.strip():
                         continue
                     try:
-                        await message.reply_text(part, parse_mode=parse_mode)
+                        # DGN-372: escape bare '[' for legacy Markdown so brackets
+                        # are never silently swallowed by Telegram's parser.
+                        send_part = (
+                            escape_legacy_markdown_brackets(part)
+                            if parse_mode == "Markdown"
+                            else part
+                        )
+                        await message.reply_text(send_part, parse_mode=parse_mode)
                     except Exception:
                         await message.reply_text(part)
 
@@ -1966,7 +2097,9 @@ class TelegramBot:
                     if not part.strip():
                         continue
                     try:
-                        await bot.send_message(chat_id, part, parse_mode="Markdown")
+                        # DGN-372: escape bare '[' so legacy Markdown never loses brackets.
+                        send_part = escape_legacy_markdown_brackets(part)
+                        await bot.send_message(chat_id, send_part, parse_mode="Markdown")
                     except Exception:
                         await bot.send_message(chat_id, part)
 
