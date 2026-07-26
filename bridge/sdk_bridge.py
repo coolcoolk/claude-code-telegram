@@ -63,6 +63,11 @@ ALLOWED_TOOLS = [
 
 TYPING_INTERVAL = 4  # seconds; Telegram typing status expires after ~5s
 
+# DGN-581: budget for the soft-interrupt control request. A CLI stuck badly
+# enough to not ack the control channel within this window is treated as an
+# interrupt failure, and the caller falls back to the hard teardown.
+INTERRUPT_SEND_TIMEOUT = 5.0  # seconds
+
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 # DGN-086: placeholder-flake detection pattern.
@@ -251,6 +256,12 @@ class _UserStreamState:
     # the trailing ResultMessage.
     proactive_texts: List[str] = field(default_factory=list)
     last_proactive_sent: Optional[str] = None
+    # DGN-581: count of trailing ResultMessages to swallow. A soft interrupt
+    # drains the pending deque, but the CLI still emits a ResultMessage (and
+    # possibly tail AssistantMessages) for each already-dispatched turn; with
+    # no pending request left the reader loop would misroute that tail to the
+    # proactive-push path. Each swallow decrements the counter.
+    discard_results: int = 0
 
 
 class SdkBridge:
@@ -640,6 +651,13 @@ class SdkBridge:
 
         if isinstance(msg, ResultMessage):
             state.last_session_id = msg.session_id or state.last_session_id
+            if state.discard_results > 0:
+                # DGN-581: trailing result of a soft-interrupted (drained) turn.
+                # Swallow it -- and any tail text it buffered -- instead of
+                # pushing the aborted turn's remains as a proactive message.
+                state.discard_results -= 1
+                state.proactive_texts = []
+                return
             if getattr(msg, "is_error", False):
                 # A no-pending turn ended in an error (e.g. model overloaded /
                 # api_error after retries). No assistant text was buffered, so the
@@ -1015,6 +1033,84 @@ class SdkBridge:
         return await self._disconnect_user_stream(
             user_id, cancel_message=messages.TASK_TERMINATED
         )
+
+    async def interrupt(self, user_id: int) -> bool:
+        """DGN-581: ESC-style soft interrupt of the in-flight turn.
+
+        Sends the SDK control-protocol interrupt (ClaudeSDKClient.interrupt()
+        -> Query.interrupt() -> control request {"subtype": "interrupt"}) so
+        the current turn stops generating, while the stream state, the client
+        connection, and the CLI subprocess all stay alive -- session context
+        is preserved. Contrast stop(), which pops the stream state and tears
+        the client (and, on timeout, the subprocess) down.
+
+        Queue policy = DRAIN: every pending request for this user is resolved,
+        not just the in-flight head, so no queued input auto-fires after the
+        stop. Drafted bubbles of the interrupted turn are finalized in place
+        (the same preserve path handle_timeout_preserve uses), and the drained
+        futures resolve silently: empty content + streamed=True renders
+        nothing at the bot reply layer, so the /stop acknowledgement is the
+        only message the user sees.
+
+        Returns False when there is nothing to interrupt: no live stream, no
+        dispatched in-flight turn, or a client without a connected streaming
+        query (interrupt() is only valid in streaming mode). The caller falls
+        back to the legacy hard-stop semantics. Raises (e.g. TimeoutError,
+        CLIConnectionError) when the interrupt send fails on a stuck turn so
+        the caller can fall back to the hard teardown -- /stop must never
+        degrade to a silent no-op.
+
+        Concurrency: deliberately takes NO send_lock. The interrupt is a
+        control-channel write the SDK serializes internally; waiting on
+        send_lock here could deadlock behind the very dispatch this call is
+        trying to interrupt.
+        """
+        state = self._streams.get(user_id)
+        if not state:
+            return False
+        head = state.pending[0] if state.pending else None
+        if head is None or not head.sent:
+            return False
+        # interrupt() is only valid on a connected streaming client; the SDK
+        # raises CLIConnectionError when _query is absent. Treat that as
+        # nothing-to-interrupt (guard, not failure).
+        if getattr(state.client, "_query", None) is None:
+            return False
+        await asyncio.wait_for(
+            state.client.interrupt(), timeout=INTERRUPT_SEND_TIMEOUT
+        )
+        drained: List[_PendingRequest] = []
+        while state.pending:
+            drained.append(state.pending.popleft())
+        for req in drained:
+            if req.sent:
+                # The CLI still emits a trailing ResultMessage for a
+                # dispatched turn; its request is drained now, so mark the
+                # result for a one-shot swallow in the reader loop.
+                state.discard_results += 1
+            if req.streaming_handler:
+                try:
+                    await req.streaming_handler.finalize_all()
+                except Exception as e:
+                    logger.error(
+                        "Interrupt finalize failed for user %s: %s", user_id, e
+                    )
+            if not req.future.done():
+                req.future.set_result(
+                    ChatResponse(
+                        content="",
+                        success=False,
+                        error="interrupted",
+                        session_id=state.last_session_id,
+                        streamed=True,
+                    )
+                )
+        logger.info(
+            "Soft-interrupted turn for user %s (drained %d request(s))",
+            user_id,
+            len(drained),
+        )
+        return True
 
     async def handle_timeout_preserve(self, user_id: int) -> Tuple[Optional[str], bool]:
         """Preserve (finalize, not delete) partial drafts + capture resume sid."""
