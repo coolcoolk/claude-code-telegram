@@ -13,6 +13,10 @@ Covers:
   4. Reader-loop swallow of the interrupted turn's trailing ResultMessage
      (discard_results) without leaking it to the proactive-push path, while a
      genuine proactive result still flushes.
+  4b. M1 regression: reader-loop discards stale trailing ResultMessage even
+     when a new request is already pending (the DRAIN race window).  Without
+     the fix the stale result would resolve the new request's future with the
+     old content or leave it permanently unresolved (hang).
   5. bot._cmd_stop wiring: soft-first (reply STOP_INTERRUPTED, no teardown),
      hard fallback on no-target (STOP_NOTHING when idle / STOP_PAUSED when a
      stream was killed) and on interrupt failure; /kill always hard-stops.
@@ -228,6 +232,116 @@ class TestDiscardTrailingResult(unittest.TestCase):
             )
 
             state.proactive_push.assert_awaited_once()
+
+        asyncio.run(scenario())
+
+
+class TestM1ReaderLoopDiscard(unittest.TestCase):
+    """M1 regression: stale trailing ResultMessage discarded via reader loop
+    even when a new pending request is already queued (the DRAIN race window).
+
+    Scenario: interrupt() drains the queue -> discard_results=1.  Before the
+    CLI emits the trailing ResultMessage, the user sends a new message which
+    gets appended to state.pending.  The reader loop now sees the trailing
+    ResultMessage with state.pending non-empty.  Without the fix, the result
+    would be misrouted to the new request's future (content corruption or hang).
+    With the fix, the result is silently discarded and discard_results returns
+    to 0; the new request's future stays unresolved until a genuine result arrives.
+    """
+
+    def _make_new_request(self):
+        loop = asyncio.get_running_loop()
+        handler = MagicMock()
+        handler.finalize_all = AsyncMock()
+        handler.drafts = []
+        return _PendingRequest(
+            user_id=USER_ID,
+            chat_id=1,
+            model=None,
+            requested_session_id=None,
+            permission_callback=None,
+            typing_callback=None,
+            future=loop.create_future(),
+            user_message="new message after interrupt",
+            sent=False,
+            streaming_handler=handler,
+        )
+
+    def test_stale_result_discarded_when_new_request_pending(self):
+        """Stale trailing result is dropped; new request future stays pending."""
+
+        async def scenario():
+            bridge = SdkBridge()
+            client = _make_client()
+            state = _UserStreamState(client=client, model=None)
+            state.last_session_id = "sid-x"
+
+            # Simulate post-interrupt state: queue drained, discard_results=1.
+            state.discard_results = 1
+
+            # New request arrived before the trailing ResultMessage (the race).
+            new_req = self._make_new_request()
+            state.pending.append(new_req)
+            bridge._streams[USER_ID] = state
+
+            stale_result = _make_result(is_error=False)
+
+            async def fake_receive():
+                yield stale_result
+
+            state.client.receive_messages = fake_receive
+
+            # Run the reader loop; it will consume the stale ResultMessage and exit.
+            with patch.object(SdkBridge, "_dispatch_next_query", new=AsyncMock()):
+                await bridge._reader_loop(USER_ID, state)
+
+            # discard_results consumed.
+            self.assertEqual(state.discard_results, 0)
+            # The new request's future must NOT have been resolved by the stale result.
+            self.assertFalse(
+                new_req.future.done(),
+                "New request future must stay unresolved -- stale result must be discarded",
+            )
+            # The new request is still in the queue, waiting for a real result.
+            self.assertIn(new_req, state.pending)
+
+        asyncio.run(scenario())
+
+    def test_stale_result_with_text_does_not_corrupt_new_request(self):
+        """Even a non-empty stale result must not resolve the new request's future."""
+
+        async def scenario():
+            bridge = SdkBridge()
+            client = _make_client()
+            state = _UserStreamState(client=client, model=None)
+            state.discard_results = 1
+            new_req = self._make_new_request()
+            state.pending.append(new_req)
+            bridge._streams[USER_ID] = state
+
+            # Stale result carries actual text that would corrupt the new request.
+            stale_result = ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="sid-old",
+                result="OLD interrupted tail text",
+            )
+
+            async def fake_receive():
+                yield stale_result
+
+            state.client.receive_messages = fake_receive
+            with patch.object(SdkBridge, "_dispatch_next_query", new=AsyncMock()):
+                await bridge._reader_loop(USER_ID, state)
+
+            self.assertEqual(state.discard_results, 0)
+            self.assertFalse(
+                new_req.future.done(),
+                "New request future must not be resolved with old interrupted tail text",
+            )
 
         asyncio.run(scenario())
 
