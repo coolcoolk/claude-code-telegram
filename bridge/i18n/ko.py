@@ -42,8 +42,9 @@ STRINGS = {
     "model_switch_warning": "주의: 모델을 전환하면 새 세션이 시작됩니다.",
     "model_unknown": "알 수 없는 모델 '{name}'. 사용 가능한 모델: {allowed}",
     "model_state_fallback": "저장된 모델 설정을 읽지 못해 기본값으로 시작합니다.",
-    "stop_paused": "마지막 작업을 멈췄습니다. 세션과 대화는 그대로입니다.",
+    "stop_paused": "세션을 종료했습니다.",
     "stop_nothing": "멈출 작업이 없습니다.",
+    "stop_interrupted": "중단됨 -- 진행 중이던 턴만 멈췄습니다. 세션은 유지되고, 대기 중이던 메시지는 비웠습니다.",
     "no_session": "활성 세션이 없습니다. 먼저 대화를 시작해 주세요.",
     "task_terminated": "작업을 종료했습니다.",
     # --- Help ---
@@ -51,7 +52,8 @@ STRINGS = {
         "사용 가능한 명령:\n"
         "/start - 시작 / 인사\n"
         "/new - 새 세션 시작\n"
-        "/stop - 현재 작업 중단\n"
+        "/stop - 진행 중인 턴 중단 (세션 유지)\n"
+        "/kill - 세션 강제 종료 (하드 중단)\n"
         "/model - 모델 전환 (세션이 새로 시작됩니다)\n"
         "/resume - 이전 세션 이어가기\n"
         "/history - 최근 기록 보기\n"
@@ -69,6 +71,7 @@ STRINGS = {
     # --- BotCommand menu descriptions ---
     "cmd_desc_new": "새 세션 시작",
     "cmd_desc_stop": "지금 작업만 멈춤",
+    "cmd_desc_kill": "세션 강제 종료 (하드 중단)",
     "cmd_desc_model": "모델 전환 (새 세션)",
     "cmd_desc_resume": "세션 이어가기",
     "cmd_desc_history": "메시지 기록 보기",

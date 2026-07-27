@@ -33,6 +33,9 @@ STRINGS = {
     "new_session": (
         "Switched to a new session."
     ),
+    "model_state_fallback": (
+        "Could not read saved model settings; starting with the default model."
+    ),
     "model_switched": "Switched: {label}",
     "model_select": (
         "Select a Claude model:\n"
@@ -42,8 +45,12 @@ STRINGS = {
     "model_unknown": (
         "Unknown model '{name}'. Allowed models: {allowed}"
     ),
-    "stop_paused": "Stopped the current task -- your session stays.",
-    "stop_nothing": "Nothing to stop.",
+    "stop_paused": "Session stopped.",
+    "stop_nothing": "Nothing running.",
+    "stop_interrupted": (
+        "Interrupted. The current turn was stopped in place; the session "
+        "stays alive and queued messages were dropped."
+    ),
     "no_session": "No active session. Start a conversation first.",
     "task_terminated": "Task terminated.",
     # --- Help ---
@@ -51,7 +58,8 @@ STRINGS = {
         "Available commands:\n"
         "/start - Start / greeting\n"
         "/new - Start a new session\n"
-        "/stop - Stop the current run\n"
+        "/stop - Interrupt the current turn (session kept)\n"
+        "/kill - Hard-stop: tear the session down\n"
         "/model - Switch model (starts a new session)\n"
         "/resume - Resume a previous session\n"
         "/history - Show recent history\n"
@@ -68,7 +76,8 @@ STRINGS = {
     "skills_header_global": "Global skills",
     # --- BotCommand menu descriptions ---
     "cmd_desc_new": "Start new session",
-    "cmd_desc_stop": "Stop the current task",
+    "cmd_desc_stop": "Stop execution",
+    "cmd_desc_kill": "Kill session (hard stop)",
     "cmd_desc_model": "Switch model (new session)",
     "cmd_desc_resume": "Resume session",
     "cmd_desc_history": "View message history",
