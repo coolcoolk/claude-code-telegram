@@ -42,8 +42,8 @@ STRINGS = {
     "model_unknown": (
         "Unknown model '{name}'. Allowed models: {allowed}"
     ),
-    "stop_paused": "Session stopped.",
-    "stop_nothing": "Nothing running.",
+    "stop_paused": "Stopped the current task -- your session stays.",
+    "stop_nothing": "Nothing to stop.",
     "no_session": "No active session. Start a conversation first.",
     "task_terminated": "Task terminated.",
     # --- Help ---
@@ -68,7 +68,7 @@ STRINGS = {
     "skills_header_global": "Global skills",
     # --- BotCommand menu descriptions ---
     "cmd_desc_new": "Start new session",
-    "cmd_desc_stop": "Stop execution",
+    "cmd_desc_stop": "Stop the current task",
     "cmd_desc_model": "Switch model (new session)",
     "cmd_desc_resume": "Resume session",
     "cmd_desc_history": "View message history",
