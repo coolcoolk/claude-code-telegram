@@ -554,6 +554,25 @@ class SdkBridge:
 
                 if isinstance(msg, ResultMessage):
                     state.last_session_id = msg.session_id or state.last_session_id
+                    # DGN-581 M1: a soft-interrupted turn's trailing ResultMessage
+                    # must be discarded even when a new request is already pending.
+                    # Without this gate, the race (interrupt -> drain -> new message
+                    # appended before CLI emits the trailing result) routes the stale
+                    # result to the new request's future, corrupting or hanging it, and
+                    # leaves discard_results=1 as a leak that silences the next genuine
+                    # proactive push.  Check discard_results here, before _finalize_result,
+                    # so the turn boundary is always request-scoped, not pending-queue-scoped.
+                    if state.discard_results > 0:
+                        state.discard_results -= 1
+                        state.proactive_texts = []
+                        logger.debug(
+                            "Discarded stale trailing ResultMessage for user %s"
+                            " (pending=%d, discard_results remaining=%d)",
+                            user_id,
+                            len(state.pending),
+                            state.discard_results,
+                        )
+                        continue
                     await self._finalize_result(user_id, state, req, msg)
                     state.pending.popleft()
                     try:

@@ -33,6 +33,9 @@ STRINGS = {
     "new_session": (
         "Switched to a new session."
     ),
+    "model_state_fallback": (
+        "Could not read saved model settings; starting with the default model."
+    ),
     "model_switched": "Switched: {label}",
     "model_select": (
         "Select a Claude model:\n"
