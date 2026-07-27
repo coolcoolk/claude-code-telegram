@@ -600,6 +600,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("model", self._cmd_model))
         app.add_handler(CommandHandler("resume", self._cmd_resume))
         app.add_handler(CommandHandler("stop", self._cmd_stop))
+        app.add_handler(CommandHandler("kill", self._cmd_kill))
         app.add_handler(CommandHandler("history", self._cmd_history))
         app.add_handler(CommandHandler("skills", self._cmd_skills))
         app.add_handler(CommandHandler("usage", self._cmd_usage))
@@ -623,6 +624,7 @@ class TelegramBot:
         commands = [
             BotCommand("new", messages.CMD_DESC_NEW),
             BotCommand("stop", messages.CMD_DESC_STOP),
+            BotCommand("kill", messages.CMD_DESC_KILL),
             BotCommand("model", messages.CMD_DESC_MODEL),
             BotCommand("usage", messages.CMD_DESC_USAGE),
             BotCommand("skills", messages.CMD_DESC_SKILLS),
@@ -1009,9 +1011,42 @@ class TelegramBot:
         )
 
     async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """DGN-581: ESC-parity stop. Soft interrupt first -- stop the in-flight
+        turn in place and drain the queue while the session, client, and CLI
+        subprocess stay alive. The hard teardown remains reachable as /kill and
+        as the fallback when the interrupt has nothing to catch or fails, so
+        /stop is never a silent no-op.
+
+        The soft path must NOT cancel the user's run tasks: they resolve on
+        their own via the drained futures, and cancelling them would trigger
+        process_message's CancelledError handler, which hard-stops the stream.
+        """
         if not await self._check_access(update):
             return
         user_id = update.effective_user.id
+        try:
+            if await sdk_bridge.interrupt(user_id):
+                await update.message.reply_text(messages.STOP_INTERRUPTED)
+                return
+        except Exception as e:
+            logger.error(
+                "Soft interrupt failed for user %s: %s -- falling back to hard teardown",
+                user_id,
+                e,
+            )
+        # Nothing to interrupt (or the interrupt send failed on a stuck turn):
+        # legacy hard-stop semantics.
+        await self._hard_stop(update, user_id)
+
+    async def _cmd_kill(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """DGN-581: explicit hard teardown (the pre-soft-interrupt /stop)."""
+        if not await self._check_access(update):
+            return
+        await self._hard_stop(update, update.effective_user.id)
+
+    async def _hard_stop(self, update: Update, user_id: int) -> None:
+        """Legacy hard teardown: cancel run tasks, disconnect the stream (kill
+        the CLI subprocess on a stuck disconnect), clear the queue."""
         await sdk_bridge.cancel_user_streaming(user_id)
         active = self._active_tasks.get(user_id)
         task_cancelled = False
