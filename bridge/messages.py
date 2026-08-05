@@ -186,6 +186,22 @@ SYSTEM_PROMPT = (
     "and output the result.\""
 )
 
+# DGN-699: appended to SYSTEM_PROMPT ONLY when effective interim mode is
+# "fold". Other modes (suppress/inline/off) must not receive this fragment
+# because the premise ("you emitted progress the user already saw live") is
+# false for them. Call site: sdk_bridge._create_user_stream() opts assembly.
+SYSTEM_PROMPT_FOLD_FRAGMENT = (
+    "\n\n## Progress Narration vs Final Answer (DGN-699)\n\n"
+    "The interim text you emit BETWEEN tool calls is shown to the user "
+    "live as a progress log (a collapsible quote bubble), and your final "
+    "end-of-turn message is delivered separately below it. Treat them as "
+    "two distinct registers: interim narration carries PROGRESS ONLY "
+    "(what you are doing right now); the final message carries the "
+    "SUBSTANTIVE RESULT ONLY. Do NOT restate or re-summarize in the "
+    "final message what you already narrated as progress -- the user has "
+    "already seen it."
+)
+
 # Denial message returned to Claude when it tries AskUserQuestion.
 ASK_USER_QUESTION_DENY = (
     "AskUserQuestion is not available in this environment. "

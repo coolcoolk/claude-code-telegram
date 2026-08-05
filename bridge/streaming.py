@@ -8,12 +8,13 @@ backed off; "message is not modified" is treated as success.
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
-from telegram import Bot
-from telegram.error import RetryAfter, TelegramError
+from telegram import Bot, LinkPreviewOptions
+from telegram.error import BadRequest, RetryAfter, TelegramError
 
 from bridge.config import config
 from bridge.formatting import split_text, strip_display_markers
@@ -21,6 +22,196 @@ from bridge.formatting import split_text, strip_display_markers
 logger = logging.getLogger(__name__)
 
 _OVERFLOW_LIMIT = 4000
+
+# DGN-376: auto link previews are OFF by default; streamed drafts can end up
+# as the final bubble (no re-send), so previews are suppressed here as well.
+_LINK_PREVIEW_OFF = LinkPreviewOptions(is_disabled=True)
+
+
+# --- DGN-699: growing-fold HTML send/edit helpers ----------------------------
+#
+# The StreamingMessageHandler above sends/edits PLAIN text (no parse_mode);
+# the growing fold needs Telegram-HTML edits (blockquote rendering), so it
+# gets its own dedicated helpers (spec D1). Content arrives here ALREADY
+# rendered (formatting.render_fold_live / render_fold_final: escaping + code
+# fence neutralization + rolling-window fit included).
+#
+# RetryAfter semantics differ per phase (spec D3):
+#   - live growth (send_fold_html / edit_fold_html): NON-BLOCKING. A rate
+#     limit never sleeps inside the reader loop await chain -- the helper
+#     returns immediately with a retry-after hint and the caller retries on a
+#     later tick, so the turn pipeline never stalls.
+#   - finalize (finalize_fold_html): the turn is ending, so a small BOUNDED
+#     backoff is allowed to make the caption+collapse swap stick.
+#
+# MAJOR-1 (DGN-699 grill): BadRequest (400) on HTML parse can occur when
+# narration contains unclosed HTML-like tags or literal </blockquote> that
+# the Telegram parser rejects. Each helper tries HTML first; on BadRequest
+# it degrades once to plain-text (no parse_mode), which Telegram always
+# accepts for prose content. The blockquote structure is lost on plain-text
+# sends but the content is preserved and the bubble is never silently dropped.
+
+
+def _fold_html_to_plain(html_text: str) -> str:
+    """Strip HTML tags for plain-text fallback.
+
+    Converts the pre-rendered fold HTML (which may contain <blockquote>,
+    <b>, <i>, <code> etc.) back to legible plain text. Unescapes HTML
+    entities so the user sees the original characters rather than &amp; etc.
+    Only used on BadRequest (400) degradation -- not in the normal path.
+    """
+    import html as _html_mod
+    plain = re.sub(r"<[^>]+>", "", html_text)
+    return _html_mod.unescape(plain)
+
+
+async def send_fold_html(bot: Bot, chat_id: int, html_text: str) -> Optional[int]:
+    """Send the fold bubble (HTML). Returns message_id, or None on failure.
+
+    Non-blocking: RetryAfter is not slept on -- creation is simply deferred
+    to a later tick (the caller re-attempts on the next interim).
+    MAJOR-1: BadRequest degrades to plain-text send once before giving up.
+    """
+    for parse_mode, text in [("HTML", html_text), (None, _fold_html_to_plain(html_text))]:
+        try:
+            kwargs = dict(
+                chat_id=chat_id,
+                text=text,
+                link_preview_options=_LINK_PREVIEW_OFF,
+            )
+            if parse_mode:
+                kwargs["parse_mode"] = parse_mode
+            sent = await bot.send_message(**kwargs)
+            mid = getattr(sent, "message_id", None)
+            if parse_mode is None:
+                logger.warning("Fold create fell back to plain text (HTML rejected)")
+            return mid if isinstance(mid, int) else None
+        except BadRequest as e:
+            if parse_mode is None:
+                logger.error("Fold create plain fallback also failed: %s", e)
+                return None
+            logger.warning("Fold create HTML rejected (400), retrying plain: %s", e)
+            continue
+        except RetryAfter as e:
+            logger.warning(
+                "Fold create rate-limited (retry_after=%s); deferring",
+                getattr(e, "retry_after", None),
+            )
+            return None
+        except Exception as e:
+            logger.error("Failed to send fold bubble: %s", e)
+            return None
+    return None
+
+
+async def edit_fold_html(
+    bot: Bot, chat_id: int, message_id: int, html_text: str
+) -> "tuple[bool, float]":
+    """Live-growth HTML edit of the fold bubble. Returns (ok, retry_after).
+
+    Non-blocking: on RetryAfter it returns (False, seconds) immediately so
+    the caller can gate the next attempt; no sleep ever happens here.
+    "message is not modified" counts as success.
+    MAJOR-1: BadRequest degrades to plain-text edit once before giving up.
+    """
+    for parse_mode, text in [("HTML", html_text), (None, _fold_html_to_plain(html_text))]:
+        try:
+            kwargs = dict(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                link_preview_options=_LINK_PREVIEW_OFF,
+            )
+            if parse_mode:
+                kwargs["parse_mode"] = parse_mode
+            await bot.edit_message_text(**kwargs)
+            if parse_mode is None:
+                logger.warning("Fold edit fell back to plain text (HTML rejected)")
+            return True, 0.0
+        except BadRequest as e:
+            if "message is not modified" in str(e).lower():
+                return True, 0.0
+            if parse_mode is None:
+                logger.error("Fold edit plain fallback also failed: %s", e)
+                return False, 0.0
+            logger.warning("Fold edit HTML rejected (400), retrying plain: %s", e)
+            continue
+        except RetryAfter as e:
+            wait = float(getattr(e, "retry_after", 3.0) or 3.0)
+            logger.warning("Fold edit rate-limited for %.1fs (msg %s)", wait, message_id)
+            return False, wait
+        except TelegramError as e:
+            if "message is not modified" in str(e).lower():
+                return True, 0.0
+            logger.error("Failed to edit fold bubble %s: %s", message_id, e)
+            return False, 0.0
+        except Exception as e:
+            logger.error("Failed to edit fold bubble %s: %s", message_id, e)
+            return False, 0.0
+    return False, 0.0
+
+
+async def finalize_fold_html(
+    bot: Bot, chat_id: int, message_id: int, html_text: str, max_retries: int = 3
+) -> bool:
+    """Finalize swap edit (caption + collapsed fold). Bounded backoff.
+
+    Runs once per turn at termination, so a short capped RetryAfter sleep is
+    acceptable here (unlike the live-growth path). Returns True on success or
+    "not modified"; False when every attempt failed (the bubble then stays in
+    its last live form -- degraded but never lost).
+    MAJOR-1: BadRequest on HTML degrades to plain-text once (caption + body,
+    no expandable structure -- fold meaning lost but content preserved).
+    """
+    plain_text = _fold_html_to_plain(html_text)
+    # Each (parse_mode, text) pair is attempted with bounded RetryAfter backoff.
+    for parse_mode, text in [("HTML", html_text), (None, plain_text)]:
+        for attempt in range(max_retries):
+            try:
+                kwargs = dict(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    link_preview_options=_LINK_PREVIEW_OFF,
+                )
+                if parse_mode:
+                    kwargs["parse_mode"] = parse_mode
+                await bot.edit_message_text(**kwargs)
+                if parse_mode is None:
+                    logger.warning("Fold finalize fell back to plain text (HTML rejected)")
+                return True
+            except BadRequest as e:
+                if "message is not modified" in str(e).lower():
+                    return True
+                if parse_mode is None:
+                    logger.error("Fold finalize plain fallback also failed: %s", e)
+                    return False
+                logger.warning("Fold finalize HTML rejected (400), retrying plain: %s", e)
+                break  # break inner loop -> outer loop tries plain
+            except RetryAfter as e:
+                if attempt == max_retries - 1:
+                    break
+                wait = min(float(getattr(e, "retry_after", 3.0) or 3.0), 10.0)
+                await asyncio.sleep(wait)
+            except TelegramError as e:
+                if "message is not modified" in str(e).lower():
+                    return True
+                logger.error("Failed to finalize fold bubble %s: %s", message_id, e)
+                return False
+            except Exception as e:
+                logger.error("Failed to finalize fold bubble %s: %s", message_id, e)
+                return False
+        else:
+            # RetryAfter exhausted all retries for this parse_mode tier
+            if parse_mode == "HTML":
+                logger.warning("Fold finalize HTML exhausted retries, trying plain")
+                continue
+            logger.error(
+                "Fold finalize gave up after %d attempts (msg %s)", max_retries, message_id
+            )
+            return False
+    logger.error("Fold finalize gave up after %d attempts (msg %s)", max_retries, message_id)
+    return False
 
 
 @dataclass
@@ -82,7 +273,9 @@ class StreamingMessageHandler:
             try:
                 await self._retry_with_backoff(
                     lambda body=body: self.bot.send_message(
-                        chat_id=self.chat_id, text=body
+                        chat_id=self.chat_id,
+                        text=body,
+                        link_preview_options=_LINK_PREVIEW_OFF,
                     )
                 )
             except Exception as e:
@@ -98,7 +291,11 @@ class StreamingMessageHandler:
         content = chunks[-1] or "..."
         try:
             sent = await self._retry_with_backoff(
-                lambda: self.bot.send_message(chat_id=self.chat_id, text=content)
+                lambda: self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=content,
+                    link_preview_options=_LINK_PREVIEW_OFF,
+                )
             )
             mid = self._message_id(sent)
             if mid is None:
@@ -121,6 +318,7 @@ class StreamingMessageHandler:
                     chat_id=self.chat_id,
                     message_id=draft.message_id,
                     text=strip_display_markers(new_text),
+                    link_preview_options=_LINK_PREVIEW_OFF,
                 )
             )
             draft.text = new_text
@@ -248,6 +446,7 @@ class StreamingMessageHandler:
                     chat_id=self.chat_id,
                     message_id=draft.message_id,
                     text=chunks[0] or "...",
+                    link_preview_options=_LINK_PREVIEW_OFF,
                 )
             )
             ok = True

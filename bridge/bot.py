@@ -25,6 +25,7 @@ from telegram import (
     BotCommandScopeAllPrivateChats,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     ReplyParameters,
     Update,
 )
@@ -51,12 +52,13 @@ from bridge import ownership
 from bridge.formatting import (
     IMAGE_EXTS,
     code_segment_html,
-    escape_legacy_markdown_brackets,
+    markdown_to_telegram_html,
     resolve_send_paths,
     split_into_segments,
     split_paths_by_scope,
     split_text,
     strip_display_markers,
+    strip_link_preview_marker,
     strip_send_markers,
     strip_toolcall_markup,
 )
@@ -109,6 +111,10 @@ STALL_STREAK_SUSPECT = 3  # more consecutive stall restarts than this -> CRITICA
 # media_group_id. Buffer same-group photos for this debounce window, then flush
 # them as a single task. 1.5s >> real album inter-arrival (~100ms), big margin.
 MEDIA_GROUP_DEBOUNCE = 1.5
+# DGN-376: auto link previews are OFF on every outbound text send by default.
+# A reply opts back in with a standalone "link_preview::" line (stripped before
+# sending), which restores Telegram's default preview for that reply's text.
+LINK_PREVIEW_OFF = LinkPreviewOptions(is_disabled=True)
 # Telegram splits a single long message at the 4096-char limit into N separate
 # text updates, delivered back-to-back. A message at/above this length is a
 # split-boundary candidate: buffer it and wait SPLIT_MERGE_WINDOW seconds for the
@@ -1307,7 +1313,6 @@ class TelegramBot:
                 await self._reply_smart(
                     message,
                     response.content,
-                    parse_mode="Markdown",
                     force_options=response.has_options,
                     streamed=response.streamed,
                     draft_message_ids=response.draft_message_ids,
@@ -1898,7 +1903,6 @@ class TelegramBot:
             await self._reply_smart(
                 message,
                 response.content,
-                parse_mode="Markdown",
                 force_options=response.has_options,
                 streamed=response.streamed,
                 draft_message_ids=response.draft_message_ids,
@@ -2029,9 +2033,105 @@ class TelegramBot:
             return trigger_id
         return None
 
-    async def _try_send_linked(
-        self, message, text: str, reply_to: int, parse_mode: Optional[str] = "HTML"
-    ) -> bool:
+    async def _reply_smart(
+        self,
+        message,
+        content: str,
+        force_options: bool = False,
+        streamed: bool = False,
+        draft_message_ids: Optional[List[int]] = None,
+    ) -> None:
+        display, _ = strip_options_marker(content)
+        display, _ = strip_send_markers(display)
+        # DGN-376: link previews default OFF; a link_preview:: line opts in.
+        display, preview = strip_link_preview_marker(display)
+        # DGN-159: last-mile scrub of leaked tool-call markup on the non-streamed
+        # / finalized send path (streamed drafts are scrubbed in strip_display_markers).
+        display = strip_toolcall_markup(display)
+        # DGN-555: selective reply-linking of the final response body.
+        reply_to = self._reply_link_id(message)
+        has_code = "```" in display
+        if not streamed:
+            await self._send_text_body(message, display, preview, reply_to=reply_to)
+        elif has_code and (force_options or draft_message_ids):
+            # DGN-085 (comment refreshed in DGN-376 v1.1, finding m4): when code
+            # blocks coexist with [[OPTIONS]] buttons or streamed drafts, the
+            # plain-text drafts are deleted and the body is re-sent through
+            # _send_text_body (HTML code segments + converted prose) so the
+            # split is enforced at the bridge layer regardless of agent
+            # discipline. Also covers the pre-existing streamed+code case.
+            bot = message.get_bot()
+            chat_id = message.chat.id
+            for mid in (draft_message_ids or []):
+                try:
+                    await bot.delete_message(chat_id, mid)
+                except Exception as e:
+                    logger.warning("Failed to delete streamed draft %s: %s", mid, e)
+            await self._send_text_body(message, display, preview, reply_to=reply_to)
+        elif draft_message_ids and display.strip():
+            # DGN-376 v1.1 (M1): streamed prose-only reply. The final draft
+            # bubble streamed as plain text; re-render it in place as HTML via
+            # the same converter the non-streamed path uses. Fallback (multi-
+            # bubble reply or edit failure): delete the drafts and re-send
+            # through the converting body path so the message is never lost.
+            # DGN-555: a reply link cannot ride an in-place edit, so when the
+            # link policy fires the edit is skipped and the same delete +
+            # re-send fallback delivers the body as a fresh, linked message.
+            bot = message.get_bot()
+            chat_id = message.chat.id
+            if reply_to is not None or not await self._edit_streamed_prose_html(
+                bot, chat_id, display, preview, draft_message_ids
+            ):
+                for mid in draft_message_ids:
+                    try:
+                        await bot.delete_message(chat_id, mid)
+                    except Exception as e:
+                        logger.warning("Failed to delete streamed draft %s: %s", mid, e)
+                await self._send_text_body(message, display, preview, reply_to=reply_to)
+        await self._send_content_artifacts(message, content, force_options)
+
+    async def _send_text_body(
+        self,
+        message,
+        content: str,
+        preview: bool = False,
+        reply_to: Optional[int] = None,
+    ) -> None:
+        # DGN-376: preview=True (link_preview:: opt-in) restores Telegram's
+        # default preview; otherwise previews are suppressed.
+        lp = None if preview else LINK_PREVIEW_OFF
+        # DGN-555: only the FIRST sent part of the final body carries the reply
+        # link; every subsequent part goes out plain.
+        link_pending = reply_to is not None
+        for segment, is_code, lang in split_into_segments(content):
+            for part in split_text(segment):
+                if not part.strip():
+                    continue
+                if is_code:
+                    rendered = code_segment_html(part, lang)
+                else:
+                    # DGN-376: prose goes out as Telegram HTML; markdown the
+                    # agents emit is converted, everything else is escaped so
+                    # stray _ * [ ] < > never mangle the message.
+                    rendered = markdown_to_telegram_html(part)
+                if link_pending:
+                    link_pending = False
+                    if await self._try_send_linked(message, rendered, lp, reply_to):
+                        continue
+                    # DGN-555: linked send rejected -> degrade to the plain
+                    # (unlinked) sends below; a reply link never fails a turn.
+                try:
+                    await message.reply_text(
+                        rendered,
+                        parse_mode="HTML",
+                        link_preview_options=lp,
+                    )
+                except Exception:
+                    # DGN-376 v1.1 (m1): plain-text fallback keeps the
+                    # preview suppression of the send it replaces.
+                    await message.reply_text(part, link_preview_options=lp)
+
+    async def _try_send_linked(self, message, rendered: str, lp, reply_to: int) -> bool:
         """DGN-555: attempt the reply-linked send of the first body part.
 
         allow_sending_without_reply lets Telegram itself degrade to a plain
@@ -2040,8 +2140,9 @@ class TelegramBot:
         """
         try:
             await message.reply_text(
-                text,
-                parse_mode=parse_mode,
+                rendered,
+                parse_mode="HTML",
+                link_preview_options=lp,
                 reply_parameters=ReplyParameters(
                     message_id=reply_to, allow_sending_without_reply=True
                 ),
@@ -2051,95 +2152,61 @@ class TelegramBot:
             logger.warning("Reply-linked send failed (mid=%s): %s", reply_to, e)
             return False
 
-    async def _reply_smart(
+    async def _edit_streamed_prose_html(
         self,
-        message,
-        content: str,
-        parse_mode: str = "Markdown",
-        force_options: bool = False,
-        streamed: bool = False,
-        draft_message_ids: Optional[List[int]] = None,
-    ) -> None:
-        display, _ = strip_options_marker(content)
-        display, _ = strip_send_markers(display)
-        # DGN-159: last-mile scrub of leaked tool-call markup on the non-streamed
-        # / finalized send path (streamed drafts are scrubbed in strip_display_markers).
-        display = strip_toolcall_markup(display)
-        # DGN-555: selective reply-linking of the final response body.
-        reply_to = self._reply_link_id(message)
-        has_code = "```" in display
-        if not streamed:
-            await self._send_text_body(message, display, parse_mode, reply_to=reply_to)
-        elif has_code and (force_options or draft_message_ids):
-            # DGN-085: when code blocks and [[OPTIONS]] buttons coexist, streaming
-            # drafts are finalized without parse_mode so code/tables render literally.
-            # Force a clean re-send via _send_text_body (HTML segments) so the split
-            # is enforced at the bridge layer regardless of agent discipline.
-            # Also covers the pre-existing streamed+code case (draft cleanup).
-            bot = message.get_bot()
-            chat_id = message.chat.id
-            for mid in (draft_message_ids or []):
-                try:
-                    await bot.delete_message(chat_id, mid)
-                except Exception as e:
-                    logger.warning("Failed to delete streamed draft %s: %s", mid, e)
-            await self._send_text_body(message, display, parse_mode, reply_to=reply_to)
-        elif draft_message_ids and display.strip():
-            # DGN-555: a reply link cannot ride an in-place edit, so when the
-            # link policy fires the draft is deleted and the body is re-sent as a
-            # fresh, linked message.
-            bot = message.get_bot()
-            chat_id = message.chat.id
-            if reply_to is not None:
-                for mid in draft_message_ids:
-                    try:
-                        await bot.delete_message(chat_id, mid)
-                    except Exception as e:
-                        logger.warning("Failed to delete streamed draft %s: %s", mid, e)
-                await self._send_text_body(message, display, parse_mode, reply_to=reply_to)
-        await self._send_content_artifacts(message, content, force_options)
+        bot,
+        chat_id: int,
+        display: str,
+        preview: bool,
+        draft_message_ids: List[int],
+    ) -> bool:
+        """DGN-376 v1.1 (M1): re-render a finalized streamed prose draft as HTML.
 
-    async def _send_text_body(
-        self, message, content: str, parse_mode: str, reply_to: Optional[int] = None
-    ) -> None:
-        # DGN-555: only the FIRST sent part of the final body carries the reply
-        # link; every subsequent part goes out plain.
-        link_pending = reply_to is not None
-        for segment, is_code, lang in split_into_segments(content):
-            if is_code:
-                for part in split_text(segment):
-                    if not part.strip():
-                        continue
-                    rendered = code_segment_html(part, lang)
-                    if link_pending:
-                        link_pending = False
-                        if await self._try_send_linked(message, rendered, reply_to, parse_mode="HTML"):
-                            continue
-                        # DGN-555: linked send rejected -> degrade to the plain send below.
-                    try:
-                        await message.reply_text(rendered, parse_mode="HTML")
-                    except Exception:
-                        await message.reply_text(part)
-            else:
-                for part in split_text(segment):
-                    if not part.strip():
-                        continue
-                    # DGN-372: escape bare '[' for legacy Markdown so brackets
-                    # are never silently swallowed by Telegram's parser.
-                    send_part = (
-                        escape_legacy_markdown_brackets(part)
-                        if parse_mode == "Markdown"
-                        else part
-                    )
-                    if link_pending:
-                        link_pending = False
-                        if await self._try_send_linked(message, send_part, reply_to, parse_mode=parse_mode):
-                            continue
-                        # DGN-555: linked send rejected -> degrade to the plain send below.
-                    try:
-                        await message.reply_text(send_part, parse_mode=parse_mode)
-                    except Exception:
-                        await message.reply_text(part)
+        The draft bubble streamed as plain text (unchanged behavior); once the
+        turn is final, edit that single bubble in place with the converted HTML
+        (markdown_to_telegram_html -- the exact converter the non-streamed path
+        uses). Returns True when the draft is already correct or the edit
+        succeeded; False tells the caller to fall back to the existing
+        delete-drafts + convert-resend path (multi-bubble replies, edit
+        failures), which never drops the message.
+        """
+        if len(draft_message_ids) != 1:
+            return False
+        if len(split_text(display)) != 1:
+            return False
+        converted = markdown_to_telegram_html(display)
+        if converted == display and not preview:
+            # No markdown and nothing to escape: the plain draft already
+            # renders exactly this text, so skip the no-op edit (Telegram
+            # rejects it with "message is not modified").
+            return True
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=draft_message_ids[0],
+                text=converted,
+                parse_mode="HTML",
+                link_preview_options=None if preview else LINK_PREVIEW_OFF,
+            )
+            return True
+        except telegram.error.BadRequest as e:
+            if "not modified" in str(e).lower():
+                # Escaping-only delta (e.g. & -> &amp;) parses back to the same
+                # visible text: the draft is already correct.
+                return True
+            logger.warning(
+                "HTML finalize edit failed for draft %s: %s",
+                draft_message_ids[0],
+                e,
+            )
+            return False
+        except Exception as e:
+            logger.warning(
+                "HTML finalize edit failed for draft %s: %s",
+                draft_message_ids[0],
+                e,
+            )
+            return False
 
     async def _send_content_artifacts(self, message, content: str, force_options: bool) -> None:
         resolved = resolve_send_paths(content, PROJECT_ROOT)
@@ -2201,12 +2268,14 @@ class TelegramBot:
         bot = self.application.bot
         display, has_marker = strip_options_marker(content)
         display, _ = strip_send_markers(display)
+        # DGN-376: link previews default OFF; a link_preview:: line opts in.
+        display, preview = strip_link_preview_marker(display)
         # DGN-159: last-mile scrub of leaked tool-call markup (proactive / option /
         # resume send path); streamed drafts are scrubbed in strip_display_markers.
         display = strip_toolcall_markup(display)
         has_code = "```" in display
         if not streamed:
-            await self._send_text_body_chat(chat_id, display)
+            await self._send_text_body_chat(chat_id, display, preview)
         elif has_code and (force_options or draft_message_ids):
             # DGN-085: same backstop as _reply_smart -- code+options coexistence
             # forces clean re-send via HTML segments so code/tables render correctly.
@@ -2215,7 +2284,20 @@ class TelegramBot:
                     await bot.delete_message(chat_id, mid)
                 except Exception as e:
                     logger.warning("Failed to delete streamed draft %s: %s", mid, e)
-            await self._send_text_body_chat(chat_id, display)
+            await self._send_text_body_chat(chat_id, display, preview)
+        elif draft_message_ids and display.strip():
+            # DGN-376 v1.1 (M1): same streamed prose finalize as _reply_smart --
+            # edit the single draft bubble to HTML in place; fall back to
+            # delete + convert-resend so the message is never lost.
+            if not await self._edit_streamed_prose_html(
+                bot, chat_id, display, preview, draft_message_ids
+            ):
+                for mid in draft_message_ids:
+                    try:
+                        await bot.delete_message(chat_id, mid)
+                    except Exception as e:
+                        logger.warning("Failed to delete streamed draft %s: %s", mid, e)
+                await self._send_text_body_chat(chat_id, display, preview)
         resolved = resolve_send_paths(content, PROJECT_ROOT)
         in_root, _ = split_paths_by_scope(resolved, PROJECT_ROOT)
         await self._send_file_paths(chat_id, in_root)
@@ -2225,27 +2307,45 @@ class TelegramBot:
             if kb:
                 await bot.send_message(chat_id, messages.SELECT_PROMPT, reply_markup=kb)
 
-    async def _send_text_body_chat(self, chat_id: int, content: str) -> None:
+    async def _send_text_body_chat(self, chat_id: int, content: str, preview: bool = False) -> None:
         bot = self.application.bot
+        # DGN-376: preview=True (link_preview:: opt-in) restores Telegram's
+        # default preview; otherwise previews are suppressed.
+        lp = None if preview else LINK_PREVIEW_OFF
         for segment, is_code, lang in split_into_segments(content):
             if is_code:
                 for part in split_text(segment):
                     if not part.strip():
                         continue
                     try:
-                        await bot.send_message(chat_id, code_segment_html(part, lang), parse_mode="HTML")
+                        await bot.send_message(
+                            chat_id,
+                            code_segment_html(part, lang),
+                            parse_mode="HTML",
+                            link_preview_options=lp,
+                        )
                     except Exception:
-                        await bot.send_message(chat_id, part)
+                        # DGN-376 v1.1 (m1): plain-text fallback keeps the
+                        # preview suppression of the send it replaces.
+                        await bot.send_message(chat_id, part, link_preview_options=lp)
             else:
                 for part in split_text(segment):
                     if not part.strip():
                         continue
                     try:
-                        # DGN-372: escape bare '[' so legacy Markdown never loses brackets.
-                        send_part = escape_legacy_markdown_brackets(part)
-                        await bot.send_message(chat_id, send_part, parse_mode="Markdown")
+                        # DGN-376: prose goes out as Telegram HTML; markdown the
+                        # agents emit is converted, everything else is escaped so
+                        # stray _ * [ ] < > never mangle the message.
+                        await bot.send_message(
+                            chat_id,
+                            markdown_to_telegram_html(part),
+                            parse_mode="HTML",
+                            link_preview_options=lp,
+                        )
                     except Exception:
-                        await bot.send_message(chat_id, part)
+                        # DGN-376 v1.1 (m1): plain-text fallback keeps the
+                        # preview suppression of the send it replaces.
+                        await bot.send_message(chat_id, part, link_preview_options=lp)
 
     async def _send_file_paths(self, chat_id: int, paths: List[Path]) -> None:
         bot = self.application.bot

@@ -18,6 +18,12 @@ logger = logging.getLogger(__name__)
 # with this prefix. Bare prose paths are never sent.
 SEND_FILE_MARKER = "send_file::"
 
+# DGN-376: link previews are disabled by default on every outbound text send.
+# A reply opts back in with a standalone line starting with this marker (the
+# line is stripped before sending), restoring Telegram's default preview for
+# that reply -- meant for intentional deep links that should show a card.
+LINK_PREVIEW_MARKER = "link_preview::"
+
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 MAX_FILE_BYTES = 10 * 1024 * 1024
 
@@ -161,8 +167,19 @@ def strip_toolcall_markup(text: str) -> str:
     return "".join(out_parts)
 
 
+def strip_link_preview_marker(text: str) -> Tuple[str, bool]:
+    """Drop link_preview:: opt-in lines; True when at least one was present."""
+    if not text:
+        return text, False
+    lines = text.split("\n")
+    kept = [ln for ln in lines if not ln.strip().startswith(LINK_PREVIEW_MARKER)]
+    if len(kept) == len(lines):
+        return text, False
+    return "\n".join(kept).rstrip(), True
+
+
 def strip_display_markers(text: str) -> str:
-    """Drop both [[OPTIONS]] and send_file:: marker lines (for bubble text).
+    """Drop [[OPTIONS]], send_file:: and link_preview:: marker lines.
 
     Also strips any leaked tool-call markup (DGN-159) so streamed drafts and
     finalized bubbles never surface raw <invoke> blocks.
@@ -174,7 +191,9 @@ def strip_display_markers(text: str) -> str:
     kept = [
         ln
         for ln in lines
-        if ln.strip() != OPTIONS_MARKER and not ln.strip().startswith(SEND_FILE_MARKER)
+        if ln.strip() != OPTIONS_MARKER
+        and not ln.strip().startswith(SEND_FILE_MARKER)
+        and not ln.strip().startswith(LINK_PREVIEW_MARKER)
     ]
     if len(kept) == len(lines):
         return text
@@ -294,6 +313,472 @@ def code_segment_html(code: str, lang: Optional[str]) -> str:
     if lang:
         return f'<pre><code class="language-{lang}">{escaped}</code></pre>'
     return f"<pre>{escaped}</pre>"
+
+
+# --- DGN-376: markdown -> Telegram HTML for prose segments -------------------
+#
+# The bridge sends prose with parse_mode="HTML" (code segments already go out
+# via code_segment_html). Telegram HTML supports ONLY these tags: b strong i
+# em u ins s strike del tg-spoiler span(class="tg-spoiler") a(href) code
+# (+language class) pre blockquote (+expandable).
+#
+# Conversion contract:
+#   1. Inline `code` spans are lifted first: content is HTML-escaped and
+#      wrapped in <code>; markdown inside a code span is never converted.
+#   2. INTENTIONAL-HTML PASSTHROUGH: a tag passes through verbatim only when
+#      it exactly matches the Telegram whitelist below (lowercase tag,
+#      double-quoted attribute, no extra attributes). Everything else --
+#      unknown tags, malformed tags, stray < > & -- is HTML-escaped, so
+#      accidental angle brackets can never break a message.
+#   3. Markdown the Dogany agents actually emit converts to tags:
+#        **bold** / __bold__ -> <b>      *italic* / _italic_ -> <i>
+#        ~~strike~~          -> <s>      `code`              -> <code>
+#        [text](http(s)://... or tg://...) -> <a href="...">
+#      Emphasis must open and close on the same line, hug non-whitespace,
+#      and not butt against word characters -- so stray _ * [ ] and
+#      snake_case / x**2 style identifiers pass through unchanged. Links
+#      convert before emphasis so URLs containing _ or * are never mangled;
+#      non-http(s)/tg link targets stay literal text.
+#   4. Markdown headers and tables (no Telegram HTML equivalent) are left as
+#      literal text. Lists and blockquotes ARE rendered (DGN-619 below).
+#
+# DGN-619 line-structural extensions (run as a pre-pass, before the inline
+# pipeline above):
+#   LISTS: Telegram HTML has no <ul>/<li>. Markdown bullet items (`- `, `* `,
+#     `+ `) become TEXT bullets: `- ` -> "* " at top level is wrong; we use
+#     the literal glyphs "• " (top), "◦ " (depth 1), "‣ "
+#     (depth >= 2). Source indentation is 2 spaces per depth level; the same
+#     2-space visual indent per depth is reproduced with leading spaces in the
+#     output (Telegram does not indent tags). Ordered items (`1.`, `2.`) keep
+#     their number ("1. ") verbatim. These prose bullets are deliberately
+#     distinct from the card-tree glyphs (U+2514 / middot), which stay
+#     table/subline-only, so the two conventions never collide.
+#   BLOCKQUOTE: a run of contiguous `> ` lines collapses into ONE
+#     <blockquote>...</blockquote> (inner lines joined with newlines). The
+#     EXPANDABLE variant (<blockquote expandable>) is opted in by a documented
+#     fold marker: the run's FIRST quote line begins `>! ` instead of `> `
+#     (i.e. the "!" sentinel immediately after the leading ">"). The fold
+#     trigger is the marker ONLY -- never line count (owner-explicit). Choosing
+#     WHICH content is captured as an expandable blockquote (tool-process
+#     capture / role classification) is a separate follow-up, not this pass.
+#   ITALIC WORD-ONLY: italic emphasis converts only when the wrapped span is a
+#     single word (no internal whitespace); a multi-word span stays literal
+#     text. This is enforced by the inline italic regexes (see below).
+
+# Whitelisted, exact-form Telegram HTML tags that pass through verbatim.
+_TG_HTML_TAG_RE = re.compile(
+    r"</?(?:b|strong|i|em|u|ins|s|strike|del|tg-spoiler|code|pre|blockquote)>"
+    r"|<blockquote expandable>"
+    r'|<code class="language-[A-Za-z0-9_+.#-]+">'
+    r'|<span class="tg-spoiler">'
+    r"|</span>"
+    r'|<a href="[^"<>\s]+">'
+    r"|</a>"
+)
+
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_LINK_RE = re.compile(r"\[([^\[\]\n]+)\]\(((?:https?|tg)://[^\s()]+)\)")
+_MD_BOLD_STAR_RE = re.compile(
+    r"(?<![A-Za-z0-9*])\*\*(?![\s*])([^\n]+?)(?<![\s*])\*\*(?![A-Za-z0-9*])"
+)
+_MD_BOLD_UNDER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])__(?![\s_])([^\n]+?)(?<![\s_])__(?![A-Za-z0-9_])"
+)
+# DGN-619: italic is WORD-ONLY. The wrapped span must contain no whitespace,
+# so `*two words*` never becomes italic (it falls through as literal text and
+# is escaped like any stray marker). `[^\s*]` (resp. `[^\s_]`) forbids internal
+# whitespace and the same marker char, mechanically enforcing the single-word
+# rule while preserving every existing single-word italic case.
+_MD_ITALIC_STAR_RE = re.compile(
+    r"(?<![A-Za-z0-9*])\*(?![\s*])([^\s*\n]+?)(?<!\s)\*(?![A-Za-z0-9*])"
+)
+_MD_ITALIC_UNDER_RE = re.compile(
+    r"(?<![A-Za-z0-9_])_(?![\s_])([^\s_\n]+?)(?<!\s)_(?![A-Za-z0-9_])"
+)
+_MD_STRIKE_RE = re.compile(r"~~(?=\S)([^\n]+?)(?<=\S)~~")
+
+# DGN-619 list items: leading indent, a bullet marker (- * +) or an ordered
+# marker (digits + "."), then a single required space, then the item text.
+_MD_BULLET_ITEM_RE = re.compile(r"^([ \t]*)([-*+])[ \t]+(.*)$")
+_MD_ORDERED_ITEM_RE = re.compile(r"^([ \t]*)(\d+)\.[ \t]+(.*)$")
+# DGN-619 blockquote line: leading ">", an optional "!" fold sentinel, then a
+# single space and the quoted text (the space and text may both be empty for a
+# bare ">"). Group 1 = "!" when the expandable marker is present.
+_MD_QUOTE_LINE_RE = re.compile(r"^>(!)?(?: (.*))?$")
+
+# Prose bullet glyphs by depth (top, depth 1, depth 2+). Two visual spaces of
+# indent are added per depth level in the output.
+_BULLET_GLYPHS = ("•", "◦", "‣")  # bullet / white-bullet / triangle
+
+
+def _bullet_prefix(depth: int) -> str:
+    """Leading indent (2 spaces/depth) + the depth-appropriate bullet glyph."""
+    glyph = _BULLET_GLYPHS[min(depth, len(_BULLET_GLYPHS) - 1)]
+    return "  " * depth + glyph + " "
+
+
+def _prepass_structural(text: str, stash) -> str:
+    """Convert list/blockquote LINE structure to stashed literals + inner text.
+
+    Runs before the inline pipeline. List bullet prefixes and blockquote tags
+    are stashed (so html.escape leaves them intact); the item / quote text is
+    left in place to flow through escaping and inline emphasis normally. A run
+    of contiguous quote lines collapses into one <blockquote> (or, when the
+    first line carries the `>!` fold marker, one <blockquote expandable>).
+    """
+    lines = text.split("\n")
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        qm = _MD_QUOTE_LINE_RE.match(line)
+        if qm is not None:
+            # Collect the contiguous quote run. The first line's "!" sentinel
+            # (and ONLY the first line's) selects the expandable variant.
+            expandable = qm.group(1) == "!"
+            body: List[str] = []
+            while i < n:
+                m = _MD_QUOTE_LINE_RE.match(lines[i])
+                if m is None:
+                    break
+                body.append(m.group(2) or "")
+                i += 1
+            open_tag = "<blockquote expandable>" if expandable else "<blockquote>"
+            out.append(
+                stash(open_tag) + "\n".join(body) + stash("</blockquote>")
+            )
+            continue
+        bm = _MD_BULLET_ITEM_RE.match(line)
+        if bm is not None:
+            depth = len(bm.group(1).replace("\t", "  ")) // 2
+            out.append(stash(_bullet_prefix(depth)) + bm.group(3))
+            i += 1
+            continue
+        om = _MD_ORDERED_ITEM_RE.match(line)
+        if om is not None:
+            indent = om.group(1).replace("\t", "  ")
+            # Ordered markers keep their number verbatim; indent is preserved
+            # as-is (leading spaces stash-free would be escaped harmlessly, but
+            # stashing keeps the prefix atomic alongside the bullet path).
+            out.append(stash("{}{}. ".format(indent, om.group(2))) + om.group(3))
+            i += 1
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    """Convert a PROSE segment to Telegram-safe HTML (see contract above).
+
+    Apply only to non-code segments (code fences go through code_segment_html)
+    and exactly once at send time.
+    """
+    if not text:
+        return text
+    # NUL is used as the stash placeholder delimiter; Telegram rejects NUL in
+    # message text anyway, so dropping any stray ones is lossless.
+    text = text.replace("\x00", "")
+    stash: List[str] = []
+
+    def _stash(rendered: str) -> str:
+        stash.append(rendered)
+        return "\x00{}\x00".format(len(stash) - 1)
+
+    # 0. Line-structural pre-pass (DGN-619): lists + blockquotes. Runs first so
+    #    stashed bullet prefixes / blockquote tags survive html.escape below.
+    text = _prepass_structural(text, _stash)
+    # 1. Inline code spans: escape content, never md-convert it.
+    text = _INLINE_CODE_RE.sub(
+        lambda m: _stash("<code>{}</code>".format(html.escape(m.group(1), quote=False))),
+        text,
+    )
+    # 2. Whitelisted Telegram tags pass through verbatim.
+    text = _TG_HTML_TAG_RE.sub(lambda m: _stash(m.group(0)), text)
+    # 3. Escape everything else.
+    text = html.escape(text, quote=False)
+    # 4. Links first, stashed whole, so URL characters never hit the emphasis
+    #    regexes below.
+    text = _MD_LINK_RE.sub(
+        lambda m: _stash(
+            '<a href="{}">{}</a>'.format(m.group(2).replace('"', "&quot;"), m.group(1))
+        ),
+        text,
+    )
+    # 5. Emphasis: bold before italic so ** is never read as two *.
+    text = _MD_BOLD_STAR_RE.sub(r"<b>\1</b>", text)
+    text = _MD_BOLD_UNDER_RE.sub(r"<b>\1</b>", text)
+    text = _MD_STRIKE_RE.sub(r"<s>\1</s>", text)
+    text = _MD_ITALIC_STAR_RE.sub(r"<i>\1</i>", text)
+    text = _MD_ITALIC_UNDER_RE.sub(r"<i>\1</i>", text)
+    # 6. Restore stashed spans in reverse: later entries (links) may contain
+    #    placeholders of earlier ones (a code span inside link text).
+    for i in range(len(stash) - 1, -1, -1):
+        text = text.replace("\x00{}\x00".format(i), stash[i])
+    return text
+
+
+# --- DGN-682: interim narration -> expandable-blockquote fold ----------------
+#
+# Fold-mode (INTERIM_MODE=fold) turns synthesize the interim narration
+# captured during a turn into ONE `>!`-marked quote run, prepended above the
+# final answer at finalize time; markdown_to_telegram_html then renders it as
+# a single collapsed <blockquote expandable> (DGN-619). Composition contract
+# (DGN-682 spec v2, D7/D8/D11):
+#   - every narration line gets a "> " prefix, the FIRST line ">! " (the fold
+#     marker), and blank lines become a bare ">" so the quote run never
+#     breaks mid-fold (a break would leak the rest as plain prose);
+#   - code fences inside the narration are neutralized (``` -> ''') so the
+#     fold can never open a code segment / delete+resend path downstream;
+#   - leading whitespace-only lines are dropped so the collapsed preview
+#     (the run's first line, no caption) is always meaningful (D8);
+#   - the fold caps at INTERIM_FOLD_CAP raw narration chars; over the cap the
+#     first line and the most recent tail are preserved and the middle
+#     collapses to one omission line (D7 middle-truncate);
+#   - single-chunk guarantee: the composed fold + separator + final answer
+#     must fit ONE send chunk -- raw <= 4000 (split_text limit) and <= 4096
+#     UTF-16 code units after the Telegram HTML conversion (the real
+#     Telegram bound). The fold shrinks FIRST (halving down to a floor, then
+#     dropping entirely); a split would strip the `>!` marker from the second
+#     chunk's quote lines and break the collapsed rendering (grill B2).
+
+INTERIM_FOLD_CAP = 1500
+_FOLD_OMISSION_LINE = "⋯ 중략 ⋯"
+_FOLD_RAW_LIMIT = 4000  # split_text default limit (single-chunk bound)
+_FOLD_HTML_LIMIT = 4096  # Telegram hard cap, UTF-16 code units
+_FOLD_MIN_CAP = 80
+# Blank-line separator between the fold and the final answer: an empty line
+# terminates the quote run so the answer renders OUTSIDE the blockquote.
+# Callers that prepend a fold MUST join with this exact separator (the fit
+# check above assumes it).
+INTERIM_FOLD_SEPARATOR = "\n\n"
+
+
+def _utf16_units(text: str) -> int:
+    """Length in UTF-16 code units (Telegram's message-length unit)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _fold_middle_truncate(text: str, cap: int) -> str:
+    """Middle-truncate text to <= cap chars, keeping the first line + tail.
+
+    The first line is the collapsed preview (D8) so it is always preserved
+    (hard-cut to cap//2 if it alone is oversized); the most recent tail fills
+    the remaining budget; the omitted middle collapses to one omission line.
+    """
+    if len(text) <= cap:
+        return text
+    first = text.split("\n", 1)[0]
+    if len(first) > cap // 2:
+        first = first[: max(1, cap // 2)]
+    overhead = len(first) + len(_FOLD_OMISSION_LINE) + 2  # two joining newlines
+    tail_budget = cap - overhead
+    if tail_budget <= 0:
+        return first + "\n" + _FOLD_OMISSION_LINE
+    tail = text[-tail_budget:]
+    # Align the tail to a line start when possible so it never opens mid-word
+    # on a partial line (cosmetic; budget already holds).
+    nl = tail.find("\n")
+    if 0 <= nl < len(tail) - 1:
+        tail = tail[nl + 1:]
+    tail = tail.strip("\n")
+    if not tail.strip():
+        return first + "\n" + _FOLD_OMISSION_LINE
+    return first + "\n" + _FOLD_OMISSION_LINE + "\n" + tail
+
+
+def _fold_quote_lines(text: str) -> str:
+    """Apply D11 quoting: '>! ' first line, '> ' others, bare '>' for blanks."""
+    out: List[str] = []
+    for i, ln in enumerate(text.split("\n")):
+        if not ln.strip():
+            out.append(">")
+        elif i == 0:
+            out.append(">! " + ln)
+        else:
+            out.append("> " + ln)
+    return "\n".join(out)
+
+
+# --- DGN-699: growing fold (2-phase live render) -----------------------------
+#
+# Spec v2 (worklog/DGN-699-spec-v2-growing-fold.md). Fold-mode turns stream
+# interim narration into a DEDICATED progress bubble that grows live:
+#   - live phase (D1, owner 2026-08-02): the bubble renders as PLAIN TEXT
+#     (no blockquote), edited over Telegram HTML so the stream reads as normal
+#     text while growing;
+#   - finalize phase (D1): the same bubble is swapped to a caption + the whole
+#     narration wrapped in one <blockquote expandable> (collapsed);
+#   - length (D6): the fold owns its own 4096 UTF-16-unit budget (2-bubble
+#     split); over budget the OLDEST lines roll off the front and the cut is
+#     marked with one FOLD_TRUNCATION_LINE. update_if_needed's built-in
+#     overflow rollover is deliberately NOT used.
+# The helpers below are pure (no Telegram I/O): they return ready-to-send
+# HTML built via markdown_to_telegram_html (escaping + DGN-619 blockquote
+# rendering reused). Captions are the LOCKED copy from the spec (owner A-case,
+# 2026-08-02 14:27) -- do not edit without an owner gate.
+
+FOLD_CAPTION_NORMAL = "진행 기록"
+FOLD_CAPTION_STOPPED = "중단됨 · 진행 기록"
+FOLD_CAPTION_TIMEOUT = "시간 초과 · 진행 기록"
+FOLD_TRUNCATION_LINE = "…(생략)"
+
+
+def _fold_v2_body(fold_texts: List[str]) -> str:
+    """Join captured narration blocks into one fold body.
+
+    Same neutralization contract as compose_interim_fold: code fences are
+    disarmed (``` -> ''') so the fold can never open a code segment, edge
+    newlines are trimmed, empty blocks dropped, leading blank lines removed.
+    Display markers ([[OPTIONS]] / send_file:: / link_preview:: lines and
+    leaked tool-call markup) are stripped for parity with the normal send
+    path, which this direct-HTML path bypasses.
+    """
+    blocks: List[str] = []
+    for t in fold_texts or []:
+        t = strip_display_markers((t or "").replace("```", "'''")).strip("\n")
+        if t.strip():
+            blocks.append(t)
+    joined = "\n\n".join(blocks)
+    lines = joined.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return "\n".join(lines).rstrip()
+
+
+def _fold_v2_quote(text: str, expandable: bool) -> str:
+    """Quote a fold body: '> ' per line, blanks bare '>'.
+
+    expandable=True marks the FIRST line '>! ' (the DGN-619 fold marker) so
+    markdown_to_telegram_html renders <blockquote expandable> (collapsed);
+    False renders a plain <blockquote> (visible while growing).
+    """
+    out: List[str] = []
+    for i, ln in enumerate(text.split("\n")):
+        if not ln.strip():
+            out.append(">")
+        elif i == 0 and expandable:
+            out.append(">! " + ln)
+        else:
+            out.append("> " + ln)
+    return "\n".join(out)
+
+
+def _render_fold_html(body: str, caption: str, expandable: bool, quote: bool = True) -> str:
+    """Render body (+optional caption line) to fitted Telegram HTML.
+
+    The caption is the FIRST line INSIDE the blockquote (owner 2026-08-02):
+    the whole fold reads as one unified quote bubble rather than a floating
+    plain line above a separate quote. It is prepended to the body only at
+    render time and is NEVER part of the truncation window (the rolling-window
+    loop below operates on the caption-free body), so the caption always
+    survives a cut. D6 rolling window: while the rendered HTML exceeds the 4096
+    UTF-16-unit budget, the oldest body lines are dropped and the cut is
+    marked with one FOLD_TRUNCATION_LINE as the fold's first body line. Returns
+    "" when the body is empty.
+
+    quote=False (owner 2026-08-02): render the body as PLAIN TEXT with no
+    blockquote wrapping -- used for the live phase so the stream reads as
+    normal text while growing; the collapse into an expandable quote fold
+    happens only at finalize (quote=True).
+    """
+    if not body.strip():
+        return ""
+
+    def _render(b: str) -> str:
+        if caption:
+            b = caption + "\n" + b
+        if quote:
+            return markdown_to_telegram_html(_fold_v2_quote(b, expandable))
+        return markdown_to_telegram_html(b)
+
+    html_out = _render(body)
+    if _utf16_units(html_out) <= _FOLD_HTML_LIMIT:
+        return html_out
+    lines = body.split("\n")
+    truncated = False
+    # Coarse pre-trim on raw length (HTML output is never shorter than its
+    # source) so the fine per-line loop below stays bounded.
+    while len(lines) > 1 and sum(len(ln) + 1 for ln in lines) > _FOLD_RAW_LIMIT:
+        lines.pop(0)
+        truncated = True
+    while True:
+        window = lines[:]
+        while window and not window[0].strip():
+            window.pop(0)
+        candidate = "\n".join([FOLD_TRUNCATION_LINE] + window) if truncated else "\n".join(window)
+        html_out = _render(candidate)
+        if _utf16_units(html_out) <= _FOLD_HTML_LIMIT:
+            return html_out
+        if len(lines) > 1:
+            lines.pop(0)
+            truncated = True
+            continue
+        # Single oversized line: hard-cut from the front, keep the tail.
+        keep = len(lines[0]) // 2
+        if keep < 1:
+            return ""
+        lines[0] = lines[0][-keep:]
+        truncated = True
+
+
+def render_fold_live(fold_texts: List[str]) -> str:
+    """Live-phase HTML: growing PLAIN TEXT, no blockquote, no caption.
+
+    Owner 2026-08-02: the live stream shows as plain text so the flow is
+    readable in real time; the collapse into a caption + expandable quote fold
+    happens only at finalize (render_fold_final). Supersedes the earlier D1
+    'non-expandable blockquote' live render.
+    """
+    return _render_fold_html(_fold_v2_body(fold_texts), "", expandable=False, quote=False)
+
+
+def render_fold_final(fold_texts: List[str], caption: str) -> str:
+    """Finalize-phase HTML: collapsed expandable fold with the caption as its
+    first quoted line (owner 2026-08-02: caption inside the blockquote)."""
+    return _render_fold_html(_fold_v2_body(fold_texts), caption, expandable=True)
+
+
+def compose_interim_fold(interim_texts: List[str], final_text: str) -> str:
+    """Compose captured interim narration into one `>!` fold quote run.
+
+    Returns the quoted fold block (no trailing separator) or "" when nothing
+    survives composition -- empty/whitespace-only capture (D6) or a final
+    answer so large that even the minimum fold cannot fit the single-chunk
+    budget (D7: the fold shrinks first, the answer is never cut). The caller
+    prepends the result with INTERIM_FOLD_SEPARATOR between fold and answer.
+    """
+    blocks: List[str] = []
+    for t in interim_texts or []:
+        # Neutralize code fences so the fold never opens a code segment in
+        # the send path (D11); trim edge newlines so joins stay tight.
+        t = (t or "").replace("```", "'''").strip("\n")
+        if t.strip():
+            blocks.append(t)
+    joined = "\n\n".join(blocks)
+    # D8: drop leading whitespace-only lines so the collapsed preview line is
+    # the first MEANINGFUL narration line.
+    lines = joined.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    joined = "\n".join(lines).rstrip()
+    if not joined.strip():
+        return ""
+    final = final_text or ""
+    cap = min(INTERIM_FOLD_CAP, len(joined))
+    while cap > 0:
+        quoted = _fold_quote_lines(_fold_middle_truncate(joined, cap))
+        combined = quoted + INTERIM_FOLD_SEPARATOR + final
+        if (
+            len(combined) <= _FOLD_RAW_LIMIT
+            and _utf16_units(markdown_to_telegram_html(combined)) <= _FOLD_HTML_LIMIT
+        ):
+            return quoted
+        if cap <= _FOLD_MIN_CAP:
+            break
+        cap = max(cap // 2, _FOLD_MIN_CAP)
+    return ""
 
 
 # DGN-372: Telegram legacy Markdown (parse_mode="Markdown") swallows unmatched
