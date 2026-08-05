@@ -125,10 +125,22 @@ class Config(BaseSettings):
     # When False (default), only the terminal AssistantMessage (stop_reason=end_turn)
     # is live-streamed to the user; interim between-tool narration is suppressed and
     # the typing indicator remains the only feedback during those phases.
-    # Set STREAM_INTERIM=true in .env to restore the pre-DGN-426 behavior (all
-    # AssistantMessage TextBlocks displayed live). User-facing agents should leave
-    # this at the default (False).
+    # DGN-682: DEPRECATED alias -- superseded by INTERIM_MODE below. When
+    # INTERIM_MODE is unset, STREAM_INTERIM=true maps to interim mode "inline"
+    # (the pre-DGN-426 behavior: all AssistantMessage TextBlocks display live).
+    # Planned for removal one version after DGN-682 ships. User-facing agents
+    # should leave this at the default (False).
     stream_interim: bool = Field(default=False)
+    # DGN-682: interim narration mode -- "suppress" | "inline" | "fold".
+    #   suppress (default): interim narration dropped; typing indicator only.
+    #   inline: every interim TextBlock streams live (pre-DGN-426 behavior).
+    #   fold: interim narration is captured during the turn and prepended to
+    #     the final answer as ONE collapsed expandable blockquote (rendered via
+    #     the DGN-619 `>!` fold marker). Dev-agent opt-in; user-facing agents
+    #     stay on the default suppress.
+    # Unset (None) -> resolution falls back to the STREAM_INTERIM alias (see
+    # _resolve_interim_mode / INTERIM_MODE below).
+    interim_mode: Optional[str] = Field(default=None)
 
     # Voice (local faster-whisper only)
     transcription_provider: str = Field(default="local")
@@ -200,6 +212,17 @@ class Config(BaseSettings):
             return None
         return parsed
 
+    @field_validator("interim_mode", mode="before")
+    @classmethod
+    def _normalize_interim_mode(cls, v):
+        # DGN-682: only suppress/inline/fold are recognized; anything else
+        # (or empty) behaves as unset so the STREAM_INTERIM alias resolution
+        # in _resolve_interim_mode applies.
+        if v is None:
+            return None
+        value = str(v).strip().lower()
+        return value if value in {"suppress", "inline", "fold"} else None
+
     @field_validator("locale", mode="before")
     @classmethod
     def _normalize_locale(cls, v):
@@ -254,7 +277,31 @@ CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH") or (
 )
 # DGN-426: expose as module-level constant so sdk_bridge.py can import once
 # rather than reaching into the Config object on every message.
+# DGN-682: kept as a DERIVED back-compat symbol (existing tests patch it and
+# it still acts as the deprecated "inline" alias); INTERIM_MODE below is the
+# primary knob.
 STREAM_INTERIM: bool = config.stream_interim
+
+
+# DGN-682 D1: INTERIM_MODE supersedes the boolean STREAM_INTERIM. An explicit
+# INTERIM_MODE always wins; unset + STREAM_INTERIM=true maps to "inline"
+# (deprecated alias, removal planned one version out); unset + unset ->
+# "suppress". Instances with neither key set resolve to suppress unchanged
+# (pydantic extra="ignore" keeps stray keys from crashing).
+def _resolve_interim_mode(explicit: Optional[str], stream_interim: bool) -> str:
+    """Resolve the effective interim mode from the explicit field + alias."""
+    if explicit in ("suppress", "inline", "fold"):
+        return explicit
+    return "inline" if stream_interim else "suppress"
+
+
+INTERIM_MODE: str = _resolve_interim_mode(config.interim_mode, config.stream_interim)
+# DGN-699 D3: growing-fold live-edit throttle -- a TIME-DOMINANT minimum
+# interval between fold HTML edits. Reuses the DRAFT_UPDATE_INTERVAL knob but
+# floors it at 2.0s (spec: 2~3s band): the fold is a background progress
+# surface, so it must never approach the per-chat edit rate limit the way the
+# 1.0s draft default may.
+FOLD_UPDATE_INTERVAL: float = max(float(config.draft_update_interval), 2.0)
 # DGN-555: selective reply-linking. The FINAL response of a turn is sent as a
 # Telegram reply to its triggering user message ONLY when newer user messages
 # interleaved before the send, or the response fires later than

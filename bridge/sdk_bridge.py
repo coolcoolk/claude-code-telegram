@@ -35,9 +35,20 @@ from bridge.config import (
     BRIDGE_SCAFFOLD_GUARD,
     CLAUDE_CLI_PATH,
     CLAUDE_MAX_BUFFER_SIZE,
+    FOLD_UPDATE_INTERVAL,
+    INTERIM_MODE,
     PROCESS_TIMEOUT,
     STREAM_INTERIM,
     config,
+)
+from bridge.formatting import (
+    FOLD_CAPTION_NORMAL,
+    FOLD_CAPTION_STOPPED,
+    FOLD_CAPTION_TIMEOUT,
+    INTERIM_FOLD_SEPARATOR,
+    compose_interim_fold,
+    render_fold_final,
+    render_fold_live,
 )
 from bridge.options import OPTIONS_MARKER, classify_is_choice, has_numbered_list
 from bridge.permissions import extract_outside_paths, extract_protected_paths
@@ -62,6 +73,18 @@ ALLOWED_TOOLS = [
 ]
 
 TYPING_INTERVAL = 4  # seconds; Telegram typing status expires after ~5s
+
+# DGN-699 D8: lazy fold-bubble creation gates (short-turn noise guard). The
+# fold message is created only when a SECOND interim block arrives, OR the
+# accumulated capture crosses the char floor; turns that never pass the gate
+# fall back to the existing finalize-time compose_interim_fold synthesis
+# (DGN-682), so short turns never open a dedicated bubble.
+# Note: the T-gate (FOLD_CREATE_MIN_SECS, 8s) was removed at grill review
+# because the gate is checked on interim ARRIVAL, so elapsed time at the 2nd
+# interim is negligible -- the count gate always fires first. If a T-gate is
+# ever needed, reintroduce it as a periodic check, not an arrival check.
+FOLD_CREATE_MIN_INTERIMS = 2
+FOLD_CREATE_MIN_CHARS = 300
 
 # DGN-581: budget for the soft-interrupt control request. A CLI stuck badly
 # enough to not ack the control channel within this window is treated as an
@@ -124,6 +147,21 @@ def _is_retryable_sdk_error(error: Exception) -> bool:
     if type(error).__name__ in _RETRYABLE_TYPES:
         return True
     return any(p in msg.lower() for p in _RETRYABLE_MSG)
+
+
+def _effective_interim_mode() -> str:
+    """DGN-682 D1: resolve the effective interim mode at call time.
+
+    INTERIM_MODE (suppress|inline|fold) is the primary knob. The legacy
+    STREAM_INTERIM boolean stays honored as a deprecated alias -- and as the
+    symbol existing tests patch on this module: when the mode resolves to
+    suppress but STREAM_INTERIM is truthy, the alias maps to inline. Reads the
+    module globals at call time so unittest.mock.patch on either symbol works.
+    """
+    mode = INTERIM_MODE
+    if mode == "suppress" and STREAM_INTERIM:
+        return "inline"
+    return mode
 
 
 def _no_pending_guard(tool_name: str, tool_input: Any):
@@ -236,6 +274,29 @@ class _PendingRequest:
     # placeholder-flake detection. Incremented in _reader_loop on each
     # AssistantMessage that has no parent_tool_use_id.
     tool_use_count: int = 0
+    # DGN-682 D4/D9: fold-mode interim TextBlock capture buffer. Owned by the
+    # request: a fresh empty list per turn, discarded together with the request
+    # on EVERY termination path (normal, is_error, /stop, timeout) -- no
+    # cross-turn bleed. Capture applies _scaffold_guard ONLY (D5).
+    interim_texts: List[str] = field(default_factory=list)
+    # DGN-699 D2: growing-fold state, deliberately SEPARATE from the
+    # streaming_handler drafts (fold_msg_id must never enter
+    # ChatResponse.draft_message_ids -- D4). fold_buf accumulates the same
+    # captured narration that interim_texts holds; the dedicated fold
+    # dispatch renders/edits from it. Per-request lifetime: a retry's new
+    # request starts a fresh fold bubble (D7).
+    fold_msg_id: Optional[int] = None
+    fold_buf: List[str] = field(default_factory=list)
+    # Throttle/lifecycle internals for the fold dispatch (D3/D7/D8).
+    # fold_dirty removed (grill MINOR): field was written but never read for
+    # a branch decision -- throttle logic relies solely on fold_last_edit_at
+    # (time gate) and fold_retry_at (RetryAfter backoff).
+    # fold_first_interim_at removed (grill MINOR): only served the T-gate
+    # (FOLD_CREATE_MIN_SECS) which was also removed as dead -- the count gate
+    # always fires before elapsed time would reach the threshold.
+    fold_last_edit_at: float = 0.0
+    fold_retry_at: float = 0.0
+    fold_finalized: bool = False
 
 
 @dataclass
@@ -310,11 +371,17 @@ class SdkBridge:
                 return result
             return PermissionResultAllow() if result else PermissionResultDeny()
 
+        # DGN-699 FATAL-1: the fold fragment is gated on the CURRENT effective
+        # mode so that suppress/inline/off turns never receive a premise that
+        # is false for them ("the user already saw your progress live").
+        _sys_prompt = messages.SYSTEM_PROMPT
+        if _effective_interim_mode() == "fold":
+            _sys_prompt = _sys_prompt + messages.SYSTEM_PROMPT_FOLD_FRAGMENT
         opts: Dict[str, Any] = {
             "cwd": str(self.project_root),
             "allowed_tools": ALLOWED_TOOLS,
             "disallowed_tools": ["AskUserQuestion"],
-            "system_prompt": messages.SYSTEM_PROMPT,
+            "system_prompt": _sys_prompt,
             "can_use_tool": can_use_tool,
             "permission_mode": "default",
             # DGN-460: default SDK transport buffer (1MB) is too small for
@@ -358,6 +425,11 @@ class SdkBridge:
         msg = cancel_message or messages.TASK_TERMINATED
         while state.pending:
             req = state.pending.popleft()
+            # DGN-699 D7 (_disconnect_user_stream cleanup hook): this teardown
+            # path never reaches _finalize_result, so an orphaned grown fold
+            # is confirmed here (collapse + stop marker). Idempotent: paths
+            # that already finalized (timeout/stop/finalize) are no-ops.
+            await self._fold_finalize(req, FOLD_CAPTION_STOPPED)
             if not req.future.done():
                 req.future.set_result(
                     ChatResponse(
@@ -528,21 +600,36 @@ class SdkBridge:
                     # stop_reason="end_turn" is the measured 100%-clean terminality
                     # signal (164 turns). "tool_use", None, or a ServerToolUseBlock
                     # present -> non-terminal (suppress live display; typing indicator
-                    # is the only feedback). When STREAM_INTERIM is True the gating
-                    # is bypassed and all TextBlocks display live (pre-DGN-426 behavior).
+                    # is the only feedback). DGN-682: interim mode "inline" (or the
+                    # deprecated STREAM_INTERIM alias) bypasses the gating and all
+                    # TextBlocks display live (pre-DGN-426 behavior); mode "fold"
+                    # keeps interim off the live stream but CAPTURES it for the
+                    # finalize-time fold blockquote.
                     stop_reason = getattr(msg, "stop_reason", None)
                     has_server_tool = any(
                         isinstance(b, ServerToolUseBlock) for b in msg.content
                     )
                     is_terminal = stop_reason == "end_turn" and not has_server_tool
-                    live_stream = STREAM_INTERIM or is_terminal
+                    interim_mode = _effective_interim_mode()
+                    live_stream = interim_mode == "inline" or is_terminal
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             # DGN-285: guard at ingestion so both the final
                             # assembly and the live streaming drafts are clean.
                             block_text = _scaffold_guard(block.text)
                             req.last_assistant_texts.append(block_text)
-                            if req.streaming_handler and live_stream:
+                            if interim_mode == "fold" and not is_terminal:
+                                # DGN-682 D4/D5: capture interim narration on the
+                                # scaffold-guarded block text (see
+                                # _PendingRequest.interim_texts).
+                                captured = _scaffold_guard(block.text)
+                                if captured.strip():
+                                    req.interim_texts.append(captured)
+                                    # DGN-699 D2: growing-fold dispatch rides the
+                                    # SAME captured text. Never raises into the
+                                    # reader loop.
+                                    await self._fold_dispatch(req, captured)
+                            if req.streaming_handler and live_stream and block_text:
                                 try:
                                     await req.streaming_handler.update_if_needed(block_text)
                                 except Exception as e:
@@ -597,6 +684,10 @@ class SdkBridge:
                         await req.streaming_handler.finalize_all()
                     except Exception:
                         pass
+                # DGN-699 D7 (reader crash): a grown fold is confirmed
+                # collapsed with the stop marker, never deleted (the user
+                # already saw the progress). _fold_finalize never raises.
+                await self._fold_finalize(req, FOLD_CAPTION_STOPPED)
                 if not req.future.done():
                     req.future.set_result(
                         ChatResponse(
@@ -759,6 +850,203 @@ class SdkBridge:
         except Exception as e:
             logger.error("Proactive push failed for user %s: %s", user_id, e)
 
+    async def _fold_dispatch(self, req: _PendingRequest, captured: str) -> None:
+        """DGN-699 D2/D3/D8: grow the dedicated fold bubble with new narration.
+
+        Called from the reader loop on every captured fold-mode interim block.
+        Contract:
+        - D8 lazy creation: the fold message is created only past a gate
+          (2nd interim OR char floor); short turns never open a bubble and
+          fall back to finalize-time compose synthesis.
+        - D3 throttle: edits pass a TIME-DOMINANT AND gate (new content has
+          arrived AND FOLD_UPDATE_INTERVAL elapsed AND any RetryAfter backoff
+          deadline passed). A rate limit defers to a later tick -- no sleep
+          ever happens on this path, the reader loop never stalls.
+        - Never raises: any failure logs and leaves the turn pipeline intact.
+        """
+        try:
+            handler = req.streaming_handler
+            if handler is None or req.fold_finalized:
+                return
+            from bridge.streaming import edit_fold_html, send_fold_html
+
+            now = asyncio.get_event_loop().time()
+            req.fold_buf.append(captured)
+
+            if req.fold_msg_id is None:
+                total_chars = sum(len(t) for t in req.fold_buf)
+                if not (
+                    len(req.fold_buf) >= FOLD_CREATE_MIN_INTERIMS
+                    or total_chars >= FOLD_CREATE_MIN_CHARS
+                ):
+                    return
+                html = render_fold_live(req.fold_buf)
+                if not html:
+                    return
+                mid = await send_fold_html(handler.bot, req.chat_id, html)
+                if mid is not None:
+                    req.fold_msg_id = mid
+                    req.fold_last_edit_at = now
+                return
+
+            if now < req.fold_retry_at:
+                return
+            if (now - req.fold_last_edit_at) < FOLD_UPDATE_INTERVAL:
+                return
+            html = render_fold_live(req.fold_buf)
+            if not html:
+                return
+            ok, retry_after = await edit_fold_html(
+                handler.bot, req.chat_id, req.fold_msg_id, html
+            )
+            if ok:
+                req.fold_last_edit_at = now
+            elif retry_after > 0:
+                req.fold_retry_at = now + retry_after
+        except Exception as e:
+            logger.error(
+                "Fold dispatch failed for user %s: %s", req.user_id, e
+            )
+
+    async def _fold_finalize(self, req: _PendingRequest, caption: str) -> bool:
+        """DGN-699 D1/D7: swap the fold bubble to [caption + collapsed fold].
+
+        The finalize edit re-renders from the FULL fold_buf, so it is also the
+        D3 tail flush (any delta a throttled tick skipped lands here).
+        Idempotent (fold_finalized latch): every D7 termination path may call
+        it safely; only the first call edits. Returns True when a fold bubble
+        existed for this turn (used by the timeout partial_preserved probe),
+        False when there was nothing to finalize. Never raises.
+        """
+        try:
+            if req.fold_msg_id is None or req.fold_finalized:
+                return False
+            req.fold_finalized = True
+            handler = req.streaming_handler
+            if handler is None:
+                return True
+            from bridge.streaming import finalize_fold_html
+
+            html = render_fold_final(req.fold_buf, caption)
+            if not html:
+                return True
+            ok = await finalize_fold_html(
+                handler.bot, req.chat_id, req.fold_msg_id, html
+            )
+            if not ok:
+                logger.error(
+                    "Fold finalize edit failed for user %s (msg %s); bubble "
+                    "left in last live form",
+                    req.user_id,
+                    req.fold_msg_id,
+                )
+            return True
+        except Exception as e:
+            logger.error("Fold finalize failed for user %s: %s", req.user_id, e)
+            return req.fold_msg_id is not None
+
+    @staticmethod
+    def _dedup_final_against_interim(content: str, interim_texts: List[str]) -> str:
+        """DGN-699 D5 code backstop: drop final-body paragraphs that EXACTLY
+        duplicate live-shown interim narration.
+
+        Normalized (whitespace-collapsed) FULL-match only -- containment
+        judgments are forbidden (a short final answer that is a substring of
+        the narration would be wrongly erased and the DGN-519 empty-drop
+        would then silently discard the turn). If filtering would empty the
+        result, the filter is skipped entirely (non-empty floor).
+        """
+        try:
+            if not content or not interim_texts:
+                return content
+
+            def _norm(s: str) -> str:
+                return re.sub(r"\s+", " ", s).strip()
+
+            seen = set()
+            for t in interim_texts:
+                for para in re.split(r"\n\s*\n", t or ""):
+                    n = _norm(para)
+                    if n:
+                        seen.add(n)
+            if not seen:
+                return content
+            kept = [
+                p
+                for p in re.split(r"\n\s*\n", content)
+                if _norm(p) and _norm(p) not in seen
+            ]
+            deduped = "\n\n".join(kept).strip()
+            if not deduped:
+                return content  # non-empty floor: skip the filter
+            return deduped
+        except Exception:
+            return content
+
+    @staticmethod
+    def _final_fully_in_interim(content: str, interim_texts: List[str]) -> bool:
+        """DGN-699 (owner 2026-08-02): True when EVERY non-empty final paragraph
+        (normalized) already appears as an interim narration paragraph.
+
+        This is exactly the condition under which _dedup_final_against_interim
+        would empty the body and fall back to its non-empty floor (showing the
+        duplicate). Detecting it lets the caller drop the now-redundant fold
+        bubble instead of leaving the overlap on screen. Containment is NOT
+        used -- only normalized full-paragraph matches, same as the dedup.
+        """
+        try:
+            if not content or not interim_texts:
+                return False
+
+            def _norm(s: str) -> str:
+                return re.sub(r"\s+", " ", s).strip()
+
+            seen = set()
+            for t in interim_texts:
+                for para in re.split(r"\n\s*\n", t or ""):
+                    n = _norm(para)
+                    if n:
+                        seen.add(n)
+            if not seen:
+                return False
+            paras = [p for p in re.split(r"\n\s*\n", content) if _norm(p)]
+            if not paras:
+                return False
+            return all(_norm(p) in seen for p in paras)
+        except Exception:
+            return False
+
+    async def _fold_delete(self, req: _PendingRequest) -> bool:
+        """DGN-699 (owner 2026-08-02): drop a fully-redundant fold bubble.
+
+        Called when the final answer body entirely reproduces the live fold
+        narration -- the collapsed progress record would only duplicate the
+        answer, so the bubble is deleted and the clean final message stands
+        alone (owner-chosen option 1: overlap removed at the root). Sets the
+        fold_finalized latch first so the normal finalize swap becomes a
+        no-op. Idempotent; never raises.
+        """
+        try:
+            if req.fold_msg_id is None or req.fold_finalized:
+                return False
+            req.fold_finalized = True
+            handler = req.streaming_handler
+            if handler is None:
+                return True
+            try:
+                await handler.bot.delete_message(
+                    chat_id=req.chat_id, message_id=req.fold_msg_id
+                )
+            except Exception as e:
+                logger.error(
+                    "Fold delete failed for user %s (msg %s): %s",
+                    req.user_id, req.fold_msg_id, e,
+                )
+            return True
+        except Exception as e:
+            logger.error("Fold delete failed for user %s: %s", req.user_id, e)
+            return False
+
     async def _finalize_result(
         self, user_id: int, state: _UserStreamState, req: _PendingRequest, msg: ResultMessage
     ) -> None:
@@ -800,9 +1088,39 @@ class SdkBridge:
         # check only for the non-error branch.
         if not msg.is_error and not content:
             logger.info("empty-final turn dropped for user %s", user_id)
+            # DGN-699 D7 (empty-final drop): the answer body is silently
+            # dropped, but a grown fold is CONFIRMED in place (caption +
+            # collapse) -- the caption is then the turn's only signal.
+            await self._fold_finalize(req, FOLD_CAPTION_NORMAL)
             return
 
+        # DGN-699 D5 (code backstop): on a grown-fold turn the narration was
+        # already shown live, so final-body paragraphs that EXACTLY duplicate
+        # it (normalized full match only, non-empty floor) are dropped. The
+        # primary dedup lever is the prompt instruction (fold fragment);
+        # this is the safety net behind it.
+        if (
+            not msg.is_error
+            and req.synthetic_response is None
+            and req.fold_msg_id is not None
+            and _effective_interim_mode() == "fold"
+        ):
+            # DGN-699 (owner 2026-08-02, option 1): when the final body ENTIRELY
+            # duplicates the live fold (every final paragraph already narrated),
+            # the collapsed fold would only echo the answer -- delete it outright
+            # and keep the clean final so the two never overlap. Otherwise run
+            # the paragraph-level dedup backstop (partial-overlap trim).
+            if self._final_fully_in_interim(content, req.interim_texts):
+                await self._fold_delete(req)
+            else:
+                content = self._dedup_final_against_interim(content, req.interim_texts)
+
         if msg.is_error:
+            # DGN-699 D7 (is_error): DGN-682 D9 stays -- no fold is ever
+            # ATTACHED to an error notice -- but an already-grown fold bubble
+            # is confirmed collapsed with the stop marker (the user saw it;
+            # deleting it would erase real progress).
+            await self._fold_finalize(req, FOLD_CAPTION_STOPPED)
             req.future.set_result(
                 ChatResponse(
                     content=messages.PROCESSING_FAILED.format(error=content),
@@ -838,6 +1156,61 @@ class SdkBridge:
             content = await self._maybe_mark_options(req.user_message, content)
 
         has_options = req.synthetic_response is not None or has_numbered_list(content)
+
+        # DGN-682 D2/D5/D10: fold-mode interim synthesis, at the finalize
+        # TAIL END -- after the final guards (D5), the DGN-519 empty-drop,
+        # and _maybe_mark_options / has_options (so quoted narration numbering
+        # can never be mistaken for a choice menu, D10). The fold never
+        # participates in the body guard / empty-drop / options judgments
+        # above. is_error turns returned early above, so a fold never attaches
+        # to an error notice (D9).
+        #
+        # DGN-699 D1/D4/D8: a turn whose fold bubble already GREW live takes
+        # the 2-bubble path instead -- the bridge confirms the fold bubble
+        # directly (caption + collapse; fold_msg_id never enters
+        # draft_message_ids) and the final answer goes out as its own
+        # separate message, with NO fold prepended (prepending would
+        # duplicate what the user already watched grow). Turns that never
+        # passed the D8 creation gate keep the finalize-time compose
+        # synthesis below unchanged.
+        if _effective_interim_mode() == "fold":
+            if req.fold_msg_id is not None:
+                await self._fold_finalize(req, FOLD_CAPTION_NORMAL)
+            else:
+                # DGN-710: the compose-fallback path must apply the SAME
+                # final-vs-interim dedup as the grown-bubble path above.
+                # Without it, a short turn whose opening streamed as a
+                # non-terminal chunk (captured as interim) and was then
+                # re-sent in the end_turn body renders that paragraph twice:
+                # once in the collapsed fold, once in the body.
+                if self._final_fully_in_interim(content, req.interim_texts):
+                    # The whole answer already sits in the fold -- prepending
+                    # it would only echo the body. Keep the clean final alone,
+                    # attach no fold (symmetric with the grown-bubble delete).
+                    logger.info(
+                        "DGN-710 compose fold dropped for user %s: final body "
+                        "fully duplicates captured interim",
+                        user_id,
+                    )
+                else:
+                    content = self._dedup_final_against_interim(
+                        content, req.interim_texts
+                    )
+                    fold = compose_interim_fold(req.interim_texts, content)
+                    if fold:
+                        content = fold + INTERIM_FOLD_SEPARATOR + content
+                    elif req.interim_texts:
+                        # D6: interim WAS captured but composed to nothing
+                        # (whitespace or budget-drop) -- log distinctly from
+                        # the ordinary no-interim turn so silent-empty causes
+                        # stay traceable.
+                        logger.info(
+                            "DGN-682 fold dropped for user %s: %d captured "
+                            "interim block(s) composed empty",
+                            user_id,
+                            len(req.interim_texts),
+                        )
+
         if not req.future.done():
             req.future.set_result(
                 ChatResponse(
@@ -975,6 +1348,9 @@ class SdkBridge:
                     await streaming_handler.cancel()
                 except Exception:
                     pass
+            # DGN-699 D7 (CancelledError): drafts are deleted above, but a
+            # grown fold is confirmed with the stop marker, not deleted.
+            await self._fold_finalize(request, FOLD_CAPTION_STOPPED)
             await self.stop(user_id)
             raise
 
@@ -998,6 +1374,10 @@ class SdkBridge:
                     state.pending.remove(request)
                 except ValueError:
                     pass
+            # DGN-699 D7: the request left the pending deque, so no cleanup
+            # hook will ever see it again -- confirm a grown fold here before
+            # the retry path builds a NEW request (fresh fold, no overlap).
+            await self._fold_finalize(request, FOLD_CAPTION_STOPPED)
             if _is_retryable_sdk_error(e):
                 logger.warning("Retryable SDK error for user %s: %s — retrying", user_id, e)
                 return await self._reconnect_and_retry(
@@ -1151,6 +1531,11 @@ class SdkBridge:
                         partial_preserved = True
                     except Exception as e:
                         logger.error("Timeout finalize failed for user %s: %s", user_id, e)
+                # DGN-699 D4/D7 (timeout): a turn whose only streamed surface
+                # is the grown fold still counts as partial output preserved.
+                # The fold is confirmed with the timeout marker.
+                if await self._fold_finalize(head, FOLD_CAPTION_TIMEOUT):
+                    partial_preserved = True
         await self._disconnect_user_stream(user_id, cancel_message=messages.STILL_WORKING)
         return resume_session_id, partial_preserved
 
@@ -1166,6 +1551,11 @@ class SdkBridge:
                     cancelled = True
                 except Exception as e:
                     logger.error("Failed to cancel streaming for user %s: %s", user_id, e)
+            # DGN-699 D7 (/stop): drafts above are DELETED, but a grown fold
+            # is confirmed collapsed with the stop marker -- the progress the
+            # user watched is preserved, never deleted.
+            if await self._fold_finalize(req, FOLD_CAPTION_STOPPED):
+                cancelled = True
         return cancelled
 
 
