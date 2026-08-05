@@ -40,11 +40,15 @@ MAX_FILE_BYTES = 10 * 1024 * 1024
 # link_preview:: control marker as a contract construct (a4).
 #
 # a1 CONTRACT_VERSION -- handshake between the semantic core (marker vocabulary)
-#   and this render layer. A version-skew (RULES advances a marker while a
-#   .dogany-preserve-frozen render layer stays behind -- Metal's own DGN-696
-#   drift) is then DETECTABLE: the core can stamp the contract version it was
-#   authored against, and check_contract_skew() logs when the render layer is
-#   older. Bump this only when the recognized marker vocabulary changes.
+#   and this render layer. DORMANT BY DESIGN (dec-108): this is a phase-2 API
+#   surface only. Nothing stamps or checks it at runtime today -- no producer
+#   stamps a contract version (the semantic core is an LLM and cannot reliably
+#   self-stamp yet) and no consumer calls check_contract_skew(). It exists so a
+#   future non-LLM producer / harness can make version-skew (RULES advances a
+#   marker while a .dogany-preserve-frozen render layer stays behind -- the
+#   DGN-696 drift shape) DETECTABLE. The real runtime defense against skew is
+#   a2 (contain_unknown_markers), which needs no handshake. Bump this only when
+#   the recognized marker vocabulary changes.
 CONTRACT_VERSION = 1
 
 # a2/a4 -- the marker vocabulary THIS render layer recognizes. Every neutral
@@ -91,12 +95,18 @@ _ZWSP = "\u200b"
 def check_contract_skew(core_version: Optional[int]) -> bool:
     """a1: detect a semantic-core / render-bridge version skew.
 
+    DORMANT phase-2 API surface (dec-108): no runtime caller exists today --
+    no producer stamps a contract version (the semantic core is an LLM and
+    cannot reliably self-stamp yet), so nothing invokes this check. It is kept
+    as the forward observability handshake for a future stamping producer.
+
     core_version is the CONTRACT_VERSION the emitting semantic core was authored
     against (None = un-stamped / legacy core, treated as compatible). Returns
     True when a skew is detected (core NEWER than this render layer, i.e. the
     render layer is frozen behind an advanced RULES vocabulary -- the DGN-696
     case) and logs one warning; False otherwise. Non-fatal: the containment net
-    (a2) is the runtime safety, this is the observability handshake.
+    (a2, contain_unknown_markers) is the real runtime safety; this is only the
+    dormant observability handshake.
     """
     if core_version is None:
         return False
@@ -142,7 +152,10 @@ def contain_unknown_markers(text: str) -> Tuple[str, int]:
         out.append(indent + neutralized)
         downgraded += 1
     if downgraded:
-        logger.warning(
+        # debug (not warning) level -- dec-108 a2: ordinary prose lines like
+        # "todo:: x" match the marker shape and would WARN-spam on every send;
+        # containment is routine hygiene, not an incident.
+        logger.debug(
             "Contained %d unknown output marker(s) (version skew?); downgraded "
             "to safe literal.",
             downgraded,
@@ -248,7 +261,6 @@ def render_fold_block(text: str) -> str:
         out.append(lines[i])
         i += 1
     return "\n".join(out)
-
 
 
 def extract_send_marker_paths(content: str) -> List[str]:
