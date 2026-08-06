@@ -186,6 +186,49 @@ class TestPrefixDotNotSeparator:
 
 
 # ---------------------------------------------------------------------------
+# (e2) separator at label START must not erase the body (number-only button)
+# ---------------------------------------------------------------------------
+
+
+class TestSeparatorAtLabelStart:
+    """Regression: a body that STARTS with a separator (e.g. "--html ...")
+    used to collapse to an empty body -- the button showed only "2. ".
+    The separator split now applies only when an action phrase precedes it;
+    a leading separator is treated as part of the label body."""
+
+    def test_double_hyphen_start_keeps_body(self):
+        assert _shorten_button_label("2. --html 경유") == "2. --html 경유"
+
+    def test_em_dash_start_keeps_body(self):
+        assert _shorten_button_label("1. —강제 진행") == "1. —강제 진행"
+
+    def test_colon_start_keeps_body(self):
+        assert _shorten_button_label("3. :옵션 유지") == "3. :옵션 유지"
+
+    def test_repro_dgn_number_only_button(self):
+        # Original repro: "2. --html opt-in ..." -> button text was "2. ".
+        result = _shorten_button_label("2. --html opt-in 경유 (변환 후 전송)")
+        assert result.strip() != "2.", f"body erased, got {result!r}"
+        assert "--html" in result, f"body lost, got {result!r}"
+
+    def test_no_prefix_leading_separator_keeps_body(self):
+        assert _shorten_button_label("--force 재시도") == "--force 재시도"
+
+    def test_leading_separator_overlong_still_trims(self):
+        # Leading separator + overlong body: glyph-trim fallback still applies
+        # and the result carries real body content, not just the prefix.
+        label = "1. --" + "가" * 25
+        result = _shorten_button_label(label)
+        assert result.endswith("…"), f"expected ellipsis, got {result!r}"
+        assert len(result) > len("1. ") + 1, f"body erased, got {result!r}"
+
+    def test_normal_split_still_works(self):
+        # Guard must not weaken the normal case: action phrase before the
+        # separator still gets the description clause stripped.
+        assert _shorten_button_label("1. 실행 -- 설명 문구") == "1. 실행"
+
+
+# ---------------------------------------------------------------------------
 # (f) short label passthrough
 # ---------------------------------------------------------------------------
 

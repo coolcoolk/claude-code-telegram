@@ -262,9 +262,15 @@ def _shorten_button_label(label: str) -> str:
         body = label
 
     # Strip description clause after the first separator in the action body.
+    # Only split when an action phrase actually precedes the separator: a label
+    # whose body STARTS with a separator (e.g. "--html opt-in ...") would
+    # otherwise collapse to an empty body, leaving a number-only button.
+    # In that case the separator is part of the label body itself -- keep it.
     sep_match = _LABEL_SEPARATORS.search(body)
     if sep_match:
-        body = body[: sep_match.start()].strip()
+        head = body[: sep_match.start()].strip()
+        if head:
+            body = head
 
     # Reassemble and check total weighted display width.
     short = prefix + body
