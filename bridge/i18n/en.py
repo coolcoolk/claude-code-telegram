@@ -88,6 +88,9 @@ STRINGS = {
     "usage_script_missing": "Usage script not found (routines/claude-usage.sh).",
     "usage_timeout": "The usage lookup did not finish in time. Please try again shortly.",
     "usage_failed": "Usage lookup failed: {error}",
+    # --- Transient countdown (DGN-594) ---
+    "countdown_body": "{label} {remaining} left  {bar}",
+    "countdown_done": "{label} done",
     # --- Resume (session history) ---
     "no_session_history": "No session history found.",
     "session_history_header": "Session History",

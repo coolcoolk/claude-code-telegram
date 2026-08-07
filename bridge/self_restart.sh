@@ -27,6 +27,13 @@
 #                   compose it release-note style (what changed for the user,
 #                   not dev jargon). Failure notify always stays technical.
 #   --verify PROMPT (optional) headless claude -p after restart; output appended to notify
+#   --resume-intent TEXT (optional; DGN-706) in-flight task + next concrete
+#                   action at restart time. When set, the post-restart spool
+#                   (DGN-226) step 4 hands the resumed session this exact context
+#                   to continue -- instead of guessing from chronically-open wip
+#                   tickets. When omitted, the caller asserts NO in-flight task
+#                   and the resumed session is told not to hunt wip. Wire this
+#                   whenever you trigger a restart with work still pending.
 #   --model NAME    (optional) model for --verify (default haiku)
 #   --delay N       (optional) seconds before SIGTERM, lets the current turn flush (default 6)
 #   --label LABEL   (optional) launchd label (default com.telegram-skill-bot.telegram-agent)
@@ -47,6 +54,7 @@ LABEL="com.telegram-skill-bot.telegram-agent"
 REASON=""
 NOTICE=""
 VERIFY=""
+RESUME_INTENT=""
 MODEL="haiku"
 DELAY=6
 ENV_FILE="__PROJECT_ROOT__/.telegram_bot/.env"
@@ -60,11 +68,18 @@ FORCE=""
 IDLE_MINS=10
 TRIGGER="auto"
 
+# DGN-706b: derive the instance root from this script's own location
+# (bridge/ -> parent). Works in both the launcher and the re-exec'd worker
+# ($0 is absolute there). Feeds the version-update auto-notice below.
+SELF_BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTANCE_ROOT="$(cd "$SELF_BIN_DIR/.." && pwd)"
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --reason)  REASON="$2"; shift 2 ;;
     --notice)  NOTICE="$2"; shift 2 ;;
     --verify)  VERIFY="$2"; shift 2 ;;
+    --resume-intent) RESUME_INTENT="$2"; shift 2 ;;
     --model)   MODEL="$2"; shift 2 ;;
     --delay)   DELAY="$2"; shift 2 ;;
     --label)   LABEL="$2"; shift 2 ;;
@@ -85,6 +100,37 @@ case "$TRIGGER" in user|auto) ;; *) echo "invalid --trigger '$TRIGGER' (user|aut
 
 notify() { "$PUSH" --env "$ENV_FILE" --text "$1" || echo "[self_restart] push failed" >&2; }
 cur_pid() { launchctl list | awk -v l="$LABEL" '$3==l && $1 ~ /^[0-9]+$/ {print $1}'; }
+
+# DGN-687 HTML escape for the parse_mode=HTML push path (tags added AFTER escape).
+html_esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
+# DGN-706b: version-update auto-notice. When the applied framework version
+# (.instance.conf DOGANY_FW_VERSION) differs from the last version we already
+# notified about, and the caller gave NO explicit --notice, compose the
+# owner-locked DGN-687 release-note fold from product/releases/v<ver>.md. This
+# guarantees an update-restart always tells the owner "update complete + what
+# changed" -- even when the restart is triggered manually (decoupled from
+# routines/self-update.sh, which composes the same notice on its own path).
+# The owner-locked copy is mirrored verbatim here; keep both sites in sync on
+# any DGN-687 re-lock. Fail-open at every step (missing conf/notes -> no notice,
+# never blocks the restart). Marker advances only when a notice is composed.
+maybe_compose_update_notice() {
+  local cur last relnote notes fold
+  cur="$(sed -n 's/^DOGANY_FW_VERSION=//p' "$INSTANCE_ROOT/.instance.conf" 2>/dev/null | head -n1)"
+  [[ -n "$cur" ]] || return 0
+  last="$(cat "$VER_MARKER" 2>/dev/null || true)"
+  [[ "$cur" == "$last" ]] && return 0
+  relnote="$INSTANCE_ROOT/product/releases/v${cur}.md"
+  [[ -f "$relnote" ]] || return 0
+  notes="$(awk '/^## Summary/{g=1;next} g&&/^(---|## )/{exit} g{print}' "$relnote" | sed -e '/./,$!d' | head -n 12)"
+  [[ -n "$notes" ]] || return 0
+  fold="Update summary ..."
+  NOTICE="Restart complete · v${cur} update applied
+<blockquote expandable>${fold}
+$(printf '%s\n' "$notes" | html_esc)</blockquote>"
+  mkdir -p "$(dirname "$VER_MARKER")" 2>/dev/null && printf '%s\n' "$cur" >"$VER_MARKER"
+  echo "[self_restart] version-update auto-notice composed for v${cur} (was '${last:-none}')"
+}
 
 # ---- Idle guard: refuse restart while the user is mid-session (DGN-328). ----
 # Derives the Claude Code project transcript dir from this instance's root path
@@ -136,18 +182,37 @@ check_idle_guard() {
 }
 
 SPOOL_DIR="__PROJECT_ROOT__/.telegram_bot/session-inbox"
+# DGN-706b: last framework version we auto-notified about (version-update fold).
+VER_MARKER="$(dirname "$SPOOL_DIR")/state/last_notified_fw_version"
 
 # Drop a post-restart verification instruction into the session-inbox spool
 # so the RESUMED live session verifies real state itself.
 # Writer contract: temp write then atomic rename to *.md.
 drop_verify_spool() {
   mkdir -p "$SPOOL_DIR" || { echo "[self_restart] spool dir unavailable" >&2; return 0; }
-  local ts name tmp
+  local ts name tmp resume_step4
   ts="$(date '+%Y%m%d-%H%M%S')"
   name="restart-verify-${ts}.md"
   tmp="${SPOOL_DIR}/.${name}.tmp"
+
+  # DGN-706: step 4 signal depends on whether the caller passed --resume-intent.
+  # Present -> hand the resumed session the exact in-flight context to continue.
+  # Absent  -> caller asserted no in-flight task; tell it NOT to hunt chronically
+  # open wip tickets (that guessing was the old failure mode).
+  if [[ -n "$RESUME_INTENT" ]]; then
+    resume_step4="4. Resume interrupted work -- this restart CUT OFF an in-flight task. You were
+   mid-executing:
+     ${RESUME_INTENT}
+   Pick it up from there and continue autonomously now. Cross-check the owning
+   worklog/ ticket for current state before acting, then carry it forward."
+  else
+    resume_step4="4. Resume interrupted work: the restart caller asserted NO specific in-flight
+   task. Sanity-check queued session-inbox items and any ticket you were
+   ACTIVELY executing this very session; if nothing was truly cut off, do NOT
+   hunt through chronically-open wip tickets -- treat this as clean."
+  fi
   cat >"$tmp" <<EOF
-[cron-inject] post-restart self-verification
+[cron-inject] post-restart self-verification (DGN-226)
 
 The bridge just self-restarted. Reason: ${REASON}
 pid ${OLD_PID:-?} -> ${NEW_PID:-?}. The completion notice was already pushed
@@ -157,9 +222,7 @@ Verify the real state yourself now:
 1. Bridge process alive for label ${LABEL}; pid matches ${NEW_PID:-?}.
 2. Tail ${MARKER_LOG}: no ERROR burst after the restart.
 3. Spot-check that the restart reason above actually landed in running code.
-4. Resume interrupted work: check worklog/ tickets with status wip owned by
-   the agent, and any queued session-inbox items. If this restart cut off an
-   in-flight task, pick it up and continue autonomously.
+${resume_step4}
 
 If everything is healthy AND nothing needs resuming: append one line
 (self-verify OK + timestamp) to the worklog ticket this restart belongs to,
@@ -178,9 +241,16 @@ if [[ -z "$WORKER" ]]; then
   # Idle guard (DGN-328): runs in the launcher, before detach; --dry-run included.
   check_idle_guard
 
+  # DGN-706b: if the caller passed no explicit --notice and this is a real
+  # restart, auto-compose the version-update release-note fold when the applied
+  # framework version changed since we last notified. Runs AFTER the idle guard
+  # so a refused restart never advances the marker or emits a stale notice.
+  [[ -z "$NOTICE" && -z "$DRY_RUN" ]] && maybe_compose_update_notice
+
   ARGS=(--_worker --reason "$REASON" --model "$MODEL" --delay "$DELAY" --label "$LABEL" --env "$ENV_FILE" --prefix "$PREFIX")
   [[ -n "$NOTICE" ]]  && ARGS+=(--notice "$NOTICE")
   [[ -n "$VERIFY" ]]  && ARGS+=(--verify "$VERIFY")
+  [[ -n "$RESUME_INTENT" ]] && ARGS+=(--resume-intent "$RESUME_INTENT")
   [[ -n "$DRY_RUN" ]] && ARGS+=(--dry-run)
   # Resolve $0 to an absolute path BEFORE re-exec. If invoked as a bare relative
   # name (e.g. `bash self_restart.sh`), nohup looks it up in PATH (not cwd) and

@@ -66,6 +66,13 @@ from telegram import Bot
 
 from bridge import ownership
 from bridge.config import config
+# MIN_EDIT_INTERVAL and _is_not_modified moved to bridge.edit_guard (DGN-594,
+# shared with the countdown helper); re-imported here as the compat surface.
+from bridge.edit_guard import (  # noqa: F401 - re-exported names
+    MIN_EDIT_INTERVAL,
+    EditRateGuard,
+    _is_not_modified,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +81,6 @@ DASHBOARD_FILE: Path = config.bot_data_dir / "dashboard.md"
 STATE_FILE: Path = config.bot_data_dir / "dashboard_state.json"
 
 POLL_INTERVAL = 3.0       # seconds between mtime checks (spec: ~3s)
-MIN_EDIT_INTERVAL = 3.0   # min seconds between edits per chat (spec: >=3s)
 RECREATE_COOLDOWN = 60.0  # min seconds between send+pin recreations
 # Empty state must persist this long before the pinned message is actually
 # unpinned+deleted (DGN-541 S1 debounce, spec range [30, 60]).  Separate
@@ -102,11 +108,6 @@ def _tail_cut(text: str) -> str:
         return text
     encoded = text.encode("utf-16-le")[: MAX_UTF16_UNITS * 2]
     return encoded.decode("utf-16-le", errors="ignore")
-
-
-def _is_not_modified(error: Exception) -> bool:
-    # Same normal-flow detection as streaming.StreamingMessageHandler.
-    return "message is not modified" in str(error).lower()
 
 
 def _needs_recreate(error: Exception) -> bool:
@@ -170,13 +171,34 @@ class DashboardSync:
         self._message_id: Optional[int] = None
         self._last_synced_mtime: Optional[float] = None
         self._dirty = False
-        self._last_edit: Optional[float] = None      # monotonic
+        # Flood/interval state lives in the shared guard (DGN-594);
+        # _last_edit/_flood_until below are property shims over it.
+        self._edit_guard = EditRateGuard()
         self._last_recreate: Optional[float] = None  # monotonic
-        self._flood_until: float = 0.0               # monotonic deadline
         # First empty read (monotonic) while a message is pinned; None when
         # content is present or no delete is pending (DGN-541 S1 debounce).
         self._empty_since: Optional[float] = None
         self._load_state()
+
+    # --- shared edit-guard state (single source: EditRateGuard, DGN-594) ---
+    # Property shims keep the historical attribute surface (used across this
+    # class and by tests) reading/writing the ONE guard state.
+
+    @property
+    def _last_edit(self) -> Optional[float]:  # monotonic
+        return self._edit_guard.last_edit
+
+    @_last_edit.setter
+    def _last_edit(self, value: Optional[float]) -> None:
+        self._edit_guard.last_edit = value
+
+    @property
+    def _flood_until(self) -> float:  # monotonic deadline
+        return self._edit_guard.flood_until
+
+    @_flood_until.setter
+    def _flood_until(self, value: float) -> None:
+        self._edit_guard.flood_until = value
 
     # --- state file ({chat_id, message_id}, atomic writes) ---
 
@@ -267,10 +289,8 @@ class DashboardSync:
             return
 
         now = time.monotonic()
-        if now < self._flood_until:
-            return  # flood wait pending; stay dirty
-        if self._last_edit is not None and (now - self._last_edit) < MIN_EDIT_INTERVAL:
-            return  # min edit interval; stay dirty, coalesce
+        if not self._edit_guard.ready(now):
+            return  # flood wait pending or min edit interval; stay dirty, coalesce
 
         chat_id = self._owner_chat_id()
         if chat_id is None:
@@ -339,7 +359,9 @@ class DashboardSync:
                 chat_id=chat_id, message_id=self._message_id
             )
         except telegram.error.RetryAfter as e:
-            self._flood_until = now + float(getattr(e, "retry_after", 5.0))
+            self._edit_guard.note_retry_after(
+                float(getattr(e, "retry_after", 5.0)), now
+            )
             return  # stay dirty; retried after the flood wait
         except telegram.error.Forbidden as e:
             logger.warning("Dashboard chat forbidden on delete (%s); state reset", e)
@@ -374,7 +396,7 @@ class DashboardSync:
     def _mark_synced(self, mtime: float, now: float) -> None:
         self._dirty = False
         self._last_synced_mtime = mtime
-        self._last_edit = now
+        self._edit_guard.note_edit(now)
 
     async def _sync(self, chat_id: int, text: str, mtime: float) -> None:
         now = time.monotonic()
@@ -386,7 +408,9 @@ class DashboardSync:
                 self._mark_synced(mtime, now)
                 return
             except telegram.error.RetryAfter as e:
-                self._flood_until = now + float(getattr(e, "retry_after", 5.0))
+                self._edit_guard.note_retry_after(
+                    float(getattr(e, "retry_after", 5.0)), now
+                )
                 return  # stay dirty; retried after the flood wait
             except telegram.error.BadRequest as e:
                 if _is_not_modified(e):
@@ -444,7 +468,9 @@ class DashboardSync:
                 chat_id=chat_id, text=text, disable_notification=True
             )
         except telegram.error.RetryAfter as e:
-            self._flood_until = now + float(getattr(e, "retry_after", 5.0))
+            self._edit_guard.note_retry_after(
+                float(getattr(e, "retry_after", 5.0)), now
+            )
             return
         except telegram.error.TelegramError as e:
             if isinstance(e, telegram.error.Forbidden) or _is_chat_gone(e):

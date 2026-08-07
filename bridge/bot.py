@@ -79,6 +79,7 @@ from bridge.permissions import (
 from bridge.sdk_bridge import ChatResponse, PROJECT_ROOT, sdk_bridge
 from bridge.session import session_manager
 from bridge.dashboard import DashboardSync
+from bridge.countdown import CountdownDriver
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
@@ -292,6 +293,7 @@ class TelegramBot:
             watchdog_task = None
             inbox_task = None
             dashboard_task = None
+            countdown_task = None
             try:
                 await self.application.start()
                 await self.application.updater.start_polling(
@@ -324,6 +326,13 @@ class TelegramBot:
                         bot=self.application.bot,
                         turn_active=self._user_turn_active,
                     ).run()
+                )
+                # Transient countdown driver (DGN-594): polls the countdown
+                # control dir and edits transient owner-chat messages in
+                # place. Same lifecycle as the tasks above (cancelled in the
+                # same finally; its own finally reaps live countdown tasks).
+                countdown_task = asyncio.create_task(
+                    CountdownDriver(bot=self.application.bot).run()
                 )
                 await self._wait_for_polling_exit(stop_event)
             except PollingConflict:
@@ -411,6 +420,12 @@ class TelegramBot:
                     dashboard_task.cancel()
                     try:
                         await dashboard_task
+                    except asyncio.CancelledError:
+                        pass
+                if countdown_task and not countdown_task.done():
+                    countdown_task.cancel()
+                    try:
+                        await countdown_task
                     except asyncio.CancelledError:
                         pass
                 await self._graceful_shutdown()
