@@ -641,6 +641,14 @@ _MD_ORDERED_ITEM_RE = re.compile(r"^([ \t]*)(\d+)\.[ \t]+(.*)$")
 # bare ">"). Group 1 = "!" when the expandable marker is present.
 _MD_QUOTE_LINE_RE = re.compile(r"^>(!)?(?: (.*))?$")
 
+# DGN-775: markdown header line (1-6 '#' marks at line start).
+_MD_HEADER_RE = re.compile(r"^(#{1,6})[ \t]+(.*)$", re.MULTILINE)
+# DGN-775: markdown table detection helpers.
+# A table data row has at least one '|' that is not the only character on the line.
+_MD_TABLE_ROW_RE = re.compile(r"^\|.*\|[ \t]*$")
+# A separator row: cells containing only '-', ':', and spaces between pipes.
+_MD_TABLE_SEP_RE = re.compile(r"^\|[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*$")
+
 # Prose bullet glyphs by depth (top, depth 1, depth 2+). Two visual spaces of
 # indent are added per depth level in the output.
 _BULLET_GLYPHS = ("•", "◦", "‣")  # bullet / white-bullet / triangle
@@ -652,6 +660,71 @@ def _bullet_prefix(depth: int) -> str:
     return "  " * depth + glyph + " "
 
 
+def _strip_md_headers(text: str) -> str:
+    """DGN-775: remove '# ' / '## ' / ... prefix from markdown header lines.
+
+    The header text is kept; only the '#' marks and the mandatory trailing
+    space are removed. Bold-promotion is deliberately avoided: headers in
+    Telegram chat are unusual and bold conversion could conflict with existing
+    emphasis handling lower in the pipeline.
+
+    Runs BEFORE _prepass_structural so the cleaned line re-enters the normal
+    list/blockquote path if it happens to start with '>' or '-' (edge case).
+    """
+    return _MD_HEADER_RE.sub(r"\2", text)
+
+
+def _wrap_md_tables(text: str) -> str:
+    """DGN-775: detect markdown table blocks and wrap each one in <pre>...</pre>.
+
+    A table block is a contiguous run of lines that are either data rows
+    (contain at least one '|') or separator rows ('|---|' style). The block
+    must contain at least one separator row so pure pipe-containing prose is
+    never mistakenly wrapped.
+
+    Wrapping happens BEFORE html.escape (called in markdown_to_telegram_html),
+    so the <pre>...</pre> tags themselves must be stash-safe -- they are NOT
+    stashed here because _prepass_structural does not call this helper; the
+    caller (markdown_to_telegram_html) must ensure the pre tags survive escape
+    by stashing them. We therefore emit a special sentinel instead of raw tags,
+    and the caller substitutes after escaping. However, to keep the design
+    surgical and consistent with the existing stash pattern, this function
+    returns the text with <pre> / </pre> replaced by NUL-delimited stash tokens
+    that the caller has already registered -- so it accepts a stash callable.
+
+    Implementation note: since this runs BEFORE the stash is set up in
+    markdown_to_telegram_html, we take stash as a parameter so the caller can
+    register the tag pair and retrieve their placeholders.
+    """
+    lines = text.split("\n")
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        # Detect start of a possible table: must be a data row.
+        if _MD_TABLE_ROW_RE.match(lines[i]):
+            # Collect the contiguous run.
+            run_start = i
+            has_sep = False
+            while i < n and (_MD_TABLE_ROW_RE.match(lines[i]) or _MD_TABLE_SEP_RE.match(lines[i])):
+                if _MD_TABLE_SEP_RE.match(lines[i]):
+                    has_sep = True
+                i += 1
+            run = lines[run_start:i]
+            if has_sep:
+                # Confirmed table: join lines as a pre-formatted block.
+                # Use literal markers here; markdown_to_telegram_html will stash
+                # them via the _stash callback passed in by the caller.
+                out.append("\x01TABLE_PRE_OPEN\x01" + "\n".join(run) + "\x01TABLE_PRE_CLOSE\x01")
+            else:
+                # Not a real table (no separator row): emit unchanged.
+                out.extend(run)
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def _prepass_structural(text: str, stash) -> str:
     """Convert list/blockquote LINE structure to stashed literals + inner text.
 
@@ -660,13 +733,29 @@ def _prepass_structural(text: str, stash) -> str:
     left in place to flow through escaping and inline emphasis normally. A run
     of contiguous quote lines collapses into one <blockquote> (or, when the
     first line carries the `>!` fold marker, one <blockquote expandable>).
+
+    DGN-775: also strips markdown headers (# / ## / ...) and wraps table
+    blocks in <pre> before the inline pipeline runs.
     """
+    # DGN-775: strip header marks first (pure text transform, no stash needed).
+    text = _strip_md_headers(text)
+    # DGN-775: wrap table blocks with sentinel markers before line iteration.
+    text = _wrap_md_tables(text)
     lines = text.split("\n")
     out: List[str] = []
     i = 0
     n = len(lines)
     while i < n:
         line = lines[i]
+        # DGN-775: resolve table sentinel markers into stashed <pre> tags so
+        # html.escape cannot corrupt them.  A sentinel line may contain both
+        # the open and close marker (single-line table block) or just one.
+        if "\x01TABLE_PRE_OPEN\x01" in line or "\x01TABLE_PRE_CLOSE\x01" in line:
+            line = line.replace("\x01TABLE_PRE_OPEN\x01", stash("<pre>"))
+            line = line.replace("\x01TABLE_PRE_CLOSE\x01", stash("</pre>"))
+            out.append(line)
+            i += 1
+            continue
         qm = _MD_QUOTE_LINE_RE.match(line)
         if qm is not None:
             # Collect the contiguous quote run. The first line's "!" sentinel
