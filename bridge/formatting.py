@@ -28,6 +28,241 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 MAX_FILE_BYTES = 10 * 1024 * 1024
 
 
+# =============================================================================
+# DGN-719 phase-1: bridge output CONTRACT (semantic core <-> render bridge seam)
+# =============================================================================
+#
+# The agent SEMANTIC CORE (RULES marker vocabulary) emits channel-neutral intent
+# markers; this RENDER BRIDGE transpiles them to Telegram syntax. Phase-1 is a
+# backward-compatible DEFENSIVE layer only -- RULES is NOT retrained here. It
+# adds a version handshake (a1), a containment net for markers this render layer
+# does not recognize (a2), a typed fold intent block (a3), and formalizes the
+# link_preview:: control marker as a contract construct (a4).
+#
+# a1 CONTRACT_VERSION -- handshake between the semantic core (marker vocabulary)
+#   and this render layer. DORMANT BY DESIGN (dec-108): this is a phase-2 API
+#   surface only. Nothing stamps or checks it at runtime today -- no producer
+#   stamps a contract version (the semantic core is an LLM and cannot reliably
+#   self-stamp yet) and no consumer calls check_contract_skew(). It exists so a
+#   future non-LLM producer / harness can make version-skew (RULES advances a
+#   marker while a .dogany-preserve-frozen render layer stays behind -- the
+#   DGN-696 drift shape) DETECTABLE. The real runtime defense against skew is
+#   a2 (contain_unknown_markers), which needs no handshake. Bump this only when
+#   the recognized marker vocabulary changes.
+CONTRACT_VERSION = 1
+
+# a2/a4 -- the marker vocabulary THIS render layer recognizes. Every neutral
+# `word::` control marker the core may emit is registered here. A marker not in
+# this set is treated as UNKNOWN by the containment net (a2) and downgraded to a
+# safe literal instead of being raw-relayed. Known markers are stripped upstream
+# (strip_*_marker / strip_display_markers) before prose reaches the converter,
+# so they never reach the containment net as "unknown".
+RECOGNIZED_COLON_MARKERS = frozenset(
+    {SEND_FILE_MARKER, LINK_PREVIEW_MARKER, "fold::"}
+)
+# Bracket-form control markers ([[OPTIONS]] etc.) the render layer recognizes.
+RECOGNIZED_BRACKET_MARKERS = frozenset({OPTIONS_MARKER})
+
+# a3 -- fold typed-block markers. compose_fold_block() emits this pair around a
+# summary + expandable body; render_fold_block() (or the existing DGN-619 `>! `
+# path) transpiles it to <blockquote expandable>. The typed form keeps the fold
+# INTENT (summary = required structural field, body = expandable content)
+# explicit so a non-Telegram renderer could map it to its own collapsible
+# primitive (e.g. Slack). Both markers are single standalone lines.
+FOLD_OPEN_MARKER = "fold::"
+FOLD_CLOSE_MARKER = "fold::end"
+
+# a2 -- shapes the containment net inspects. A standalone marker-shaped line is:
+#   * a neutral colon-marker: `word::` (lowercase word + "::") standing alone or
+#     followed by a WHITESPACE-separated payload, OR
+#   * a bracket-marker: `[[WORD]]`.
+# Anchored to a STANDALONE line (full-line match after strip) so inline prose
+# that merely contains "::" (http://, "Note:: x" mid-sentence, code) is never
+# touched -- every real Dogany marker is emitted on its own line, matching the
+# existing strip_* conventions. The colon-marker also REQUIRES the "::" to be
+# followed by end-of-line or whitespace, so ordinary prose like "a::b" (payload
+# abutting the colons, never a real marker shape) is left alone. This keeps
+# backward-compat parity intact.
+_COLON_MARKER_LINE_RE = re.compile(r"^([a-z][a-z0-9_]*::)(|\s.*)$")
+_BRACKET_MARKER_LINE_RE = re.compile(r"^(\[\[[A-Z][A-Z0-9_]*\]\])$")
+
+# Zero-width space (U+200B) used to break an unknown marker token so no later
+# marker scan re-parses it, while it stays invisible to the reader. Declared as
+# an escape so this source file remains pure ASCII.
+_ZWSP = "\u200b"
+
+
+def check_contract_skew(core_version: Optional[int]) -> bool:
+    """a1: detect a semantic-core / render-bridge version skew.
+
+    DORMANT phase-2 API surface (dec-108): no runtime caller exists today --
+    no producer stamps a contract version (the semantic core is an LLM and
+    cannot reliably self-stamp yet), so nothing invokes this check. It is kept
+    as the forward observability handshake for a future stamping producer.
+
+    core_version is the CONTRACT_VERSION the emitting semantic core was authored
+    against (None = un-stamped / legacy core, treated as compatible). Returns
+    True when a skew is detected (core NEWER than this render layer, i.e. the
+    render layer is frozen behind an advanced RULES vocabulary -- the DGN-696
+    case) and logs one warning; False otherwise. Non-fatal: the containment net
+    (a2, contain_unknown_markers) is the real runtime safety; this is only the
+    dormant observability handshake.
+    """
+    if core_version is None:
+        return False
+    if core_version > CONTRACT_VERSION:
+        logger.warning(
+            "Contract version skew: core=%d render=%d -- render layer is behind "
+            "the semantic core; unknown markers will be contained (a2).",
+            core_version,
+            CONTRACT_VERSION,
+        )
+        return True
+    return False
+
+
+def contain_unknown_markers(text: str) -> Tuple[str, int]:
+    """a2: downgrade unrecognized neutral/semantic markers to safe literals.
+
+    A standalone line shaped like a control marker (`word::` or `[[WORD]]`) that
+    is NOT in the recognized vocabulary is the version-skew hazard: a marker the
+    core emits from an advanced RULES that this frozen render layer never learned
+    to transpile. Rather than raw-relay it to Telegram (where it could look like
+    a broken directive or, worse, smuggle syntax), we NEUTRALIZE it: the marker
+    token gets a zero-width word break inserted after its first char so it can
+    never be re-parsed as a live marker downstream, and it survives html.escape
+    as visible literal text. Recognized markers pass through untouched (they are
+    stripped by their own handlers before this point).
+
+    Returns (contained_text, count_downgraded). Logs one line with the count
+    (never the payload) when a downgrade happens, so skew stays observable.
+    """
+    if not text or ("::" not in text and "[[" not in text):
+        return text, 0
+    downgraded = 0
+    out: List[str] = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        neutralized = _neutralize_if_unknown_marker(stripped)
+        if neutralized is None:
+            out.append(line)
+            continue
+        # Preserve the original leading indentation of the line.
+        indent = line[: len(line) - len(line.lstrip())]
+        out.append(indent + neutralized)
+        downgraded += 1
+    if downgraded:
+        # debug (not warning) level -- dec-108 a2: ordinary prose lines like
+        # "todo:: x" match the marker shape and would WARN-spam on every send;
+        # containment is routine hygiene, not an incident.
+        logger.debug(
+            "Contained %d unknown output marker(s) (version skew?); downgraded "
+            "to safe literal.",
+            downgraded,
+        )
+    return "\n".join(out), downgraded
+
+
+def _neutralize_if_unknown_marker(stripped: str) -> Optional[str]:
+    """Return the neutralized literal for an UNKNOWN marker line, else None.
+
+    None means the line is not an unrecognized marker (ordinary prose, or a
+    recognized marker) and must be left byte-identical.
+    """
+    bm = _BRACKET_MARKER_LINE_RE.match(stripped)
+    if bm is not None:
+        if bm.group(1) in RECOGNIZED_BRACKET_MARKERS:
+            return None
+        # "[[WORD]]" -> "[<zwsp>[WORD]]" : the doubled bracket is broken so no
+        # downstream pass reads it as a live [[..]] marker; renders literally.
+        return "[" + _ZWSP + stripped[1:]
+    cm = _COLON_MARKER_LINE_RE.match(stripped)
+    if cm is not None:
+        token = cm.group(1)  # e.g. "wibble::"
+        if token in RECOGNIZED_COLON_MARKERS:
+            return None
+        # "wibble:: x" -> "w<zwsp>ibble:: x" : the marker word is broken by a
+        # zero-width space so `startswith("word::")` / re marker scans miss it,
+        # while the text reads unchanged to the user.
+        return token[0] + _ZWSP + stripped[1:]
+    return None
+
+
+def compose_fold_block(summary: str, body: str) -> str:
+    """a3: build a fold TYPED INTENT block (summary + expandable body).
+
+    Emits the neutral typed form:
+        fold:: <summary>
+        <body...>
+        fold::end
+    render_fold_block() (below) transpiles this to the existing DGN-619 `>! `
+    expandable-blockquote path; a non-Telegram renderer can instead map the
+    (summary, body) intent to its own collapsible primitive. summary is the
+    REQUIRED structural field (the collapsed preview); an empty summary yields
+    an empty block (nothing to fold).
+    """
+    if not summary.strip():
+        return ""
+    lines = [FOLD_OPEN_MARKER + " " + summary.strip()]
+    if body:
+        lines.append(body.rstrip("\n"))
+    lines.append(FOLD_CLOSE_MARKER)
+    return "\n".join(lines)
+
+
+_FOLD_OPEN_LINE_RE = re.compile(r"^fold::[ \t]*(.*)$")
+
+
+def render_fold_block(text: str) -> str:
+    """a3: transpile fold:: typed blocks to the DGN-619 `>! ` fold render.
+
+    Each `fold:: <summary>` ... `fold::end` block becomes an expandable
+    blockquote run: the summary is the first quoted line carrying the `>! `
+    marker (the collapsed preview), each body line a `> ` quote line, blank
+    body lines a bare `>`. The result flows through markdown_to_telegram_html
+    unchanged (backward-compat: same output as a hand-written `>! ` run). Text
+    outside fold blocks is left byte-identical. A fold:: with no matching
+    fold::end is left literal (never a dangling open blockquote).
+    """
+    if FOLD_OPEN_MARKER not in text:
+        return text
+    lines = text.split("\n")
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        m = _FOLD_OPEN_LINE_RE.match(lines[i].strip())
+        # Only a bare "fold::" open line (not "fold::end") starts a block.
+        if m is not None and lines[i].strip() != FOLD_CLOSE_MARKER:
+            # Find the matching close line.
+            j = i + 1
+            while j < n and lines[j].strip() != FOLD_CLOSE_MARKER:
+                j += 1
+            if j >= n:
+                # Unterminated: leave the open line literal, continue past it.
+                out.append(lines[i])
+                i += 1
+                continue
+            summary = m.group(1).strip()
+            body = lines[i + 1 : j]
+            quoted: List[str] = []
+            if summary:
+                quoted.append(">! " + summary)
+            for k, ln in enumerate(body):
+                if not ln.strip():
+                    quoted.append(">")
+                elif k == 0 and not summary:
+                    quoted.append(">! " + ln)
+                else:
+                    quoted.append("> " + ln)
+            out.extend(quoted)
+            i = j + 1
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def extract_send_marker_paths(content: str) -> List[str]:
     """Return raw path strings from each send_file:: marker line, in order."""
     if not content:
@@ -406,6 +641,14 @@ _MD_ORDERED_ITEM_RE = re.compile(r"^([ \t]*)(\d+)\.[ \t]+(.*)$")
 # bare ">"). Group 1 = "!" when the expandable marker is present.
 _MD_QUOTE_LINE_RE = re.compile(r"^>(!)?(?: (.*))?$")
 
+# DGN-775: markdown header line (1-6 '#' marks at line start).
+_MD_HEADER_RE = re.compile(r"^(#{1,6})[ \t]+(.*)$", re.MULTILINE)
+# DGN-775: markdown table detection helpers.
+# A table data row has at least one '|' that is not the only character on the line.
+_MD_TABLE_ROW_RE = re.compile(r"^\|.*\|[ \t]*$")
+# A separator row: cells containing only '-', ':', and spaces between pipes.
+_MD_TABLE_SEP_RE = re.compile(r"^\|[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)+\|?[ \t]*$")
+
 # Prose bullet glyphs by depth (top, depth 1, depth 2+). Two visual spaces of
 # indent are added per depth level in the output.
 _BULLET_GLYPHS = ("•", "◦", "‣")  # bullet / white-bullet / triangle
@@ -417,6 +660,71 @@ def _bullet_prefix(depth: int) -> str:
     return "  " * depth + glyph + " "
 
 
+def _strip_md_headers(text: str) -> str:
+    """DGN-775: remove '# ' / '## ' / ... prefix from markdown header lines.
+
+    The header text is kept; only the '#' marks and the mandatory trailing
+    space are removed. Bold-promotion is deliberately avoided: headers in
+    Telegram chat are unusual and bold conversion could conflict with existing
+    emphasis handling lower in the pipeline.
+
+    Runs BEFORE _prepass_structural so the cleaned line re-enters the normal
+    list/blockquote path if it happens to start with '>' or '-' (edge case).
+    """
+    return _MD_HEADER_RE.sub(r"\2", text)
+
+
+def _wrap_md_tables(text: str) -> str:
+    """DGN-775: detect markdown table blocks and wrap each one in <pre>...</pre>.
+
+    A table block is a contiguous run of lines that are either data rows
+    (contain at least one '|') or separator rows ('|---|' style). The block
+    must contain at least one separator row so pure pipe-containing prose is
+    never mistakenly wrapped.
+
+    Wrapping happens BEFORE html.escape (called in markdown_to_telegram_html),
+    so the <pre>...</pre> tags themselves must be stash-safe -- they are NOT
+    stashed here because _prepass_structural does not call this helper; the
+    caller (markdown_to_telegram_html) must ensure the pre tags survive escape
+    by stashing them. We therefore emit a special sentinel instead of raw tags,
+    and the caller substitutes after escaping. However, to keep the design
+    surgical and consistent with the existing stash pattern, this function
+    returns the text with <pre> / </pre> replaced by NUL-delimited stash tokens
+    that the caller has already registered -- so it accepts a stash callable.
+
+    Implementation note: since this runs BEFORE the stash is set up in
+    markdown_to_telegram_html, we take stash as a parameter so the caller can
+    register the tag pair and retrieve their placeholders.
+    """
+    lines = text.split("\n")
+    out: List[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        # Detect start of a possible table: must be a data row.
+        if _MD_TABLE_ROW_RE.match(lines[i]):
+            # Collect the contiguous run.
+            run_start = i
+            has_sep = False
+            while i < n and (_MD_TABLE_ROW_RE.match(lines[i]) or _MD_TABLE_SEP_RE.match(lines[i])):
+                if _MD_TABLE_SEP_RE.match(lines[i]):
+                    has_sep = True
+                i += 1
+            run = lines[run_start:i]
+            if has_sep:
+                # Confirmed table: join lines as a pre-formatted block.
+                # Use literal markers here; markdown_to_telegram_html will stash
+                # them via the _stash callback passed in by the caller.
+                out.append("\x01TABLE_PRE_OPEN\x01" + "\n".join(run) + "\x01TABLE_PRE_CLOSE\x01")
+            else:
+                # Not a real table (no separator row): emit unchanged.
+                out.extend(run)
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def _prepass_structural(text: str, stash) -> str:
     """Convert list/blockquote LINE structure to stashed literals + inner text.
 
@@ -425,13 +733,29 @@ def _prepass_structural(text: str, stash) -> str:
     left in place to flow through escaping and inline emphasis normally. A run
     of contiguous quote lines collapses into one <blockquote> (or, when the
     first line carries the `>!` fold marker, one <blockquote expandable>).
+
+    DGN-775: also strips markdown headers (# / ## / ...) and wraps table
+    blocks in <pre> before the inline pipeline runs.
     """
+    # DGN-775: strip header marks first (pure text transform, no stash needed).
+    text = _strip_md_headers(text)
+    # DGN-775: wrap table blocks with sentinel markers before line iteration.
+    text = _wrap_md_tables(text)
     lines = text.split("\n")
     out: List[str] = []
     i = 0
     n = len(lines)
     while i < n:
         line = lines[i]
+        # DGN-775: resolve table sentinel markers into stashed <pre> tags so
+        # html.escape cannot corrupt them.  A sentinel line may contain both
+        # the open and close marker (single-line table block) or just one.
+        if "\x01TABLE_PRE_OPEN\x01" in line or "\x01TABLE_PRE_CLOSE\x01" in line:
+            line = line.replace("\x01TABLE_PRE_OPEN\x01", stash("<pre>"))
+            line = line.replace("\x01TABLE_PRE_CLOSE\x01", stash("</pre>"))
+            out.append(line)
+            i += 1
+            continue
         qm = _MD_QUOTE_LINE_RE.match(line)
         if qm is not None:
             # Collect the contiguous quote run. The first line's "!" sentinel
@@ -486,6 +810,14 @@ def markdown_to_telegram_html(text: str) -> str:
         stash.append(rendered)
         return "\x00{}\x00".format(len(stash) - 1)
 
+    # DGN-719 a3: transpile fold:: typed intent blocks to the DGN-619 `>! `
+    #    expandable-blockquote form BEFORE the structural pre-pass consumes it.
+    text = render_fold_block(text)
+    # DGN-719 a2: contain any unrecognized neutral/semantic marker line (version
+    #    skew net) -- downgrade to a safe literal so it is never raw-relayed.
+    #    Runs before html.escape so the neutralized text renders as visible
+    #    literal; recognized markers are already stripped upstream and pass through.
+    text, _ = contain_unknown_markers(text)
     # 0. Line-structural pre-pass (DGN-619): lists + blockquotes. Runs first so
     #    stashed bullet prefixes / blockquote tags survive html.escape below.
     text = _prepass_structural(text, _stash)
