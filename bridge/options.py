@@ -292,6 +292,37 @@ def _shorten_button_label(label: str) -> str:
     return "".join(kept) + "…"
 
 
+# DGN-775: regexes for stripping inline markdown from button label text.
+# Applied before display-width trimming so markdown syntax never counts toward
+# the width budget or leaks into the Telegram button surface.
+_LABEL_MD_BOLD_STAR = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_LABEL_MD_BOLD_UNDER = re.compile(r"__(.+?)__", re.DOTALL)
+_LABEL_MD_ITALIC_STAR = re.compile(r"\*(.+?)\*", re.DOTALL)
+_LABEL_MD_ITALIC_UNDER = re.compile(r"_(.+?)_", re.DOTALL)
+_LABEL_MD_CODE = re.compile(r"`(.+?)`", re.DOTALL)
+_LABEL_MD_HEADER = re.compile(r"^#{1,6}\s+")
+
+
+def strip_markdown_label(text: str) -> str:
+    """DGN-775: strip inline markdown syntax from a button label string.
+
+    Removes: **bold** / __bold__ -> text, *italic* / _italic_ -> text,
+    `code` -> text, ## header prefix -> text (line-start only).
+    The inner content is always preserved; only the markup wrappers are removed.
+    Applied to button labels before display-width trimming so syntax chars
+    never inflate the width measurement or appear on the Telegram button surface.
+    """
+    # Header prefix: only meaningful at the very start of the label.
+    text = _LABEL_MD_HEADER.sub("", text.lstrip())
+    # Bold before italic so ** is not partially consumed as two *.
+    text = _LABEL_MD_BOLD_STAR.sub(r"\1", text)
+    text = _LABEL_MD_BOLD_UNDER.sub(r"\1", text)
+    text = _LABEL_MD_ITALIC_STAR.sub(r"\1", text)
+    text = _LABEL_MD_ITALIC_UNDER.sub(r"\1", text)
+    text = _LABEL_MD_CODE.sub(r"\1", text)
+    return text
+
+
 def build_option_keyboard(options: List[str]) -> Optional[InlineKeyboardMarkup]:
     """Build inline buttons; callback 'opt:{i}. {label}' with 'opt:{i}' fallback.
 
@@ -299,12 +330,16 @@ def build_option_keyboard(options: List[str]) -> Optional[InlineKeyboardMarkup]:
     the safe Telegram inline button width (DGN-704). The callback_data and the
     resolve_choice path use the index-based "opt:{i}" fallback for Korean/CJK
     labels, so shortening the display text has no effect on choice resolution.
+
+    DGN-775: markdown syntax is stripped from the label before width trimming
+    so button text is always plain text (never leaks **bold** etc. to Telegram).
     """
     if not options:
         return None
     buttons = []
     for i, opt in enumerate(options, 1):
-        label = f"{i}. {opt}"
+        clean_opt = strip_markdown_label(opt)
+        label = f"{i}. {clean_opt}"
         cb_data = f"opt:{label}"
         if len(cb_data.encode("utf-8")) > 64:
             cb_data = f"opt:{i}"
