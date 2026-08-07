@@ -82,6 +82,9 @@ STRINGS = {
     "usage_script_missing": "사용량 스크립트를 찾을 수 없습니다 (routines/claude-usage.sh).",
     "usage_timeout": "사용량 조회가 시간 내에 끝나지 않았습니다. 잠시 후 다시 시도해 주세요.",
     "usage_failed": "사용량 조회 실패: {error}",
+    # --- Transient countdown (DGN-594) ---
+    "countdown_body": "{label} {remaining} 남음  {bar}",
+    "countdown_done": "{label} 종료",
     # --- Resume (session history) ---
     "no_session_history": "세션 기록을 찾을 수 없습니다.",
     "session_history_header": "세션 기록",

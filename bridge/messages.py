@@ -67,6 +67,10 @@ USAGE_SCRIPT_MISSING = t("usage_script_missing")
 USAGE_TIMEOUT = t("usage_timeout")
 USAGE_FAILED = t("usage_failed")
 
+# --- Transient countdown (DGN-594) ---
+COUNTDOWN_BODY = t("countdown_body")
+COUNTDOWN_DONE = t("countdown_done")
+
 # --- Slash command usage ---
 USAGE_SKILL = t("usage_skill")
 USAGE_COMMAND = t("usage_command")
