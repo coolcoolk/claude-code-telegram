@@ -11,7 +11,7 @@ DGN-790 item 4 (DGN-720): strip_consumed_options keeps the full option run in
 the display body when any label has a description clause, so the user sees the
 explanatory text above the buttons. Bare-phrase-only runs are still dropped.
 
-DGN-704b (owner iPhone 13 mini measurement, 2026-07-24 + 2026-08-07): the
+DGN-704b (on-device width measurement, DGN-779): the
 button width budget is a WEIGHTED sum -- CJK / full-width glyphs count as 1.5,
 whitespace as 0.4, everything else as 1.0 -- generation contract at 31.0.
 
