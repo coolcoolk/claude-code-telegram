@@ -252,9 +252,9 @@ def resolve_choice(data: str, inline_keyboard: Optional[list]) -> str:
 _LABEL_SEPARATORS = re.compile(r"\s*(?:--|—)\s*|\s+-\s+")
 
 # Generation contract width: the expected maximum weighted display width for a
-# one-line Telegram inline button label. Measured on iPhone 13 mini (owner,
-# 2026-07-24 + 2026-08-07 recalibration, DGN-779): stays on one line at <= 31
-# weighted units. Counts CJK/full-width (east_asian_width W/F) as 1.5,
+# one-line Telegram inline button label. Derived from on-device measurements
+# (DGN-779): a label stays on one line at <= 31 weighted
+# units. Counts CJK/full-width (east_asian_width W/F) as 1.5,
 # whitespace as 0.4, and everything else (latin/digit/symbol) as 1.0.
 # NOTE: this constant is the GENERATION CONTRACT VALUE (roughly 18-20 pure-
 # Korean chars or ~28 pure-ASCII chars); it is NOT the trim trigger. Trimming
@@ -278,7 +278,7 @@ def _label_width(text: str) -> float:
     - Whitespace (ch.isspace()): 0.4  -- real on-device width ~0.25; 1.0 was 2.7x overcount
     - Everything else (latin, digit, symbol, ambiguous): 1.0
 
-    Calibrated against iPhone 13 mini on-device measurements (DGN-779, 2026-08-07).
+    Calibrated against on-device measurements (DGN-779).
     """
     width = 0.0
     for ch in text:
