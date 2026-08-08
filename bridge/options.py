@@ -143,6 +143,32 @@ def extract_options(text: str) -> List[str]:
     return [label.strip() for _, label, _ in _last_option_run(_option_line_entries(text))]
 
 
+def _label_has_description(label: str) -> bool:
+    """Return True when a raw option label contains a description clause.
+
+    A description clause is text after the first separator (em-dash, double-
+    hyphen, or space-hyphen-space) that follows an actual action phrase. This
+    is the SAME sep-strip predicate used by _shorten_button_label so the
+    strip_consumed_options keep-in-body decision and the button sep-strip never
+    diverge (DGN-790 blocker5 / 704c regression prevention).
+
+    A label whose body STARTS with a separator (DGN-704c number-only-button
+    guard) is treated as having NO description -- the separator is part of the
+    action phrase itself, not a label/description boundary.
+
+    Colon (':') is intentionally NOT a separator here (DGN-790: colon removed
+    from _LABEL_SEPARATORS; Korean labels with colons stay whole).
+    """
+    prefix_match = re.match(r"^(\d+[.)]\s*)", label)
+    body = label[len(prefix_match.group(1)):] if prefix_match else label
+    sep_match = _LABEL_SEPARATORS.search(body)
+    if not sep_match:
+        return False
+    head = body[: sep_match.start()].strip()
+    # Only a non-empty action phrase before the separator makes it a real boundary.
+    return bool(head)
+
+
 def strip_consumed_options(text: str) -> Tuple[str, List[str]]:
     """Split a reply into (display_text, options) for button-only choices (DGN-665).
 
@@ -160,6 +186,12 @@ def strip_consumed_options(text: str) -> Tuple[str, List[str]]:
     numbered lines there would orphan the in-between text. When the run is not
     line-adjacent the options still build (buttons unchanged) but the body keeps
     the list -- the old safe behavior.
+
+    DGN-720 / DGN-790: when any label in the run carries a description clause
+    (detected via _label_has_description -- the same sep-strip predicate used
+    by the button shortener), the entire run is KEPT in the display body so the
+    full descriptions are visible above the buttons. Only runs where every label
+    is a bare short phrase (no description) are dropped from the body.
     """
     clean, _ = strip_options_marker(text or "")
     run = _last_option_run(_option_line_entries(clean))
@@ -171,6 +203,12 @@ def strip_consumed_options(text: str) -> Tuple[str, List[str]]:
         line_indices[i] == line_indices[i - 1] + 1 for i in range(1, len(line_indices))
     )
     if not adjacent:
+        return clean, options
+    # DGN-720: keep the body lines when any option has a description clause.
+    # The button shortener strips the clause from the button text; the full
+    # label stays in the body so the user can read the explanation.
+    has_any_description = any(_label_has_description(opt) for opt in options)
+    if has_any_description:
         return clean, options
     drop = set(line_indices)
     lines = clean.split("\n")
@@ -205,52 +243,72 @@ def resolve_choice(data: str, inline_keyboard: Optional[list]) -> str:
 # Separators that mark the boundary between the action phrase and the
 # description clause in an option label, in priority order.
 # "--" (ASCII double-hyphen) and the Unicode em-dash are treated equally.
-# " - " (space-hyphen-space) and ":" are secondary separators.
+# " - " (space-hyphen-space) is a secondary separator.
+# Colon (":") is intentionally excluded: Korean labels frequently use ":" as
+# part of the action phrase itself (e.g. "실행: 빠르게"), and colon-splitting
+# caused widespread mis-truncation (DGN-790 Q4).
 # The leading "N." of the number prefix must NOT be treated as a separator,
 # so these patterns are only applied to the body after the prefix is stripped.
-_LABEL_SEPARATORS = re.compile(r"\s*(?:--|—)\s*|\s+-\s+|:")
+_LABEL_SEPARATORS = re.compile(r"\s*(?:--|—)\s*|\s+-\s+")
 
-# Safe display width for a Telegram inline button label (weighted, not a flat
-# character count). Measured on an iPhone 13 mini (owner, 2026-07-24): a label
-# stays on one comfortable line while the weighted width stays at or under 30,
-# counting CJK / full-width glyphs as 1.5 and everything else (latin/digit/
-# symbol) as 1. That gives roughly 18-20 pure-Korean chars or ~28 pure-ASCII
-# chars -- matching what Telegram actually renders. This replaces the old flat
-# 16-character cap, which truncated far more aggressively than the screen needs
-# (long labels wrap gracefully; only genuine overflow is trimmed).
-_BUTTON_LABEL_MAX_WIDTH = 30.0
+# Generation contract width: the expected maximum weighted display width for a
+# one-line Telegram inline button label. Measured on iPhone 13 mini (owner,
+# 2026-07-24 + 2026-08-07 recalibration, DGN-779): stays on one line at <= 31
+# weighted units. Counts CJK/full-width (east_asian_width W/F) as 1.5,
+# whitespace as 0.4, and everything else (latin/digit/symbol) as 1.0.
+# NOTE: this constant is the GENERATION CONTRACT VALUE (roughly 18-20 pure-
+# Korean chars or ~28 pure-ASCII chars); it is NOT the trim trigger. Trimming
+# uses _BUTTON_LABEL_HARD_CAP (40.0). Manual "..." truncation is removed (DGN-
+# 790 part2); Telegram client handles display-side ellipsis for overflow.
+_BUTTON_LABEL_MAX_WIDTH = 31.0
+
+# Hard cap: labels exceeding this weighted width are force-trimmed (raw cut,
+# no "..." appended -- Telegram client supplies the visual ellipsis). Value is
+# ~31 * 1.3 = 40.3, rounded down to 40.0. This is an arbitrary headroom margin
+# designed only as a runaway safeguard; any label under the generation contract
+# (31) naturally stays well below this cap and is never trimmed.
+_BUTTON_LABEL_HARD_CAP = 40.0
 
 
 def _label_width(text: str) -> float:
     """Weighted display width of a button label.
 
-    CJK / full-width glyphs count as 1.5; all other glyphs (latin, digit,
-    symbol, ambiguous) count as 1.0. This mirrors the owner's on-device
-    measurement and is a close proxy for Telegram's own button layout.
+    Priority order:
+    - CJK / full-width glyphs (east_asian_width W or F): 1.5
+    - Whitespace (ch.isspace()): 0.4  -- real on-device width ~0.25; 1.0 was 2.7x overcount
+    - Everything else (latin, digit, symbol, ambiguous): 1.0
+
+    Calibrated against iPhone 13 mini on-device measurements (DGN-779, 2026-08-07).
     """
     width = 0.0
     for ch in text:
         if unicodedata.east_asian_width(ch) in ("W", "F"):
             width += 1.5
+        elif ch.isspace():
+            width += 0.4
         else:
             width += 1.0
     return width
 
 
 def _shorten_button_label(label: str) -> str:
-    """Shorten an option label to a safe Telegram button width.
+    """Extract the action phrase from an option label for Telegram button display.
 
-    Strategy:
+    Strategy (DGN-790 part2):
     1. Parse the number prefix (e.g. "1. ", "2) ") from the label.
     2. Strip the description clause that follows the first separator
-       (em-dash/double-hyphen, " - ", or ":") from the action phrase.
-    3. If the resulting label (prefix + action phrase) still exceeds
-       _BUTTON_LABEL_MAX_WIDTH (weighted: CJK/full-width 1.5, else 1.0), trim
-       glyph-by-glyph and append the Unicode ellipsis (U+2026) to signal it.
-    4. Labels at or under the width budget are returned unchanged.
+       (em-dash or double-hyphen, or " - ") from the action phrase.
+       Colon is NOT a separator (DGN-790: removed to prevent Korean mis-splits).
+    3. After sep-strip, if the weighted width is at or under _BUTTON_LABEL_HARD_CAP
+       (40.0), return as-is -- no trimming, no ellipsis. Telegram client handles
+       any display-side overflow with its own ellipsis.
+    4. Only labels exceeding the hard cap (40.0) are force-trimmed glyph-by-glyph
+       (raw cut, NO "..." appended). This is purely a runaway safeguard; labels
+       produced under the generation contract (_BUTTON_LABEL_MAX_WIDTH = 31.0)
+       never reach the hard cap.
 
     The number prefix dot "." is NOT treated as a separator -- it is only
-    consumed as part of the "N. " / "N) " prefix pattern.
+    consumed as part of the "N. " / "N) " prefix pattern (DGN-704c guard).
     """
     # Match the number prefix: "1. ", "2) ", "3. ", etc.
     prefix_match = re.match(r"^(\d+[.)]\s*)", label)
@@ -272,24 +330,30 @@ def _shorten_button_label(label: str) -> str:
         if head:
             body = head
 
-    # Reassemble and check total weighted display width.
+    # Reassemble and check against hard cap (runaway safeguard only).
     short = prefix + body
-    if _label_width(short) <= _BUTTON_LABEL_MAX_WIDTH:
+    if _label_width(short) <= _BUTTON_LABEL_HARD_CAP:
+        # Within safe range: return as-is, no trim, no ellipsis.
+        # Telegram client provides display-side ellipsis if needed.
         return short
 
-    # Trim to fit: accumulate glyphs until the next one would exceed the budget
-    # minus one slot reserved for the ellipsis glyph (U+2026, width ~1). The
-    # prefix is short enough that it is always kept.
-    budget = _BUTTON_LABEL_MAX_WIDTH - 1.0
+    # Force-trim labels that exceed the hard cap: raw cut, no "..." appended.
+    # This path should never be reached for labels generated under the contract
+    # (_BUTTON_LABEL_MAX_WIDTH = 31.0); it is a pure runaway safeguard.
     used = 0.0
     kept = []
     for ch in short:
-        w = 1.5 if unicodedata.east_asian_width(ch) in ("W", "F") else 1.0
-        if used + w > budget:
+        if unicodedata.east_asian_width(ch) in ("W", "F"):
+            w = 1.5
+        elif ch.isspace():
+            w = 0.4
+        else:
+            w = 1.0
+        if used + w > _BUTTON_LABEL_HARD_CAP:
             break
         kept.append(ch)
         used += w
-    return "".join(kept) + "…"
+    return "".join(kept)
 
 
 # DGN-775: regexes for stripping inline markdown from button label text.
