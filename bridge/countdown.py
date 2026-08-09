@@ -19,7 +19,8 @@ dashboard.md file-driven pattern):
       agent-writable, so trusting it would let a writer target arbitrary
       chats (owner resolution mirrors DashboardSync._owner_chat_id).
     - file deleted  -> that countdown is cancelled (cleanup edit).
-    - countdown end -> the driver removes its own control file.
+    - countdown end -> the driver removes its own control file and writes a
+      <id>.done marker (consumer watches for it, then deletes it).
     Absent directory = feature dormant (cheap poll, no error), mirroring the
     DASHBOARD_FILE dormancy style. Malformed files are skipped (kept on disk,
     warned once) -- a partial write parses fine on a later tick.
@@ -36,6 +37,7 @@ import json
 import logging
 import math
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
 
@@ -114,6 +116,7 @@ class Countdown:
         self._message_id: Optional[int] = None
         self.task: Optional[asyncio.Task] = None
         self.finished = False
+        self.completed = False
 
     def cancel(self) -> None:
         """Early stop: the loop wakes, does one cleanup edit, and ends."""
@@ -145,6 +148,7 @@ class Countdown:
         while not self._stop.is_set():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self.completed = True
                 break
             try:
                 await asyncio.wait_for(
@@ -155,6 +159,7 @@ class Countdown:
                 pass  # cadence tick elapsed
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self.completed = True
                 break
             if not self._guard.ready():
                 continue  # flood/interval backoff: skip this tick silently
@@ -244,6 +249,8 @@ class CountdownDriver:
         # 1) Reap finished countdowns; completion removes our own file.
         for cid, countdown in list(self._active.items()):
             if countdown.finished:
+                if countdown.completed:
+                    self._emit_done(cid)
                 del self._active[cid]
                 self._remove_file(cid)
 
@@ -304,6 +311,15 @@ class CountdownDriver:
         if type(cadence) is not int or cadence <= 0:
             return None
         return seconds, label.strip(), cadence
+
+    def _emit_done(self, cid: str) -> None:
+        try:
+            (self._dir / f"{cid}.done").write_text(
+                json.dumps({"ended_at": datetime.now(timezone.utc).isoformat()}),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass  # fail-open: consumer will not see a marker, not fatal
 
     def _remove_file(self, cid: str) -> None:
         try:

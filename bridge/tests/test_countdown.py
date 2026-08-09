@@ -254,6 +254,62 @@ class TestCountdownLoop(unittest.TestCase):
         # is attempted (deliberately unconditional) and returns FLOOD.
         self.assertEqual(bot.edit_message_text.await_count, 1)
 
+    def test_natural_end_sets_completed(self):
+        bot = _mock_bot()
+
+        async def scenario():
+            countdown = self._start(bot, seconds=0.05, cadence=0.02)
+            await asyncio.wait_for(countdown.task, timeout=2)
+            return countdown
+
+        countdown = asyncio.run(scenario())
+        self.assertTrue(countdown.finished)
+        self.assertTrue(countdown.completed)
+
+    def test_cancel_does_not_set_completed(self):
+        bot = _mock_bot()
+
+        async def scenario():
+            countdown = self._start(bot, seconds=60, cadence=10)
+            await asyncio.sleep(0.02)
+            countdown.cancel()
+            await asyncio.wait_for(countdown.task, timeout=2)
+            return countdown
+
+        countdown = asyncio.run(scenario())
+        self.assertTrue(countdown.finished)
+        self.assertFalse(countdown.completed)
+
+    def test_send_fail_does_not_set_completed(self):
+        bot = _mock_bot()
+        bot.send_message = AsyncMock(
+            side_effect=telegram.error.Forbidden("bot was blocked")
+        )
+
+        async def scenario():
+            countdown = self._start(bot, seconds=0.3, cadence=0.05)
+            await asyncio.wait_for(countdown.task, timeout=2)
+            return countdown
+
+        countdown = asyncio.run(scenario())
+        self.assertTrue(countdown.finished)
+        self.assertFalse(countdown.completed)
+
+    def test_edit_fail_does_not_set_completed(self):
+        bot = _mock_bot()
+        bot.edit_message_text = AsyncMock(
+            side_effect=telegram.error.TelegramError("internal error")
+        )
+
+        async def scenario():
+            countdown = self._start(bot, seconds=0.3, cadence=0.05)
+            await asyncio.wait_for(countdown.task, timeout=2)
+            return countdown
+
+        countdown = asyncio.run(scenario())
+        self.assertTrue(countdown.finished)
+        self.assertFalse(countdown.completed)
+
 
 # ---------------------------------------------------------------------------
 # Control-file driver
@@ -362,12 +418,44 @@ class TestDriver(unittest.TestCase):
     def test_finished_countdown_reaped_and_file_removed(self):
         self._write("done1", {"seconds": 60, "label": "done1"})
         dummy = types.SimpleNamespace(
-            finished=True, task=None, cancel=lambda: None
+            finished=True, completed=False, task=None, cancel=lambda: None
         )
         self._driver._active["done1"] = dummy
         self._run(self._driver._tick())
         self.assertNotIn("done1", self._driver._active)
         self.assertFalse((self._dir / "done1.json").exists())
+
+    def test_natural_end_emits_done_marker(self):
+        """Natural completion (completed=True) writes <cid>.done."""
+        self._dir.mkdir(parents=True, exist_ok=True)
+        dummy = types.SimpleNamespace(
+            finished=True, completed=True, task=None, cancel=lambda: None
+        )
+        self._driver._active["w1"] = dummy
+        self._run(self._driver._tick())
+        self.assertNotIn("w1", self._driver._active)
+        done_path = self._dir / "w1.done"
+        self.assertTrue(done_path.exists(), ".done marker should be written")
+        data = json.loads(done_path.read_text(encoding="utf-8"))
+        self.assertIn("ended_at", data)
+
+    def test_cancelled_end_no_done_marker(self):
+        """Cancelled (completed=False) must NOT write a .done marker."""
+        self._dir.mkdir(parents=True, exist_ok=True)
+        dummy = types.SimpleNamespace(
+            finished=True, completed=False, task=None, cancel=lambda: None
+        )
+        self._driver._active["w2"] = dummy
+        self._run(self._driver._tick())
+        self.assertFalse((self._dir / "w2.done").exists())
+
+    def test_emit_done_failopen_on_oserror(self):
+        """_emit_done into a non-existent dir must not raise."""
+        driver = CountdownDriver(self._bot, control_dir=Path("/nonexistent/dir"))
+        try:
+            driver._emit_done("x")
+        except OSError:
+            self.fail("_emit_done must be fail-open (no OSError raised)")
 
     def test_malformed_file_skipped_and_kept(self):
         self._dir.mkdir(parents=True, exist_ok=True)
