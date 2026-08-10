@@ -28,6 +28,7 @@ from claude_agent_sdk import (
 
 # conftest.py already sets PROJECT_ROOT and TELEGRAM_BOT_TOKEN before import.
 import bridge.config as _cfg_mod
+from bridge.config import _resolve_interim_mode
 
 from bridge.sdk_bridge import SdkBridge, _PendingRequest, _UserStreamState
 
@@ -95,17 +96,26 @@ def _make_pending_req(streaming_handler=None) -> _PendingRequest:
 
 
 class TestInterimSuppressionGate(unittest.TestCase):
-    """Verify the stop_reason gate logic."""
+    """Verify the stop_reason gate logic.
+
+    These tests exercise the suppress and inline paths explicitly. Since
+    v1.31.0 raised the default to fold, both STREAM_INTERIM and INTERIM_MODE
+    must be pinned so sdk_bridge._effective_interim_mode() returns the intended
+    mode regardless of the module-level default baked at import time.
+    """
 
     def setUp(self):
         self._orig = _cfg_mod.STREAM_INTERIM
         _cfg_mod.STREAM_INTERIM = False
-        self._patch = patch("bridge.sdk_bridge.STREAM_INTERIM", False)
-        self._patch.start()
+        self._patch_si = patch("bridge.sdk_bridge.STREAM_INTERIM", False)
+        self._patch_si.start()
+        self._patch_im = patch("bridge.sdk_bridge.INTERIM_MODE", "suppress")
+        self._patch_im.start()
 
     def tearDown(self):
         _cfg_mod.STREAM_INTERIM = self._orig
-        self._patch.stop()
+        self._patch_si.stop()
+        self._patch_im.stop()
 
     def _run_reader_messages(self, messages_seq, stream_interim_override=None):
         """Feed a sequence of SDK messages through _reader_loop and return the result."""
@@ -298,6 +308,35 @@ class TestInterimSuppressionGate(unittest.TestCase):
         call_text = handler.update_if_needed.call_args[0][0]
         self.assertEqual(call_text, "real final")
         self.assertEqual(response.content, "real final")
+
+
+# ---------------------------------------------------------------------------
+# DGN-825 / v1.31.0: _resolve_interim_mode default regression
+# ---------------------------------------------------------------------------
+
+
+class TestInterimModeResolutionDefault(unittest.TestCase):
+    """Verify default-fold baseline (v1.31.0 lift) and alias path."""
+
+    def test_unset_defaults_to_fold(self):
+        # v1.31.0: unset explicit + unset stream_interim -> fold (was suppress).
+        self.assertEqual(_resolve_interim_mode(None, False), "fold")
+
+    def test_stream_interim_alias_maps_to_inline(self):
+        # STREAM_INTERIM=true still yields inline (deprecated alias preserved).
+        self.assertEqual(_resolve_interim_mode(None, True), "inline")
+
+    def test_explicit_suppress_wins_over_default(self):
+        # Explicit suppress always honoured.
+        self.assertEqual(_resolve_interim_mode("suppress", False), "suppress")
+        self.assertEqual(_resolve_interim_mode("suppress", True), "suppress")
+
+    def test_explicit_fold_wins_over_stream_interim(self):
+        # Explicit fold overrides STREAM_INTERIM=true (stream_interim alias ignored).
+        self.assertEqual(_resolve_interim_mode("fold", True), "fold")
+
+    def test_explicit_inline_wins_over_default(self):
+        self.assertEqual(_resolve_interim_mode("inline", False), "inline")
 
 
 if __name__ == "__main__":
