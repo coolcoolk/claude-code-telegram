@@ -132,12 +132,13 @@ class Config(BaseSettings):
     # should leave this at the default (False).
     stream_interim: bool = Field(default=False)
     # DGN-682: interim narration mode -- "suppress" | "inline" | "fold".
-    #   suppress (default): interim narration dropped; typing indicator only.
+    #   suppress: interim narration dropped; typing indicator only.
     #   inline: every interim TextBlock streams live (pre-DGN-426 behavior).
-    #   fold: interim narration is captured during the turn and prepended to
-    #     the final answer as ONE collapsed expandable blockquote (rendered via
-    #     the DGN-619 `>!` fold marker). Dev-agent opt-in; user-facing agents
-    #     stay on the default suppress.
+    #   fold (default): interim narration is captured during the turn and
+    #     prepended to the final answer as ONE collapsed expandable blockquote
+    #     (rendered via the DGN-619 `>!` fold marker). v1.31.0 baseline lift:
+    #     fold is now the unset default for all agents; suppress requires
+    #     explicit INTERIM_MODE=suppress.
     # Unset (None) -> resolution falls back to the STREAM_INTERIM alias (see
     # _resolve_interim_mode / INTERIM_MODE below).
     interim_mode: Optional[str] = Field(default=None)
@@ -286,13 +287,14 @@ STREAM_INTERIM: bool = config.stream_interim
 # DGN-682 D1: INTERIM_MODE supersedes the boolean STREAM_INTERIM. An explicit
 # INTERIM_MODE always wins; unset + STREAM_INTERIM=true maps to "inline"
 # (deprecated alias, removal planned one version out); unset + unset ->
-# "suppress". Instances with neither key set resolve to suppress unchanged
+# "fold" (v1.31.0 baseline lift: suppress retired as default; agents that
+# want suppress must set INTERIM_MODE=suppress explicitly).
 # (pydantic extra="ignore" keeps stray keys from crashing).
 def _resolve_interim_mode(explicit: Optional[str], stream_interim: bool) -> str:
     """Resolve the effective interim mode from the explicit field + alias."""
     if explicit in ("suppress", "inline", "fold"):
         return explicit
-    return "inline" if stream_interim else "suppress"
+    return "inline" if stream_interim else "fold"
 
 
 INTERIM_MODE: str = _resolve_interim_mode(config.interim_mode, config.stream_interim)
