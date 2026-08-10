@@ -1,4 +1,4 @@
-"""DGN-581: ESC-style soft interrupt for /stop (hard teardown -> /kill fallback).
+"""DGN-581: ESC-style soft interrupt for /stop.
 
 Covers:
   1. sdk_bridge.interrupt() on a live turn: sends the SDK control interrupt,
@@ -19,7 +19,7 @@ Covers:
      old content or leave it permanently unresolved (hang).
   5. bot._cmd_stop wiring: soft-first (reply STOP_INTERRUPTED, no teardown),
      hard fallback on no-target (STOP_NOTHING when idle / STOP_PAUSED when a
-     stream was killed) and on interrupt failure; /kill always hard-stops.
+     stream was killed) and on interrupt failure.
 """
 
 import asyncio
@@ -347,7 +347,7 @@ class TestM1ReaderLoopDiscard(unittest.TestCase):
 
 
 class TestCmdStopWiring(unittest.TestCase):
-    """/stop soft-first with hard fallback; /kill always hard."""
+    """/stop soft-first with hard fallback."""
 
     def _make_update(self):
         update = MagicMock()
@@ -433,21 +433,6 @@ class TestCmdStopWiring(unittest.TestCase):
                 update = self._make_update()
                 await bot._cmd_stop(update, None)
             # Never a silent no-op: the hard teardown ran and was reported.
-            mock_sdk.stop.assert_awaited_once_with(USER_ID)
-            update.message.reply_text.assert_awaited_once_with(messages.STOP_PAUSED)
-
-        self._run(scenario())
-
-    def test_kill_always_hard_stops(self):
-        async def scenario():
-            mock_sdk = self._mock_sdk(interrupt_result=True, stop_result=True)
-            TelegramBot, access, sdk = self._patched_bot(mock_sdk)
-            with access, sdk:
-                bot = TelegramBot()
-                update = self._make_update()
-                await bot._cmd_kill(update, None)
-            # /kill bypasses the soft path entirely.
-            mock_sdk.interrupt.assert_not_awaited()
             mock_sdk.stop.assert_awaited_once_with(USER_ID)
             update.message.reply_text.assert_awaited_once_with(messages.STOP_PAUSED)
 

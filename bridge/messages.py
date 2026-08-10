@@ -54,7 +54,6 @@ SKILLS_HEADER_GLOBAL = t("skills_header_global")
 # --- BotCommand menu descriptions ---
 CMD_DESC_NEW = t("cmd_desc_new")
 CMD_DESC_STOP = t("cmd_desc_stop")
-CMD_DESC_KILL = t("cmd_desc_kill")
 CMD_DESC_MODEL = t("cmd_desc_model")
 CMD_DESC_RESUME = t("cmd_desc_resume")
 CMD_DESC_HISTORY = t("cmd_desc_history")
