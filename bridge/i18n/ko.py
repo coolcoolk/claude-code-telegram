@@ -71,7 +71,6 @@ STRINGS = {
     # --- BotCommand menu descriptions ---
     "cmd_desc_new": "새 세션 시작",
     "cmd_desc_stop": "지금 작업만 멈춤",
-    "cmd_desc_kill": "세션 강제 종료 (하드 중단)",
     "cmd_desc_model": "모델 전환 (새 세션)",
     "cmd_desc_resume": "세션 이어가기",
     "cmd_desc_history": "메시지 기록 보기",
