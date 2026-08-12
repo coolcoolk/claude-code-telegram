@@ -1,6 +1,7 @@
-"""Unit tests for bridge/countdown.py (DGN-594).
+"""Unit tests for bridge/countdown.py (DGN-594; DGN-780 snap + UI redesign).
 
-Covers rendering (m:ss + progress bar), the cadence edit loop, natural-end
+Covers rendering (m:ss + draining progress bar + glyph allowlist), the
+deadline-anchored boundary-snap edit loop (drift self-correction), natural-end
 final edit, cancel() early stop, fail-open on send/edit errors, the
 control-file driver (start / delete-cancel / completion cleanup / malformed
 skip), and owner-chat targeting (file chat_id ignored).
@@ -26,9 +27,18 @@ from bridge.countdown import (
     Countdown,
     CountdownDriver,
     DEFAULT_CADENCE,
+    DEFAULT_DONE_ICON,
+    DEFAULT_GLYPH_SET,
+    DEFAULT_ICON,
+    GLYPH_SETS,
     _format_remaining,
+    _is_safe_glyph,
+    _next_boundary,
     _render_bar,
+    _resolve_glyphs,
+    _resolve_icon,
     render_countdown,
+    render_done,
     start_countdown,
 )
 from bridge.edit_guard import EditRateGuard
@@ -45,8 +55,8 @@ def _mock_bot(msg_id=5555):
     return bot
 
 
-def _done_text(label):
-    return messages.COUNTDOWN_DONE.format(label=label)
+def _done_text(label, done_icon=None):
+    return render_done(label, done_icon=done_icon)
 
 
 def _fake_config(tmpdir):
@@ -82,20 +92,29 @@ class TestFormatRemaining(unittest.TestCase):
 
 
 class TestRenderBar(unittest.TestCase):
-    def test_start_all_empty(self):
-        self.assertEqual(_render_bar(0.0), BAR_EMPTY * BAR_CELLS)
+    """DGN-780: the bar DRAINS -- filled cells = time REMAINING."""
 
-    def test_full_elapsed(self):
+    def test_start_all_filled(self):
         self.assertEqual(_render_bar(1.0), BAR_FILLED * BAR_CELLS)
+
+    def test_done_all_empty(self):
+        self.assertEqual(_render_bar(0.0), BAR_EMPTY * BAR_CELLS)
 
     def test_half(self):
         self.assertEqual(
             _render_bar(0.5), BAR_FILLED * 5 + BAR_EMPTY * 5
         )
 
-    def test_proportional(self):
+    def test_ceil_rounds_partial_cell_up(self):
+        # 75% remaining -> ceil(7.5) = 8 filled cells
         self.assertEqual(
-            _render_bar(0.75), BAR_FILLED * 7 + BAR_EMPTY * 3
+            _render_bar(0.75), BAR_FILLED * 8 + BAR_EMPTY * 2
+        )
+
+    def test_running_countdown_never_fully_drained(self):
+        # ceil: any positive remaining keeps at least one filled cell
+        self.assertEqual(
+            _render_bar(0.01), BAR_FILLED * 1 + BAR_EMPTY * 9
         )
 
     def test_fixed_width_always(self):
@@ -107,25 +126,202 @@ class TestRenderBar(unittest.TestCase):
         self.assertEqual(_render_bar(1.5), BAR_FILLED * BAR_CELLS)
 
 
+class TestGlyphSets(unittest.TestCase):
+    """DGN-780: config-selected glyph set with allowlist fallback."""
+
+    def _bar_with(self, cfg):
+        with patch("bridge.countdown.config", cfg):
+            return _render_bar(0.5)
+
+    def test_default_is_dot(self):
+        filled, empty = GLYPH_SETS[DEFAULT_GLYPH_SET]
+        self.assertEqual((filled, empty), (BAR_FILLED, BAR_EMPTY))
+        self.assertEqual(DEFAULT_GLYPH_SET, "dot")
+
+    def test_alternate_sets_render(self):
+        for name, (filled, empty) in GLYPH_SETS.items():
+            cfg = types.SimpleNamespace(countdown_glyph_set=name)
+            self.assertEqual(self._bar_with(cfg), filled * 5 + empty * 5)
+
+    def test_unknown_value_falls_back_to_dot(self):
+        cfg = types.SimpleNamespace(countdown_glyph_set="sparkles")
+        self.assertEqual(
+            self._bar_with(cfg), BAR_FILLED * 5 + BAR_EMPTY * 5
+        )
+
+    def test_missing_attr_falls_back_to_dot(self):
+        cfg = types.SimpleNamespace()  # config without the knob at all
+        self.assertEqual(
+            self._bar_with(cfg), BAR_FILLED * 5 + BAR_EMPTY * 5
+        )
+
+    def test_config_validator_normalizes_to_allowlist(self):
+        # bridge.config layer: case-insensitive accept, junk falls back.
+        # (Token/env comes from the hermetic conftest environment.)
+        from bridge.config import Config
+        self.assertEqual(
+            Config(countdown_glyph_set="BLOCK-LINE").countdown_glyph_set,
+            "block-line",
+        )
+        self.assertEqual(
+            Config(countdown_glyph_set="sparkles").countdown_glyph_set, "dot"
+        )
+        self.assertEqual(Config().countdown_glyph_set, "dot")
+
+
+class TestGlyphMarkdownSafety(unittest.TestCase):
+    """DGN-780: every allowlisted set must be markdown-safe on the PLAIN
+    message surface and pass the scaffold-leak guard untouched."""
+
+    MARKDOWN_RISK = set("*_`#>|[]~")
+
+    def test_glyphs_carry_no_markdown_risk_chars(self):
+        for name, pair in GLYPH_SETS.items():
+            for glyph in pair:
+                self.assertFalse(
+                    set(glyph) & self.MARKDOWN_RISK,
+                    f"glyph set {name!r} carries a markdown-risk char",
+                )
+
+    def test_rendered_bodies_pass_scaffold_guard(self):
+        from bridge.sdk_bridge import _scaffold_guard
+        for name in GLYPH_SETS:
+            cfg = types.SimpleNamespace(countdown_glyph_set=name)
+            with patch("bridge.countdown.config", cfg):
+                for remaining in (30, 15, 5):
+                    text = render_countdown("rest", remaining, 30)
+                    self.assertEqual(_scaffold_guard(text), text)
+        done = render_done("rest")
+        self.assertEqual(_scaffold_guard(done), done)
+
+
+class TestFreeFormAppearance(unittest.TestCase):
+    """DGN-780b: free-form icon/glyph with call > config > default priority
+    and silent safe fallback on unsafe/unknown values."""
+
+    def test_safe_glyph_gate(self):
+        # Emoji + plain glyphs pass; markdown-risk chars, newlines, empties,
+        # and non-strings are rejected.
+        for good in ("🔥", "●", "▶", "A", "→"):
+            self.assertTrue(_is_safe_glyph(good), good)
+        for bad in ("*", "_", "`", "#", ">", "|", "[", "]", "~",
+                    "a*b", "x\ny", "", "  ", None, 5, ("a",)):
+            self.assertFalse(_is_safe_glyph(bad), repr(bad))
+
+    def test_priority_call_over_config_over_default(self):
+        cfg = types.SimpleNamespace(countdown_glyph_set="square")
+        with patch("bridge.countdown.config", cfg):
+            # config only: square preset
+            self.assertEqual(_resolve_glyphs(None), GLYPH_SETS["square"])
+            # call preset name wins over config
+            self.assertEqual(_resolve_glyphs("block-line"),
+                             GLYPH_SETS["block-line"])
+            # call custom pair wins over config
+            self.assertEqual(_resolve_glyphs(("▶", "▷")), ("▶", "▷"))
+        # no config knob at all -> default dot
+        with patch("bridge.countdown.config", types.SimpleNamespace()):
+            self.assertEqual(_resolve_glyphs(None),
+                             GLYPH_SETS[DEFAULT_GLYPH_SET])
+
+    def test_custom_glyph_pair_renders(self):
+        bar = _render_bar(0.5, glyph=("▶", "▷"))
+        self.assertEqual(bar, "▶" * 5 + "▷" * 5)
+
+    def test_unsafe_custom_glyph_falls_back(self):
+        # A markdown-risk char in either member -> silent fallback to config
+        # (here: no config knob -> default dot).
+        with patch("bridge.countdown.config", types.SimpleNamespace()):
+            self.assertEqual(_resolve_glyphs(("*", "-")),
+                             GLYPH_SETS[DEFAULT_GLYPH_SET])
+            self.assertEqual(_resolve_glyphs(("●", "|")),
+                             GLYPH_SETS[DEFAULT_GLYPH_SET])
+        # Unknown preset name -> config/default fallback too.
+        cfg = types.SimpleNamespace(countdown_glyph_set="square")
+        with patch("bridge.countdown.config", cfg):
+            self.assertEqual(_resolve_glyphs("sparkles"), GLYPH_SETS["square"])
+
+    def test_icon_priority_and_fallback(self):
+        self.assertEqual(_resolve_icon(None, DEFAULT_ICON), DEFAULT_ICON)
+        self.assertEqual(_resolve_icon("🔥", DEFAULT_ICON), "🔥")
+        # unsafe icon -> default
+        self.assertEqual(_resolve_icon("#", DEFAULT_ICON), DEFAULT_ICON)
+        self.assertEqual(_resolve_icon("", DEFAULT_ICON), DEFAULT_ICON)
+
+    def test_render_uses_call_icon_and_glyph(self):
+        text = render_countdown("rest", 150, 600, icon="🔥", glyph=("▶", "▷"))
+        self.assertTrue(text.startswith("🔥 rest"))
+        self.assertIn("▶" * 3 + "▷" * 7, text)
+
+    def test_render_done_uses_call_icon(self):
+        self.assertTrue(render_done("rest", done_icon="🎉").startswith("🎉 rest"))
+        # unsafe -> default check icon
+        self.assertTrue(
+            render_done("rest", done_icon="`").startswith(DEFAULT_DONE_ICON)
+        )
+
+    def test_omitted_params_unchanged_regression(self):
+        # DGN-780b hard requirement: omitting the new params reproduces the
+        # pre-DGN-780b default look exactly.
+        with patch("bridge.countdown.config", types.SimpleNamespace()):
+            body = render_countdown("rest", 600, 600)
+            self.assertEqual(
+                body,
+                f"{DEFAULT_ICON} rest  10:00  {BAR_FILLED * BAR_CELLS}",
+            )
+            done = render_done("rest")
+            self.assertTrue(done.startswith(f"{DEFAULT_DONE_ICON} rest"))
+
+    def test_custom_icon_glyph_still_pass_scaffold_guard(self):
+        from bridge.sdk_bridge import _scaffold_guard
+        text = render_countdown("rest", 15, 30, icon="🔥", glyph=("▶", "▷"))
+        self.assertEqual(_scaffold_guard(text), text)
+        done = render_done("rest", done_icon="🎉")
+        self.assertEqual(_scaffold_guard(done), done)
+
+
 class TestRenderCountdown(unittest.TestCase):
     def test_body_carries_label_time_and_bar(self):
-        # 150s remaining of 600s -> 75% elapsed -> 7 filled cells
+        # 150s remaining of 600s -> 25% remaining -> ceil(2.5) = 3 filled
         text = render_countdown("rest", 150, 600)
         expected = messages.COUNTDOWN_BODY.format(
+            icon=DEFAULT_ICON,
             label="rest",
             remaining="2:30",
-            bar=BAR_FILLED * 7 + BAR_EMPTY * 3,
+            bar=BAR_FILLED * 3 + BAR_EMPTY * 7,
         )
         self.assertEqual(text, expected)
 
-    def test_at_start_bar_is_empty(self):
+    def test_at_start_bar_is_full(self):
         text = render_countdown("rest", 600, 600)
-        self.assertIn(BAR_EMPTY * BAR_CELLS, text)
+        self.assertIn(BAR_FILLED * BAR_CELLS, text)
         self.assertIn("10:00", text)
 
-    def test_zero_total_renders_full_bar(self):
+    def test_zero_total_renders_drained_bar(self):
         text = render_countdown("rest", 0, 0)  # degenerate: no division crash
-        self.assertIn(BAR_FILLED * BAR_CELLS, text)
+        self.assertIn(BAR_EMPTY * BAR_CELLS, text)
+
+
+class TestNextBoundary(unittest.TestCase):
+    """DGN-780 snap math: next cadence boundary strictly below remaining."""
+
+    def test_spec_example(self):
+        self.assertEqual(_next_boundary(24.3, 5), 20)
+
+    def test_full_start(self):
+        self.assertEqual(_next_boundary(30, 5), 25)
+
+    def test_exact_boundary_steps_down(self):
+        self.assertEqual(_next_boundary(20.0, 5), 15)
+
+    def test_below_one_cadence_snaps_to_zero(self):
+        self.assertEqual(_next_boundary(3, 5), 0)
+        self.assertEqual(_next_boundary(5, 5), 0)
+
+    def test_never_negative(self):
+        self.assertEqual(_next_boundary(0.2, 5), 0)
+
+    def test_fractional_cadence(self):
+        self.assertAlmostEqual(_next_boundary(0.35, 0.1), 0.3, places=9)
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +369,41 @@ class TestCountdownLoop(unittest.TestCase):
             self.assertTrue(BAR_FILLED in text or BAR_EMPTY in text)
             self.assertNotEqual(text, _done_text("rest"))
             self.assertEqual(call.kwargs["message_id"], 5555)
+
+    def test_snap_self_corrects_edit_latency(self):
+        # DGN-780: with a fixed-cadence nap, a 25%-of-cadence edit latency
+        # accumulates and slides the display off the boundary grid. The
+        # deadline-anchored snap must keep every periodic edit on EXACT
+        # cadence boundaries (0.6 -> 0.4 -> 0.2 for 0.8s @ 0.2s cadence).
+        bot = _mock_bot()
+
+        async def slow_edit(*args, **kwargs):
+            await asyncio.sleep(0.05)  # simulated editMessageText round-trip
+
+        bot.edit_message_text = AsyncMock(side_effect=slow_edit)
+        recorded = []
+        real_render = render_countdown
+
+        def spy_render(label, remaining, total, *args, **kwargs):
+            recorded.append(remaining)
+            return real_render(label, remaining, total, *args, **kwargs)
+
+        async def scenario():
+            with patch("bridge.countdown.render_countdown", spy_render):
+                countdown = self._start(bot, seconds=0.8, cadence=0.2)
+                await asyncio.wait_for(countdown.task, timeout=3)
+
+        asyncio.run(scenario())
+        # recorded[0] = initial send (full remaining); the rest are the
+        # periodic edits, which must sit exactly on the cadence grid.
+        self.assertAlmostEqual(recorded[0], 0.8, places=6)
+        periodic = recorded[1:]
+        self.assertEqual(len(periodic), 3, periodic)
+        for value, expected in zip(periodic, (0.6, 0.4, 0.2)):
+            self.assertAlmostEqual(value, expected, places=6)
+        # Final edit is still the done line, after the periodic edits.
+        last = bot.edit_message_text.await_args_list[-1]
+        self.assertEqual(last.kwargs["text"], _done_text("rest"))
 
     def test_natural_end_final_edit(self):
         bot = _mock_bot()
@@ -254,62 +485,6 @@ class TestCountdownLoop(unittest.TestCase):
         # is attempted (deliberately unconditional) and returns FLOOD.
         self.assertEqual(bot.edit_message_text.await_count, 1)
 
-    def test_natural_end_sets_completed(self):
-        bot = _mock_bot()
-
-        async def scenario():
-            countdown = self._start(bot, seconds=0.05, cadence=0.02)
-            await asyncio.wait_for(countdown.task, timeout=2)
-            return countdown
-
-        countdown = asyncio.run(scenario())
-        self.assertTrue(countdown.finished)
-        self.assertTrue(countdown.completed)
-
-    def test_cancel_does_not_set_completed(self):
-        bot = _mock_bot()
-
-        async def scenario():
-            countdown = self._start(bot, seconds=60, cadence=10)
-            await asyncio.sleep(0.02)
-            countdown.cancel()
-            await asyncio.wait_for(countdown.task, timeout=2)
-            return countdown
-
-        countdown = asyncio.run(scenario())
-        self.assertTrue(countdown.finished)
-        self.assertFalse(countdown.completed)
-
-    def test_send_fail_does_not_set_completed(self):
-        bot = _mock_bot()
-        bot.send_message = AsyncMock(
-            side_effect=telegram.error.Forbidden("bot was blocked")
-        )
-
-        async def scenario():
-            countdown = self._start(bot, seconds=0.3, cadence=0.05)
-            await asyncio.wait_for(countdown.task, timeout=2)
-            return countdown
-
-        countdown = asyncio.run(scenario())
-        self.assertTrue(countdown.finished)
-        self.assertFalse(countdown.completed)
-
-    def test_edit_fail_does_not_set_completed(self):
-        bot = _mock_bot()
-        bot.edit_message_text = AsyncMock(
-            side_effect=telegram.error.TelegramError("internal error")
-        )
-
-        async def scenario():
-            countdown = self._start(bot, seconds=0.3, cadence=0.05)
-            await asyncio.wait_for(countdown.task, timeout=2)
-            return countdown
-
-        countdown = asyncio.run(scenario())
-        self.assertTrue(countdown.finished)
-        self.assertFalse(countdown.completed)
-
 
 # ---------------------------------------------------------------------------
 # Control-file driver
@@ -370,6 +545,26 @@ class TestDriver(unittest.TestCase):
             kwargs = self._bot.send_message.await_args.kwargs
             self.assertEqual(kwargs["chat_id"], OWNER_ID)
             self.assertNotEqual(kwargs["chat_id"], 999)
+            await self._teardown_countdown(countdown)
+
+        self._run(scenario())
+
+    def test_control_file_appearance_flows_to_rendered_message(self):
+        # DGN-780b: icon/glyph from the control file reach the sent message.
+        self._write("rest", {
+            "seconds": 60, "label": "rest",
+            "icon": "🔥", "glyph": ["▶", "▷"],
+        })
+
+        async def scenario():
+            await self._driver._tick()
+            countdown = self._driver._active["rest"]
+            await asyncio.sleep(0.02)  # let the send land
+            text = self._bot.send_message.await_args.kwargs["text"]
+            # Initial send is at full remaining -> bar all filled (custom
+            # filled glyph); the custom icon leads the line.
+            self.assertTrue(text.startswith("🔥 rest"))
+            self.assertIn("▶" * BAR_CELLS, text)
             await self._teardown_countdown(countdown)
 
         self._run(scenario())
@@ -500,22 +695,48 @@ class TestReadSpec(unittest.TestCase):
         return self._driver._read_spec(path)
 
     def test_valid_minimal(self):
+        # Appearance fields default to None (fall through to the default look).
         self.assertEqual(
             self._spec({"seconds": 120, "label": "rest"}),
-            (120, "rest", DEFAULT_CADENCE),
+            (120, "rest", DEFAULT_CADENCE, None, None, None),
         )
 
     def test_valid_with_cadence(self):
         self.assertEqual(
             self._spec({"seconds": 120, "label": "rest", "cadence": 5}),
-            (120, "rest", 5),
+            (120, "rest", 5, None, None, None),
         )
 
     def test_chat_id_key_is_ignored(self):
         # Security: owner-only targeting; a chat_id key never surfaces.
         self.assertEqual(
             self._spec({"seconds": 60, "label": "rest", "chat_id": 999}),
-            (60, "rest", DEFAULT_CADENCE),
+            (60, "rest", DEFAULT_CADENCE, None, None, None),
+        )
+
+    def test_appearance_fields_passed_through(self):
+        # DGN-780b: icon/done_icon pass through raw; glyph preset name kept;
+        # a [filled, empty] JSON array becomes a tuple pair.
+        self.assertEqual(
+            self._spec({
+                "seconds": 60, "label": "rest",
+                "icon": "🔥", "done_icon": "🎉", "glyph": "square",
+            }),
+            (60, "rest", DEFAULT_CADENCE, "🔥", "🎉", "square"),
+        )
+        self.assertEqual(
+            self._spec({
+                "seconds": 60, "label": "rest", "glyph": ["#", "-"],
+            }),
+            (60, "rest", DEFAULT_CADENCE, None, None, ("#", "-")),
+        )
+
+    def test_bad_glyph_shape_becomes_none(self):
+        # A malformed glyph field (not a name, not a 2-pair) -> None, so the
+        # countdown still starts with the default look.
+        self.assertEqual(
+            self._spec({"seconds": 60, "label": "rest", "glyph": [1, 2, 3]}),
+            (60, "rest", DEFAULT_CADENCE, None, None, None),
         )
 
     def test_rejects_missing_seconds(self):

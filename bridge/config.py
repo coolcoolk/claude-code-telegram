@@ -118,6 +118,12 @@ class Config(BaseSettings):
     # recognized; anything else falls back to en. Read by bridge/i18n.
     locale: str = Field(default="en")
 
+    # DGN-780: countdown progress-bar glyph set (env COUNTDOWN_GLYPH_SET).
+    # VALIDATED ALLOWLIST -- "dot" (default) | "block-line" | "square"; the
+    # actual glyph pairs live in bridge/countdown.py GLYPH_SETS. Any other
+    # value falls back to dot (here and again defensively at render time).
+    countdown_glyph_set: str = Field(default="dot")
+
     # Streaming
     draft_update_min_chars: int = Field(default=30)
     draft_update_interval: float = Field(default=1.0)
@@ -230,6 +236,14 @@ class Config(BaseSettings):
         # Only ko/en are supported; any other value (or empty) falls back to en.
         value = str(v or "").strip().lower()
         return value if value in {"ko", "en"} else "en"
+
+    @field_validator("countdown_glyph_set", mode="before")
+    @classmethod
+    def _normalize_countdown_glyph_set(cls, v):
+        # DGN-780: allowlist gate; unknown/empty values fall back to the
+        # owner-locked default set (dot). Keys mirror countdown.GLYPH_SETS.
+        value = str(v or "").strip().lower()
+        return value if value in {"dot", "block-line", "square"} else "dot"
 
     @field_validator("whisper_language", mode="before")
     @classmethod
