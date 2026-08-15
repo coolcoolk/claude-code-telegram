@@ -8,7 +8,6 @@ backed off; "message is not modified" is treated as success.
 
 import asyncio
 import logging
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, List, Optional
@@ -17,7 +16,12 @@ from telegram import Bot, LinkPreviewOptions
 from telegram.error import BadRequest, RetryAfter, TelegramError
 
 from bridge.config import config
-from bridge.formatting import split_text, strip_display_markers
+from bridge.formatting import (
+    balance_telegram_html,
+    html_to_plain_text,
+    split_text,
+    strip_display_markers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +63,10 @@ def _fold_html_to_plain(html_text: str) -> str:
     <b>, <i>, <code> etc.) back to legible plain text. Unescapes HTML
     entities so the user sees the original characters rather than &amp; etc.
     Only used on BadRequest (400) degradation -- not in the normal path.
+    DGN-891: delegates to the shared formatting helper so every send path's
+    plain fallback strips tags the same way.
     """
-    import html as _html_mod
-    plain = re.sub(r"<[^>]+>", "", html_text)
-    return _html_mod.unescape(plain)
+    return html_to_plain_text(html_text)
 
 
 async def send_fold_html(bot: Bot, chat_id: int, html_text: str) -> Optional[int]:
@@ -72,6 +76,8 @@ async def send_fold_html(bot: Bot, chat_id: int, html_text: str) -> Optional[int
     to a later tick (the caller re-attempts on the next interim).
     MAJOR-1: BadRequest degrades to plain-text send once before giving up.
     """
+    # DGN-891: universal tag-balance guard -- no-op on balanced input.
+    html_text = balance_telegram_html(html_text)
     for parse_mode, text in [("HTML", html_text), (None, _fold_html_to_plain(html_text))]:
         try:
             kwargs = dict(
@@ -114,6 +120,8 @@ async def edit_fold_html(
     "message is not modified" counts as success.
     MAJOR-1: BadRequest degrades to plain-text edit once before giving up.
     """
+    # DGN-891: universal tag-balance guard -- no-op on balanced input.
+    html_text = balance_telegram_html(html_text)
     for parse_mode, text in [("HTML", html_text), (None, _fold_html_to_plain(html_text))]:
         try:
             kwargs = dict(
@@ -163,6 +171,8 @@ async def finalize_fold_html(
     MAJOR-1: BadRequest on HTML degrades to plain-text once (caption + body,
     no expandable structure -- fold meaning lost but content preserved).
     """
+    # DGN-891: universal tag-balance guard -- no-op on balanced input.
+    html_text = balance_telegram_html(html_text)
     plain_text = _fold_html_to_plain(html_text)
     # Each (parse_mode, text) pair is attempted with bounded RetryAfter backoff.
     for parse_mode, text in [("HTML", html_text), (None, plain_text)]:

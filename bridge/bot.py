@@ -51,8 +51,11 @@ from bridge.config import (
 from bridge import ownership
 from bridge.formatting import (
     IMAGE_EXTS,
+    balance_telegram_html,
     code_segment_html,
+    html_to_plain_text,
     markdown_to_telegram_html,
+    rebalance_html_chunks,
     resolve_send_paths,
     split_into_segments,
     split_paths_by_scope,
@@ -1169,11 +1172,13 @@ class TelegramBot:
 
         escaped = html.escape(output)
         for part in split_text(escaped):
-            body = f"<pre>{part}</pre>"
+            # DGN-891: balance guard (no-op here) + tag-stripped fallback so
+            # the plain degrade never shows escaped entities.
+            body = balance_telegram_html(f"<pre>{part}</pre>")
             try:
                 await update.message.reply_text(body, parse_mode="HTML")
             except Exception:
-                await update.message.reply_text(part)
+                await update.message.reply_text(html_to_plain_text(body))
 
     @staticmethod
     def _read_skill_frontmatter(skill_md: Path) -> Optional[tuple]:
@@ -1270,10 +1275,13 @@ class TelegramBot:
             lines.extend(_fmt(global_skills))
         reply = "\n".join(lines) if lines else messages.SKILLS_NONE
         for part in split_text(reply):
+            # DGN-891: balance guard (a split could cut a <b> header pair) +
+            # tag-stripped fallback so a plain degrade never leaks tags.
+            part = balance_telegram_html(part)
             try:
                 await update.message.reply_text(part, parse_mode="HTML")
             except Exception:
-                await update.message.reply_text(part)
+                await update.message.reply_text(html_to_plain_text(part))
 
     async def _handle_skill_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -2110,16 +2118,19 @@ class TelegramBot:
         # link; every subsequent part goes out plain.
         link_pending = reply_to is not None
         for segment, is_code, lang in split_into_segments(content):
-            for part in split_text(segment):
-                if not part.strip():
-                    continue
-                if is_code:
-                    rendered = code_segment_html(part, lang)
-                else:
-                    # DGN-376: prose goes out as Telegram HTML; markdown the
-                    # agents emit is converted, everything else is escaped so
-                    # stray _ * [ ] < > never mangle the message.
-                    rendered = markdown_to_telegram_html(part)
+            parts = [p for p in split_text(segment) if p.strip()]
+            if is_code:
+                rendered_parts = [code_segment_html(p, lang) for p in parts]
+            else:
+                # DGN-376: prose goes out as Telegram HTML; markdown the
+                # agents emit is converted, everything else is escaped so
+                # stray _ * [ ] < > never mangle the message.
+                rendered_parts = [markdown_to_telegram_html(p) for p in parts]
+            # DGN-891: a tag span can straddle a split_text boundary; close
+            # open tags at each chunk end and re-open them on the next chunk
+            # so every send is independently valid HTML (no-op when balanced).
+            rendered_parts = rebalance_html_chunks(rendered_parts)
+            for rendered in rendered_parts:
                 if link_pending:
                     link_pending = False
                     if await self._try_send_linked(message, rendered, lp, reply_to):
@@ -2133,9 +2144,13 @@ class TelegramBot:
                         link_preview_options=lp,
                     )
                 except Exception:
-                    # DGN-376 v1.1 (m1): plain-text fallback keeps the
-                    # preview suppression of the send it replaces.
-                    await message.reply_text(part, link_preview_options=lp)
+                    # DGN-376 v1.1 (m1) + DGN-891: tag-STRIPPED readable
+                    # fallback (never raw markdown source, never leaked
+                    # tags); keeps the preview suppression of the send it
+                    # replaces.
+                    await message.reply_text(
+                        html_to_plain_text(rendered), link_preview_options=lp
+                    )
 
     async def _try_send_linked(self, message, rendered: str, lp, reply_to: int) -> bool:
         """DGN-555: attempt the reply-linked send of the first body part.
@@ -2180,7 +2195,9 @@ class TelegramBot:
             return False
         if len(split_text(display)) != 1:
             return False
-        converted = markdown_to_telegram_html(display)
+        # DGN-891: balance guard -- no-op on balanced (or tag-free) output,
+        # so the converted == display no-op check below is unaffected.
+        converted = balance_telegram_html(markdown_to_telegram_html(display))
         if converted == display and not preview:
             # No markdown and nothing to escape: the plain draft already
             # renders exactly this text, so skip the no-op edit (Telegram
@@ -2319,39 +2336,34 @@ class TelegramBot:
         # default preview; otherwise previews are suppressed.
         lp = None if preview else LINK_PREVIEW_OFF
         for segment, is_code, lang in split_into_segments(content):
+            parts = [p for p in split_text(segment) if p.strip()]
             if is_code:
-                for part in split_text(segment):
-                    if not part.strip():
-                        continue
-                    try:
-                        await bot.send_message(
-                            chat_id,
-                            code_segment_html(part, lang),
-                            parse_mode="HTML",
-                            link_preview_options=lp,
-                        )
-                    except Exception:
-                        # DGN-376 v1.1 (m1): plain-text fallback keeps the
-                        # preview suppression of the send it replaces.
-                        await bot.send_message(chat_id, part, link_preview_options=lp)
+                rendered_parts = [code_segment_html(p, lang) for p in parts]
             else:
-                for part in split_text(segment):
-                    if not part.strip():
-                        continue
-                    try:
-                        # DGN-376: prose goes out as Telegram HTML; markdown the
-                        # agents emit is converted, everything else is escaped so
-                        # stray _ * [ ] < > never mangle the message.
-                        await bot.send_message(
-                            chat_id,
-                            markdown_to_telegram_html(part),
-                            parse_mode="HTML",
-                            link_preview_options=lp,
-                        )
-                    except Exception:
-                        # DGN-376 v1.1 (m1): plain-text fallback keeps the
-                        # preview suppression of the send it replaces.
-                        await bot.send_message(chat_id, part, link_preview_options=lp)
+                # DGN-376: prose goes out as Telegram HTML; markdown the
+                # agents emit is converted, everything else is escaped so
+                # stray _ * [ ] < > never mangle the message.
+                rendered_parts = [markdown_to_telegram_html(p) for p in parts]
+            # DGN-891: a tag span can straddle a split_text boundary; close
+            # open tags at each chunk end and re-open them on the next chunk
+            # so every send is independently valid HTML (no-op when balanced).
+            rendered_parts = rebalance_html_chunks(rendered_parts)
+            for rendered in rendered_parts:
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        rendered,
+                        parse_mode="HTML",
+                        link_preview_options=lp,
+                    )
+                except Exception:
+                    # DGN-376 v1.1 (m1) + DGN-891: tag-STRIPPED readable
+                    # fallback (never raw markdown source, never leaked
+                    # tags); keeps the preview suppression of the send it
+                    # replaces.
+                    await bot.send_message(
+                        chat_id, html_to_plain_text(rendered), link_preview_options=lp
+                    )
 
     async def _send_file_paths(self, chat_id: int, paths: List[Path]) -> None:
         bot = self.application.bot

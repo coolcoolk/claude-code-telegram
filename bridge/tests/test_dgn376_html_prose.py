@@ -676,7 +676,10 @@ def test_reply_prose_fallback_carries_preview_suppression():
     assert len(sent) == 1, "fallback must deliver the message"
     s = sent[0]
     assert s["parse_mode"] is None
-    assert s["text"] == "hello **world**"
+    # DGN-891: the plain fallback is the tag-STRIPPED rendered text -- the
+    # user never sees raw markdown (**) or leaked tags on a rejected HTML send.
+    assert s["text"] == "hello world"
+    assert "**" not in s["text"]
     assert _is_disabled(s["link_preview_options"]), (
         "m1: fallback send must keep preview suppression"
     )

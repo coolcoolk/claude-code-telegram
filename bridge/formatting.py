@@ -851,6 +851,131 @@ def markdown_to_telegram_html(text: str) -> str:
     return text
 
 
+# --- DGN-891: tag-safe HTML balancing for split/truncated sends --------------
+#
+# Rendered Telegram HTML can end up cut at a length boundary (split_text
+# chunking of the final answer, fold rolling-window truncation) with a
+# <b>/<blockquote>/<code>/<a> span straddling the cut. Telegram rejects the
+# unbalanced chunk with a 400 ("can't find end tag corresponding to start
+# tag ...") and the send then degrades to a plain fallback -- historically
+# showing RAW markdown source to the user. The helpers below make every
+# emitted HTML string independently valid:
+#   - balance_telegram_html: closes still-open tags at the end (LIFO order)
+#     and drops stray closers that have no opener. Balanced input passes
+#     through byte-identical, so it is safe as a universal pre-send guard.
+#   - rebalance_html_chunks: balance-and-reopen across an ordered chunk list;
+#     tags left open at a chunk boundary are closed at that chunk's end and
+#     re-opened (original attributes preserved) at the next chunk's start,
+#     so a straddling span keeps its formatting on both sides of the split.
+#   - html_to_plain_text: tag-strip + entity-unescape, shared by every plain
+#     fallback so a rejected HTML send degrades to readable prose, never raw
+#     markdown (**) or leaked tags.
+
+# Container tag names Telegram HTML pairs with a close tag. Longest names
+# first so the alternation never half-matches a longer name. The optional
+# attribute group covers <a href="...">, <blockquote expandable>,
+# <code class="language-...">, <span class="tg-spoiler">.
+_TG_BALANCE_TAG_RE = re.compile(
+    r"<(/?)(blockquote|tg-spoiler|strong|strike|span|code|pre|ins|del|em|b|i|u|s|a)"
+    r"((?:\s[^<>]*)?)>"
+)
+
+
+def _scan_html_tags(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Scan whitelisted tags; fix strays; return (text, open-tag stack).
+
+    The returned stack holds (name, full_open_tag) for every tag still open
+    at the end of text, in opening order. Stray closers with no matching
+    opener are dropped; an improperly nested closer first closes the tags
+    opened inside it (Telegram requires proper nesting). Input with no
+    stray/misnested closers is returned as the same object.
+    """
+    stack: List[Tuple[str, str]] = []
+    out: List[str] = []
+    pos = 0
+    changed = False
+    for m in _TG_BALANCE_TAG_RE.finditer(text):
+        if m.group(1) != "/":
+            stack.append((m.group(2), m.group(0)))
+            continue
+        name = m.group(2)
+        if stack and stack[-1][0] == name:
+            stack.pop()
+            continue
+        out.append(text[pos:m.start()])
+        pos = m.end()
+        changed = True
+        if any(n == name for n, _ in stack):
+            # Improper nesting: close the inner tags, then keep the closer.
+            while stack and stack[-1][0] != name:
+                out.append("</{}>".format(stack.pop()[0]))
+            stack.pop()
+            out.append(m.group(0))
+        else:
+            # DGN-891 C1: stray closer with no opener -> escape it so the
+            # literal text survives (a bare "</b>" typed in prose must not be
+            # silently deleted). Escaping keeps the output balanced.
+            out.append(m.group(0).replace("<", "&lt;").replace(">", "&gt;"))
+    if not changed:
+        return text, stack
+    out.append(text[pos:])
+    return "".join(out), stack
+
+
+def balance_telegram_html(html_text: str) -> str:
+    """Close open tags / drop stray closers so Telegram accepts the HTML.
+
+    Idempotent and a byte-identical no-op on balanced input, so it is safe
+    as a final guard immediately before every parse_mode="HTML" send.
+    """
+    if not html_text or "<" not in html_text:
+        return html_text
+    fixed, open_stack = _scan_html_tags(html_text)
+    if not open_stack:
+        return fixed
+    return fixed + "".join(
+        "</{}>".format(name) for name, _ in reversed(open_stack)
+    )
+
+
+def rebalance_html_chunks(chunks: List[str]) -> List[str]:
+    """Balance-and-reopen: make each rendered-HTML chunk independently valid.
+
+    Tags still open at a chunk's end are closed there and re-opened (with
+    their original attributes) at the start of the next chunk, so a span
+    that straddled the split boundary stays formatted on both sides.
+    Already-balanced chunks pass through byte-identical.
+    """
+    out: List[str] = []
+    carry: List[Tuple[str, str]] = []
+    for chunk in chunks:
+        prefixed = "".join(tag for _, tag in carry) + chunk if carry else chunk
+        fixed, open_stack = _scan_html_tags(prefixed)
+        if open_stack:
+            fixed += "".join(
+                "</{}>".format(name) for name, _ in reversed(open_stack)
+            )
+        out.append(fixed)
+        carry = open_stack
+    return out
+
+
+def html_to_plain_text(html_text: str) -> str:
+    """Strip HTML tags + unescape entities: readable plain-text fallback.
+
+    Shared by every plain fallback of a parse_mode="HTML" send so a rejected
+    HTML message degrades to clean prose -- never raw markdown or leaked tags.
+    """
+    if not html_text:
+        return html_text
+    # DGN-891 C2: preserve link URLs ("text (url)") instead of dropping href
+    # when the anchor tag is stripped.
+    text = re.sub(
+        r'<a\s+href="([^"]*)"[^>]*>(.*?)</a>', r"\2 (\1)", html_text, flags=re.DOTALL
+    )
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
 # --- DGN-682: interim narration -> expandable-blockquote fold ----------------
 #
 # Fold-mode (INTERIM_MODE=fold) turns synthesize the interim narration
@@ -1022,8 +1147,14 @@ def _render_fold_html(body: str, caption: str, expandable: bool, quote: bool = T
         if caption:
             b = caption + "\n" + b
         if quote:
-            return markdown_to_telegram_html(_fold_v2_quote(b, expandable))
-        return markdown_to_telegram_html(b)
+            out = markdown_to_telegram_html(_fold_v2_quote(b, expandable))
+        else:
+            out = markdown_to_telegram_html(b)
+        # DGN-891: the rolling window can cut a verbatim tag pair apart (or
+        # the narration may carry a lone whitelisted tag); balance BEFORE the
+        # fit check so the emitted HTML is valid AND the 4096 budget measures
+        # the real (balanced) length. No-op on balanced output.
+        return balance_telegram_html(out)
 
     html_out = _render(body)
     if _utf16_units(html_out) <= _FOLD_HTML_LIMIT:
