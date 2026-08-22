@@ -80,6 +80,22 @@ def has_numbered_list(text: str) -> bool:
     return len(_NUMBERED_RE.findall(prose)) >= 2
 
 
+def has_options_marker(text: str) -> bool:
+    """True when any line is a standalone [[OPTIONS]] marker (DGN-1021).
+
+    The canonical "is a marker present?" recognizer. Line-based, matching the
+    strip/render seats (strip_options_marker) -- NOT a substring scan: a
+    mid-line prose mention of the marker never arms buttons, so it must not
+    count as marker-present. Every gate that asks "does this content carry
+    options?" routes through here; hand-rolled `OPTIONS_MARKER in content`
+    substring checks are retired (each independent recognizer drifts the
+    moment a new marker form is added -- the DGN-1021 defect class).
+    """
+    if not text:
+        return False
+    return any(ln.strip() == OPTIONS_MARKER for ln in text.split("\n"))
+
+
 def _option_line_entries(text: str) -> List[Tuple[int, str, int]]:
     """Scan for numbered option lines outside fenced code blocks.
 

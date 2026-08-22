@@ -70,6 +70,7 @@ from bridge.options import (
     OPTIONS_MARKER,
     build_option_keyboard,
     extract_options,
+    has_options_marker,
     strip_options_marker,
 )
 from bridge.permissions import (
@@ -2246,6 +2247,18 @@ class TelegramBot:
                 kb = build_option_keyboard(options)
                 if kb:
                     await message.reply_text(messages.SELECT_PROMPT, reply_markup=kb)
+        elif has_options_marker(content):
+            # DGN-1021 (fail-loud): an ARMABLE marker line reached the render
+            # seat with the options gate OFF -- an upstream gate missed the
+            # marker (the recognizer-drift defect class that kills buttons
+            # silently). Body is delivered intact either way; log-only, zero
+            # user-visible side effect, and marker-less sends never enter
+            # this branch.
+            logger.warning(
+                "[[OPTIONS]] marker present but options gate is OFF "
+                "(force_options=False) -- buttons skipped; upstream "
+                "recognizer drift? (DGN-1021)"
+            )
 
     async def _proactive_push(
         self, chat_id: int, content: str, has_options: bool
@@ -2329,6 +2342,16 @@ class TelegramBot:
             kb = build_option_keyboard(options)
             if kb:
                 await bot.send_message(chat_id, messages.SELECT_PROMPT, reply_markup=kb)
+        elif has_marker:
+            # DGN-1021 (fail-loud): same tripwire as _send_content_artifacts,
+            # for the proactive/resume send seat (this path renders its own
+            # keyboard instead of delegating). Marker present, gate off:
+            # upstream recognizer drift -- warn, never silently drop buttons.
+            logger.warning(
+                "[[OPTIONS]] marker present but options gate is OFF "
+                "(force_options=False) -- buttons skipped; upstream "
+                "recognizer drift? (DGN-1021)"
+            )
 
     async def _send_text_body_chat(self, chat_id: int, content: str, preview: bool = False) -> None:
         bot = self.application.bot

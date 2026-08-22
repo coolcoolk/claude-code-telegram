@@ -50,7 +50,12 @@ from bridge.formatting import (
     render_fold_final,
     render_fold_live,
 )
-from bridge.options import OPTIONS_MARKER, classify_is_choice, has_numbered_list
+from bridge.options import (
+    OPTIONS_MARKER,
+    classify_is_choice,
+    has_numbered_list,
+    has_options_marker,
+)
 from bridge.permissions import extract_outside_paths, extract_protected_paths
 
 logger = logging.getLogger(__name__)
@@ -719,7 +724,13 @@ class SdkBridge:
         list a pick-one menu. Runs only when a numbered list is present and the
         marker is absent. Fail-silent: any error leaves content unchanged.
         """
-        if not (has_numbered_list(content) and OPTIONS_MARKER not in content):
+        # DGN-1021: "is a marker present?" has exactly ONE implementation --
+        # the canonical line-based recognizer (options.has_options_marker).
+        # The old `OPTIONS_MARKER not in content` substring check is retired:
+        # its only extra coverage was MID-LINE mentions, which never arm
+        # buttons and are not an authored marker, so they must not suppress
+        # classifier injection over a genuine pick-one run.
+        if not (has_numbered_list(content) and not has_options_marker(content)):
             return content
         try:
             is_choice = await asyncio.to_thread(
@@ -842,7 +853,12 @@ class SdkBridge:
             return
         dedup_key = content  # cleaned text, before any marker is appended
         content = await self._maybe_mark_options("", content)
-        has_options = OPTIONS_MARKER in content or has_numbered_list(content)
+        # DGN-1021: marker recognition routes through the canonical recognizer
+        # ONLY (line-based; the substring check also matched mid-line prose
+        # mentions, which never arm buttons). The has_numbered_list OR-arm is
+        # load-bearing: a numbered run with no marker (classifier-injection
+        # path) must keep the gate open, so it stays.
+        has_options = has_options_marker(content) or has_numbered_list(content)
         try:
             # _send_smart strips the marker and renders [[OPTIONS]] buttons itself.
             await state.proactive_push(state.last_chat_id, content, has_options)
