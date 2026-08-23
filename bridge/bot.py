@@ -528,6 +528,28 @@ class TelegramBot:
                 path = files[0]
                 try:
                     text = path.read_text(encoding="utf-8").strip()
+                except UnicodeDecodeError as e:
+                    # DGN-inbox-utf8: a file that fails to decode is a poison
+                    # pill -- files[0] would pick the SAME undecodable file
+                    # again next tick forever (retried every poll_secs, and
+                    # blocking any later files behind it in sort order). Move
+                    # it aside once and log a single error instead of one
+                    # error per 20s poll. ".corrupt" no longer matches the
+                    # "*.md" glob above, so it is never picked up again.
+                    quarantine_path = path.with_name(path.name + ".corrupt")
+                    try:
+                        path.rename(quarantine_path)
+                        logger.error(
+                            "session-inbox undecodable, quarantined %s -> %s: %s",
+                            path, quarantine_path.name, e,
+                        )
+                    except OSError as rename_err:
+                        logger.error(
+                            "session-inbox undecodable AND quarantine failed "
+                            "for %s: %s (rename error: %s)",
+                            path, e, rename_err,
+                        )
+                    continue
                 except Exception as e:
                     logger.error("session-inbox read failed for %s: %s", path, e)
                     continue
