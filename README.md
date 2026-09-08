@@ -16,10 +16,17 @@ phone — streaming replies, voice input, inline approvals, and resilient long-r
 - Two-layer polling watchdog (in-process stall detection + external heartbeat file monitor).
 - Self-restart script (graceful drain + relaunch + completion ping).
 - Media/album handling and message formatting for Telegram.
-- Timeout resilience (guaranteed notification instead of silent stalls).
-- `/usage` command (optional): runs a project-side `routines/claude-usage.sh`
-  and posts its report. Not bundled here — supply the script to enable it;
-  otherwise the command replies with a graceful "script not found" notice.
+- Image normalization before send (oversized screenshots arrive as downscaled
+  photos, or as documents when no legal downscale exists, instead of failing).
+- Timeout resilience (guaranteed notification instead of silent stalls) and
+  classified failures with a Retry button rather than a generic "network error".
+- Interrupt-and-merge: a message sent mid-turn pauses the running turn and folds
+  itself in. `/queue <message>` appends without interrupting.
+- `/btw <question>`: an aside answered in a forked session that never touches
+  your main history.
+- `/restart`: graceful drain, relaunch, completion ping.
+- Optional fast-path handler (`FASTPATH_HANDLER`, default off): your own
+  executable can answer short deterministic messages before a model turn starts.
 
 ## Requirements
 - Claude Code CLI installed and on PATH (`claude`).
@@ -64,6 +71,12 @@ To register the watchdog as a launchd service:
 2. Or run `bridge/watchdog_setup.sh` from the project root -- it finds the
    watchdog plist in `bridge/`, substitutes it, and registers it idempotently.
    On Linux it writes a systemd user timer instead.
+
+On Linux the unit names default to `claude-code-telegram.service` and
+`claude-code-telegram-watchdog`, and the setup script adopts whichever naming is
+already registered on the host before falling back to those defaults -- so an
+in-place update never orphans an existing timer. Override with
+`DOGANY_BRIDGE_UNIT` / `DOGANY_WATCHDOG_UNIT` if you registered your own names.
 
 Watchdog activity is logged to `.telegram_bot/logs/watchdog.log`.
 Notifications on restart degrade gracefully to log-only in this repo (no bundled
