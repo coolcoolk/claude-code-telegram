@@ -10,9 +10,78 @@ import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from bridge.options import OPTIONS_MARKER
+# DGN-1209: outbound machine-line gate (telegram-free, hop-safe). The gate
+# runs inside sanitize_message_for_telegram (push.sh / pin / btw) and inside
+# bot._render_prose_html_segments (followup / fastpath / model sends) -- one
+# pure function, two render entry points, rail declared by the caller.
+from bridge.machine_gate import (  # noqa: E402
+    MACHINE_SIGNAL_MARKER,
+    RAIL_UNKNOWN,
+    apply_machine_line_gate,
+)
 
 logger = logging.getLogger(__name__)
+
+# [[OPTIONS]] marker constant lives HERE (not in bridge.options) so this module
+# stays importable without python-telegram-bot installed. bridge.options pulls
+# in `telegram` at import time; the shell sanitize hop (routines/push.sh ->
+# sanitize_message_for_telegram) must work outside the bridge venv, and a
+# transitive telegram import would silently disable the whole sanitizer
+# (DGN-822 P2). bridge.options re-imports this constant, so existing
+# `from bridge.options import OPTIONS_MARKER` consumers are unaffected.
+OPTIONS_MARKER = "[[OPTIONS]]"
+
+# DGN-992: labeled marker form -- the marker itself carries the button labels:
+#   [[OPTIONS: label1 | label2 | label3]]
+# Buttons build directly from the marker labels, so button rendering never
+# depends on the body being a numbered list (the DGN-992 silent-evaporation
+# trap) and never guesses labels from an unrelated numbered run (the DGN-984
+# hijack). Labels are thin tokens (DGN-881); "|" is the separator and cannot
+# appear inside a label. Standalone line, same position contract as the bare
+# marker. The bare form stays supported (numbered-run extraction path).
+OPTIONS_LABELED_RE = re.compile(r"^\[\[OPTIONS:(.*)\]\]$")
+
+
+def is_options_marker_line(line: str) -> bool:
+    """True when the stripped line is a bare OR labeled [[OPTIONS]] marker."""
+    stripped = line.strip()
+    return stripped == OPTIONS_MARKER or OPTIONS_LABELED_RE.match(stripped) is not None
+
+
+def parse_options_marker_labels(line: str) -> Optional[List[str]]:
+    """Parse a LABELED marker line into its labels (DGN-992).
+
+    Returns None when the line is not a labeled marker (bare marker included).
+    Empty/whitespace-only labels are dropped, so "[[OPTIONS:]]" and
+    "[[OPTIONS: | ]]" return [] -- callers treat that as label-less and fall
+    back to the bare-marker behavior.
+    """
+    m = OPTIONS_LABELED_RE.match(line.strip())
+    if m is None:
+        return None
+    return [part.strip() for part in m.group(1).split("|") if part.strip()]
+
+
+
+def _i18n(key: str, fallback: str) -> str:
+    """Resolve a user-facing copy constant via bridge.i18n, fail-open.
+
+    DGN-851: fold captions/markers are locale data and live in the bridge
+    i18n catalogs (ko carries the LOCKED owner copy). This module MUST stay
+    importable OUTSIDE the bridge venv (push.sh sanitize hop, DGN-822):
+    bridge.i18n pulls bridge.config (pydantic/dotenv, venv-only), so the
+    import is guarded and any failure -- or a missing key (t() echoes the
+    key) -- degrades to the previous hardcoded copy (zero-delta fallback).
+    """
+    try:
+        from bridge.i18n import t
+    except Exception:
+        return fallback
+    try:
+        value = t(key)
+    except Exception:
+        return fallback
+    return fallback if value == key else value
 
 # A reply only sends files when it contains a line whose stripped form starts
 # with this prefix. Bare prose paths are never sent.
@@ -58,7 +127,7 @@ CONTRACT_VERSION = 1
 # (strip_*_marker / strip_display_markers) before prose reaches the converter,
 # so they never reach the containment net as "unknown".
 RECOGNIZED_COLON_MARKERS = frozenset(
-    {SEND_FILE_MARKER, LINK_PREVIEW_MARKER, "fold::"}
+    {SEND_FILE_MARKER, LINK_PREVIEW_MARKER, "fold::", MACHINE_SIGNAL_MARKER}
 )
 # Bracket-form control markers ([[OPTIONS]] etc.) the render layer recognizes.
 RECOGNIZED_BRACKET_MARKERS = frozenset({OPTIONS_MARKER})
@@ -354,6 +423,34 @@ def _strip_toolcall_in_prose(prose: str) -> Tuple[str, int]:
     return cleaned, removed
 
 
+def _split_fenced_blocks(text: str):
+    """Walk ``` fences, yielding (chunk, is_fenced_code) pairs in order.
+
+    An opening ``` with no matching closer is NOT a real code block (same
+    rule everywhere in this module): the remainder is yielded as a single
+    prose chunk instead of being treated as fenced code, so a stray ``` can
+    never be used to shield content from a prose-only pass. This is the ONE
+    fence walk in the module -- every pass that must never touch fenced code
+    (strip_toolcall_markup, normalize_dashes) reuses it rather than
+    re-implementing the same ``` scan.
+    """
+    fence = "```"
+    pos = 0
+    n = len(text)
+    while pos < n:
+        start = text.find(fence, pos)
+        if start == -1:
+            yield text[pos:], False
+            return
+        end = text.find(fence, start + len(fence))
+        if end == -1:
+            yield text[pos:], False
+            return
+        yield text[pos:start], False
+        yield text[start : end + len(fence)], True
+        pos = end + len(fence)
+
+
 def strip_toolcall_markup(text: str) -> str:
     """Remove leaked tool-call markup from outbound assistant text.
 
@@ -367,35 +464,14 @@ def strip_toolcall_markup(text: str) -> str:
         return text
     total_removed = 0
     out_parts: List[str] = []
-    # Walk the text splitting on complete fenced blocks; scrub prose, keep code.
-    pos = 0
-    n = len(text)
-    fence = "```"
-    while pos < n:
-        start = text.find(fence, pos)
-        if start == -1:
-            prose = text[pos:]
-            cleaned, removed = _strip_toolcall_in_prose(prose)
-            total_removed += removed
-            out_parts.append(cleaned)
-            break
-        end = text.find(fence, start + len(fence))
-        if end == -1:
-            # No closing fence: this is not a real code block. Scrub the rest as
-            # prose so an opening ``` cannot shield leaked markup.
-            prose = text[pos:]
-            cleaned, removed = _strip_toolcall_in_prose(prose)
-            total_removed += removed
-            out_parts.append(cleaned)
-            break
-        # Prose before the fence: scrub it.
-        prose = text[pos:start]
-        cleaned, removed = _strip_toolcall_in_prose(prose)
+    for chunk, is_fenced in _split_fenced_blocks(text):
+        if is_fenced:
+            # The fenced block itself (fences included): keep verbatim.
+            out_parts.append(chunk)
+            continue
+        cleaned, removed = _strip_toolcall_in_prose(chunk)
         total_removed += removed
         out_parts.append(cleaned)
-        # The fenced block itself (fences included): keep verbatim.
-        out_parts.append(text[start : end + len(fence)])
-        pos = end + len(fence)
     if not total_removed:
         return text
     logger.warning("Stripped leaked tool-call markup (%d bytes removed)", total_removed)
@@ -413,8 +489,10 @@ def strip_link_preview_marker(text: str) -> Tuple[str, bool]:
     return "\n".join(kept).rstrip(), True
 
 
+
+
 def strip_display_markers(text: str) -> str:
-    """Drop [[OPTIONS]], send_file:: and link_preview:: marker lines.
+    """Drop [[OPTIONS]], [[IDRILL:..]], send_file:: and link_preview:: markers.
 
     Also strips any leaked tool-call markup (DGN-159) so streamed drafts and
     finalized bubbles never surface raw <invoke> blocks.
@@ -426,7 +504,7 @@ def strip_display_markers(text: str) -> str:
     kept = [
         ln
         for ln in lines
-        if ln.strip() != OPTIONS_MARKER
+        if not is_options_marker_line(ln)
         and not ln.strip().startswith(SEND_FILE_MARKER)
         and not ln.strip().startswith(LINK_PREVIEW_MARKER)
     ]
@@ -596,9 +674,14 @@ def code_segment_html(code: str, lang: Optional[str]) -> str:
 #     trigger is the marker ONLY -- never line count (owner-explicit). Choosing
 #     WHICH content is captured as an expandable blockquote (tool-process
 #     capture / role classification) is a separate follow-up, not this pass.
-#   ITALIC WORD-ONLY: italic emphasis converts only when the wrapped span is a
-#     single word (no internal whitespace); a multi-word span stays literal
-#     text. This is enforced by the inline italic regexes (see below).
+#   ITALIC WORD-ONLY + MULTI-WORD BOLD DEMOTION (DGN-619 / DGN-1169): italic
+#     emphasis converts only when the wrapped span is a single word (no
+#     internal whitespace). A multi-word `*...*` span is NOT italic -- it is
+#     DEMOTED TO BOLD (<b>...</b>), so the owner rule "italic is one short
+#     word" survives untouched while the raw asterisks stop reaching the
+#     screen. Underscore (`_..._`) is deliberately NOT demoted; the reasoning
+#     is recorded with the regexes below. Enforced by the inline emphasis
+#     regexes (see below).
 
 # Whitelisted, exact-form Telegram HTML tags that pass through verbatim.
 _TG_HTML_TAG_RE = re.compile(
@@ -610,6 +693,20 @@ _TG_HTML_TAG_RE = re.compile(
     r'|<a href="[^"<>\s]+">'
     r"|</a>"
 )
+
+
+def contains_telegram_html(text: str) -> bool:
+    """True when text carries a whitelisted Telegram HTML tag (DGN-846).
+
+    Used by the streamed-prose finalize path: the plain-text draft renders
+    passthrough tags (e.g. <blockquote expandable>) as RAW literal text, so
+    the HTML finalize edit must NOT be skipped as a no-op even when the
+    markdown conversion leaves the string byte-identical -- sending the same
+    string with parse_mode=HTML is what makes the tags render.
+    """
+    if not text:
+        return False
+    return _TG_HTML_TAG_RE.search(text) is not None
 
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _MD_LINK_RE = re.compile(r"\[([^\[\]\n]+)\]\(((?:https?|tg)://[^\s()]+)\)")
@@ -630,6 +727,91 @@ _MD_ITALIC_STAR_RE = re.compile(
 _MD_ITALIC_UNDER_RE = re.compile(
     r"(?<![A-Za-z0-9_])_(?![\s_])([^\s_\n]+?)(?<!\s)_(?![A-Za-z0-9_])"
 )
+
+# DGN-1169: a MULTI-WORD `*...*` span is demoted to BOLD, not promoted to
+# italic. Runs strictly AFTER _MD_ITALIC_STAR_RE, so every single-word span is
+# already consumed as <i> and this pattern can only ever see a genuine
+# multi-word leftover -- the DGN-619 word-only italic rule is preserved bit for
+# bit. Before this, such a span fell through as literal text and the raw
+# asterisks reached the screen (480 occurrences in one month of assistant
+# output, measured in DGN-376); telegram.md already TOLD authors to "use bold
+# for multi-word emphasis", so this makes the machine do what the prose rule
+# asked for.
+#
+# UNDERSCORE IS NOT DEMOTED (deliberate asymmetry, DGN-1169):
+#   1. Zero measured demand. The 480-occurrence measurement is asterisk-only;
+#      multi-word `_..._` frequency was never measured. Widening an unmeasured
+#      surface buys no known win.
+#   2. Strictly worse false-positive surface. The single-word rule is safe for
+#      BOTH markers only because banning internal whitespace makes it
+#      structurally impossible for two unrelated markers to pair up across
+#      tokens. Allowing internal whitespace removes that protection, and
+#      underscore is far more common as literal content than asterisk in this
+#      codebase's prose: leading/trailing identifier names (`_stash`, `count_`,
+#      `_prepass_structural`) appear bare in prose constantly, and a
+#      `_leading` ... `trailing_` pair one sentence apart would bold the text
+#      between them. Asterisk's literal uses are globs, which this pattern
+#      can be shaped against (see the guards below); underscore's are
+#      identifiers, which look exactly like emphasis.
+#   3. Reversible. If `_two words_` is ever measured at a rate that matters,
+#      adding the twin regex is a two-line change; un-shipping a wrong one is
+#      not.
+#
+# GUARDS beyond the single-word pattern (glob false-positive defence -- the
+# whole point of the whitespace ban was that `pack/* 와 kit/*` could not pair,
+# and lifting it hands that risk back):
+#   left flank  -- the opener must sit at the very start, after whitespace,
+#                  after an opening bracket/quote, or right after a stashed
+#                  span (\x00; list bullets and blockquote tags are stashed
+#                  BEFORE this runs, so `- *two words*` must still convert).
+#                  This is TIGHTER than the single-word rule's
+#                  `(?<![A-Za-z0-9*])`, which is ASCII-only and therefore lets
+#                  a CJK-adjacent footnote star (`3개*, 총합 10*`) open a span.
+#   opener      -- not followed by whitespace, `*`, `.` or `/`, so `*.db`,
+#                  `*.sql` and `*/tmp` can never OPEN a span.
+#   closer      -- the last content char is never `/`, so `pack/*`, `kit/*`
+#                  and `src/*` can never CLOSE one. The right flank stays the
+#                  single-word rule's `(?![A-Za-z0-9*])` on purpose: Korean
+#                  glues particles straight onto the marker (`*두 단어*를`),
+#                  and a stricter right flank would reject exactly the
+#                  Korean-heavy traffic this ticket exists to fix.
+#   content     -- no `*` (never swallows a third marker), no newline (never
+#                  crosses a line), no `<` (the bold/strike passes above have
+#                  already emitted real tags into this string; excluding `<`
+#                  keeps `*a **b** c*` literal instead of nesting <b> in <b>),
+#                  and at least one internal space (that is what makes it
+#                  multi-word; single-word spans are italic, handled above).
+#   length      -- _MD_EMPH_MULTI_MAX_CHARS caps the demoted span so a stray
+#                  asterisk pair can never bold a whole paragraph. Over the
+#                  cap the span is left exactly as it is today (literal).
+_MD_EMPH_STAR_MULTI_RE = re.compile(
+    "(?<![^\\s\\x00(\\[{<>\"'‘“「『（])"
+    r"\*(?![\s*./])"
+    r"([^\s*<\n]+?[ \t][^*<\n]*?[^\s*<\n/])"
+    r"\*(?![A-Za-z0-9*])"
+)
+_MD_EMPH_MULTI_MAX_CHARS = 200
+
+
+def _demote_multiword_star(text: str, wrap: bool) -> str:
+    """DGN-1169: multi-word `*...*` -> bold (wrap) or bare content (de-mark).
+
+    ``wrap=True``  -> ``<b>...</b>``  (markdown_to_telegram_html)
+    ``wrap=False`` -> bare content    (streaming de-mark display; that path has
+                      no HTML to offer, it only strips marker characters)
+    A span longer than _MD_EMPH_MULTI_MAX_CHARS is returned untouched, i.e. it
+    keeps the pre-DGN-1169 literal rendering rather than bolding a paragraph.
+    """
+
+    def _repl(m: "re.Match[str]") -> str:
+        inner = m.group(1)
+        if len(inner) > _MD_EMPH_MULTI_MAX_CHARS:
+            return m.group(0)
+        return "<b>{}</b>".format(inner) if wrap else inner
+
+    return _MD_EMPH_STAR_MULTI_RE.sub(_repl, text)
+
+
 _MD_STRIKE_RE = re.compile(r"~~(?=\S)([^\n]+?)(?<=\S)~~")
 
 # DGN-619 list items: leading indent, a bullet marker (- * +) or an ordered
@@ -643,6 +825,10 @@ _MD_QUOTE_LINE_RE = re.compile(r"^>(!)?(?: (.*))?$")
 
 # DGN-775: markdown header line (1-6 '#' marks at line start).
 _MD_HEADER_RE = re.compile(r"^(#{1,6})[ \t]+(.*)$", re.MULTILINE)
+# DGN-822: markdown thematic break -- a line consisting ONLY of 3+ hyphens,
+# asterisks, or underscores (optional surrounding whitespace). Table separator
+# rows (|---|---|) can never match: they contain '|'.
+_MD_THEMATIC_BREAK_RE = re.compile(r"^[ \t]*(-{3,}|\*{3,}|_{3,})[ \t]*$")
 # DGN-775: markdown table detection helpers.
 # A table data row has at least one '|' that is not the only character on the line.
 _MD_TABLE_ROW_RE = re.compile(r"^\|.*\|[ \t]*$")
@@ -653,6 +839,28 @@ _MD_TABLE_SEP_RE = re.compile(r"^\|[ \t]*:?-+:?[ \t]*(\|[ \t]*:?-+:?[ \t]*)+\|?[
 # indent are added per depth level in the output.
 _BULLET_GLYPHS = ("•", "◦", "‣")  # bullet / white-bullet / triangle
 
+# DGN-954: ATX heading level -> glyph (H4+ clamped to index 2).
+# Monotone same-shape set (owner-confirmed, header-glyphs pass): size steps
+# down with depth so depth reads from the glyph itself.
+# U+25A0 BLACK SQUARE / U+25AA BLACK SMALL SQUARE / U+25AB WHITE SMALL SQUARE
+_HEADER_GLYPHS = ("■", "▪", "▫")  # H1 / H2 / H3+
+
+# DGN-1254: section-label glyph palette. Must stay in sync with the
+# SECTION_GLYPHS list documented in vendors/telegram.md (## Markup) --
+# this is the single code-side source of truth for that list.
+SECTION_GLYPHS = ("✅", "📌", "📋")  # conclusion / grounds+key / detail+list
+
+# DGN-1254: matches a heading text that already opens with a SECTION_GLYPHS
+# glyph + required space, so _strip_md_headers can skip the redundant ATX
+# heading glyph (see collision fix below).
+_SECTION_GLYPH_PREFIX_RE = re.compile(
+    "^(" + "|".join(re.escape(g) for g in SECTION_GLYPHS) + r")[ \t]+(.*)$"
+)
+
+# Strip bare ** markers from heading text before bold-wrapping to prevent
+# double-bold or broken tags when the heading already contains bold spans.
+_HEADER_BOLD_STRIP_RE = re.compile(r"\*\*")
+
 
 def _bullet_prefix(depth: int) -> str:
     """Leading indent (2 spaces/depth) + the depth-appropriate bullet glyph."""
@@ -661,17 +869,61 @@ def _bullet_prefix(depth: int) -> str:
 
 
 def _strip_md_headers(text: str) -> str:
-    """DGN-775: remove '# ' / '## ' / ... prefix from markdown header lines.
+    """DGN-954: promote ATX heading lines to glyph + bold HTML.
 
-    The header text is kept; only the '#' marks and the mandatory trailing
-    space are removed. Bold-promotion is deliberately avoided: headers in
-    Telegram chat are unusual and bold conversion could conflict with existing
-    emphasis handling lower in the pipeline.
+    Level -> glyph: H1 -> ■ (U+25A0), H2 -> ▪ (U+25AA), H3+ -> ▫ (U+25AB, clamped).
+    Output form per line: '<glyph> <b>heading text</b>'
 
-    Runs BEFORE _prepass_structural so the cleaned line re-enters the normal
-    list/blockquote path if it happens to start with '>' or '-' (edge case).
+    The emitted <b>...</b> tags survive html.escape because _TG_HTML_TAG_RE
+    stashes whitelisted tags (step 2 in markdown_to_telegram_html) before
+    html.escape runs (step 3).  Final rendered output is therefore:
+        '<glyph> <b>heading text</b>'
+
+    Any ** markers in the heading text are stripped before bold-wrapping to
+    prevent double-bold / broken nesting when the heading already contains bold.
+    Empty headings ('# ' trailing-space only) produce '<glyph> <b></b>' -- safe.
+
+    '#hashtag' (no space after '#') never matches _MD_HEADER_RE (requires
+    '[ \\t]+'), so it passes through unchanged.
+
+    Runs inside _prepass_structural, which is called only on prose segments
+    (code fences are split out upstream in bot.py), so '#' inside fenced or
+    inline code is never affected.
+
+    DGN-1254: if the heading text already opens with a SECTION_GLYPHS glyph
+    (e.g. '## ✅ conclusion'), the ATX heading glyph would collide with it
+    ('▪ ✅ conclusion'). In that case the section glyph is kept in place of
+    the heading glyph instead of stacking both; bold promotion still applies.
     """
-    return _MD_HEADER_RE.sub(r"\2", text)
+
+    def _promote(m: "re.Match[str]") -> str:
+        level = len(m.group(1))  # number of '#' chars -> heading level
+        heading_text = m.group(2)
+        section_match = _SECTION_GLYPH_PREFIX_RE.match(heading_text)
+        if section_match:
+            glyph = section_match.group(1)
+            inner = _HEADER_BOLD_STRIP_RE.sub("", section_match.group(2))
+        else:
+            glyph = _HEADER_GLYPHS[min(level - 1, len(_HEADER_GLYPHS) - 1)]
+            inner = _HEADER_BOLD_STRIP_RE.sub("", heading_text)
+        return "{} <b>{}</b>".format(glyph, inner)
+
+    return _MD_HEADER_RE.sub(_promote, text)
+
+
+def _strip_md_thematic_breaks(text: str) -> str:
+    """DGN-822: drop markdown thematic-break lines (--- / *** / ___).
+
+    Telegram has no horizontal-rule construct, so a leaked break renders as a
+    literal dash/asterisk/underscore run. Only lines made ENTIRELY of the
+    break characters (3+ repeats, optional surrounding whitespace) are
+    dropped. Table separator rows (|---|) never match (they contain '|'), and
+    code segments are unaffected because this runs on PROSE segments only
+    (via _prepass_structural, which the bridge applies after code-fence
+    splitting).
+    """
+    lines = text.split("\n")
+    return "\n".join(ln for ln in lines if not _MD_THEMATIC_BREAK_RE.match(ln))
 
 
 def _wrap_md_tables(text: str) -> str:
@@ -739,6 +991,8 @@ def _prepass_structural(text: str, stash) -> str:
     """
     # DGN-775: strip header marks first (pure text transform, no stash needed).
     text = _strip_md_headers(text)
+    # DGN-822: drop thematic-break lines (pure text transform, no stash needed).
+    text = _strip_md_thematic_breaks(text)
     # DGN-775: wrap table blocks with sentinel markers before line iteration.
     text = _wrap_md_tables(text)
     lines = text.split("\n")
@@ -793,6 +1047,177 @@ def _prepass_structural(text: str, stash) -> str:
     return "\n".join(out)
 
 
+# --- DGN-1252: dash egress normalization --------------------------------
+#
+# Em dash (U+2014) and ASCII " -- " read as a design-register mismatch in the
+# agent's outbound voice (DGN-376 measured 15,529 em-dash occurrences /
+# 62-64% of messages). The owner-locked contract (spec section 4):
+#   `A — B`  -> `A: B`   (a single, non-repeated U+2014)
+#   `A -- B` -> `A: B`   (ASCII, exactly two hyphens, whitespace BOTH sides)
+# REPEATS ARE UNTOUCHABLE (`---`, `----`, `——`, any run) and `--flag` forms
+# (no leading whitespace, e.g. `promote.sh --check`) never match -- both are
+# structural properties of the regexes below, not a denylist.
+#
+# Toggle: DASH_NORMALIZE=on|off, instance `.telegram_bot/.env` (config.py),
+# default on. This module must stay importable OUTSIDE the bridge venv (see
+# the _i18n() note above), so the flag is read via the same guarded-import
+# fail-open pattern -- a missing bridge.config degrades to "on" (zero-delta
+# from the flag not existing yet).
+def _dash_normalize_enabled() -> bool:
+    try:
+        from bridge.config import DASH_NORMALIZE
+    except Exception:
+        return True
+    return bool(DASH_NORMALIZE)
+
+
+# Protected spans that must never have their interior scanned for a dash:
+# inline code (backtick span) and a markdown link's full `[text](url)` form
+# (the same shapes _INLINE_CODE_RE / _MD_LINK_RE recognize elsewhere in this
+# module -- reused verbatim, not re-derived). A bare URL with no markdown
+# link syntax needs no separate guard: it never contains a literal space, so
+# it can never satisfy the ASCII rule's mandatory whitespace-both-sides
+# condition, and an em dash inside one is not a measured shape (conservative
+# reading: nothing to protect that the whitespace/repeat rules do not already
+# cover).
+#
+# The three alternatives are tried in this order at every scan position, so
+# a protected span always wins over a dash match that starts at the same
+# position (e.g. an em dash INSIDE a `` `code -- x` `` span is never reached
+# as a separate match -- the whole backtick span is consumed first).
+_DASH_PROTECTED_RE_SRC = r"`[^`\n]+`" + r"|" + r"\[[^\[\]\n]+\]\((?:https?|tg)://[^\s()]+\)"
+# ASCII rule: exactly two hyphens, >=1 whitespace (space/tab) on both sides,
+# with no hyphen touching either whitespace run -- this single structural
+# shape is what excludes both repeats (`---`, `----`: no whitespace sits
+# between any two of the run's hyphens) and `--flag` forms (no whitespace
+# before the hyphens) without any separate denylist.
+_DASH_HYPHEN_RE_SRC = r"(?<!-)[ \t]+--[ \t]+(?!-)"
+# Em dash rule: a single U+2014 not immediately preceded or followed by
+# another U+2014 (the repeat exclusion). Leading whitespace is consumed and
+# dropped; trailing whitespace is captured so the replacement can normalize
+# it to exactly one space when present, and to none when the source had none
+# (spec's "A — B" -> "A: B" example always had padding on both sides; this
+# is the conservative reading for the unpadded case -- convert the mark, but
+# never SYNTHESIZE a space that was not in the source).
+_DASH_EMDASH_RE_SRC = r"(?<!—)[ \t]*—(?!—)(?P<em_trail>[ \t]*)"
+
+_DASH_SCAN_RE = re.compile(
+    r"(?P<protected>" + _DASH_PROTECTED_RE_SRC + r")"
+    r"|(?P<hyphens>" + _DASH_HYPHEN_RE_SRC + r")"
+    r"|(?P<emdash>" + _DASH_EMDASH_RE_SRC + r")"
+)
+
+
+# --- DGN-1252 section 7: three LINE-scoped skip rules (실측, 1차 구현
+# 리뷰). Owner judgment governing every ambiguous call here: "가끔 나오는건
+# 감수가능해. 너무 남발돼서 문제인거지" -- suppressing overuse, not total
+# replacement. A dash left unconverted is acceptable; a broken command or a
+# mangled table is not. When in doubt, these rules skip.
+#
+# R1: a command-signal line skips ASCII " -- " conversion ONLY (em dash is
+#     not command syntax, so R1 never touches it). Predicate enumeration is
+#     the ticket's measurement-verified text, reproduced verbatim -- do not extend
+#     or trim it without a fresh measurement.
+_R1_COMMAND_WORDS_SRC = (
+    r"git|npm|yarn|bash|sh|zsh|python3?|pip3?|curl|wget|docker|kubectl|"
+    r"make|grep|sed|awk|find|chmod|chown|launchctl|systemctl|ssh|scp|rsync|"
+    r"tar|jq"
+)
+_R1_COMMAND_SIGNAL_RE = re.compile(
+    r"\b(?:" + _R1_COMMAND_WORDS_SRC + r")\b"
+    r"|(?:^|(?<=\s))\./\S+"  # ./ 로 시작하는 토큰
+    r"|(?:^|(?<=\s))\S*\.(?:sh|py|pl|rb)\b"  # .sh|.py|.pl|.rb 확장자 토큰
+    r"|(?:^|(?<=\s))-{1,2}[A-Za-z][\w-]*"  # -x / --xxx 플래그 토큰
+)
+
+# R2: 2+ ASCII dash tokens (an exact, non-repeated run of two hyphens) on one
+#     line skips the WHOLE line -- owner's "repeats are never converted"
+#     extended from character-run to line level (aligned table cells are
+#     exactly that shape: `col   --   --   0`).
+_R2_ASCII_DASH_TOKEN_RE = re.compile(r"(?<!-)--(?!-)")
+
+# R3: the line's first non-whitespace character is a dash (ASCII or em)
+#     skips the WHOLE line -- that is a bullet glyph, not punctuation.
+_R3_LEADING_DASH_RE = re.compile(r"^[ \t]*[-—]")
+
+
+def _line_skip_flags(line: str):
+    """DGN-1252 section 7: (skip_whole_line, skip_ascii_only) for one line.
+
+    R3 and R2 both skip the whole line (all dash forms); R1 skips ASCII only,
+    leaving a same-line em dash free to still convert.
+    """
+    if _R3_LEADING_DASH_RE.match(line) is not None:
+        return True, True
+    if len(_R2_ASCII_DASH_TOKEN_RE.findall(line)) >= 2:
+        return True, True
+    return False, _R1_COMMAND_SIGNAL_RE.search(line) is not None
+
+
+def _dash_scan_repl(m: "re.Match", skip_ascii_only: bool = False) -> str:
+    if m.group("protected") is not None:
+        return m.group(0)
+    if m.group("hyphens") is not None:
+        return m.group(0) if skip_ascii_only else ": "
+    return ": " if m.group("em_trail") else ":"
+
+
+def _normalize_dashes_in_prose(prose: str) -> str:
+    if "—" not in prose and "--" not in prose:
+        # Fast path: neither trigger character/substring present at all ->
+        # byte-identical passthrough, no regex walk needed. Must NOT narrow
+        # this to the space-padded " -- " form: the ASCII rule's whitespace
+        # requirement accepts tabs too, and a substring check tighter than
+        # what the regex actually matches would silently disable that case.
+        return prose
+    # R1/R2/R3 are LINE-scoped (spec section 7): split on "\n" and decide
+    # each line independently so a skip on one line can never leak into its
+    # neighbour. This split is lossless (str.split/"\n".join round-trips
+    # exactly, including a trailing newline) and safe for the protected-span
+    # regexes above, which already exclude \n from their own matches.
+    lines = prose.split("\n")
+    out_lines: List[str] = []
+    for line in lines:
+        if "—" not in line and "--" not in line:
+            out_lines.append(line)
+            continue
+        skip_whole, skip_ascii_only = _line_skip_flags(line)
+        if skip_whole:
+            out_lines.append(line)
+            continue
+        out_lines.append(
+            _DASH_SCAN_RE.sub(
+                lambda m: _dash_scan_repl(m, skip_ascii_only), line
+            )
+        )
+    return "\n".join(out_lines)
+
+
+def normalize_dashes(text: str) -> str:
+    """DGN-1252: em dash / ` -- ` -> `:` on outbound prose, off via env.
+
+    Reuses the module's ONE fence walk (_split_fenced_blocks, the same one
+    strip_toolcall_markup uses) so a complete ``` fenced block is never
+    touched regardless of what the caller already split out -- this makes
+    the pass safe to call on either a pre-split prose segment or on raw
+    egress text that still carries its own fences. An unterminated fence is
+    "not a real code block" (module-wide rule) and is scanned as prose, so a
+    stray ``` can never be used to shield a dash from conversion.
+
+    `DASH_NORMALIZE=off` -> exact passthrough, no-op, no log line (spec:
+    "off = 원문 그대로, 로그 소음 없음").
+    """
+    if not text or not _dash_normalize_enabled():
+        return text
+    if "—" not in text and "--" not in text:
+        # Fast path: neither raw trigger character/substring present.
+        return text
+    out_parts: List[str] = []
+    for chunk, is_fenced in _split_fenced_blocks(text):
+        out_parts.append(chunk if is_fenced else _normalize_dashes_in_prose(chunk))
+    return "".join(out_parts)
+
+
 def markdown_to_telegram_html(text: str) -> str:
     """Convert a PROSE segment to Telegram-safe HTML (see contract above).
 
@@ -838,17 +1263,170 @@ def markdown_to_telegram_html(text: str) -> str:
         ),
         text,
     )
+    # DGN-1252: dash egress normalization (em dash / ` -- ` -> `:`). Runs after
+    #    inline code (1) and links (4) are stashed to opaque placeholders, so
+    #    it only ever sees the visible prose text -- never code-span or link
+    #    content -- without needing its own stash bookkeeping here. Ordered
+    #    before emphasis (5) / DGN-1169 demotion (below): the two passes touch
+    #    disjoint character classes (- / — vs *), so ordering has no functional
+    #    interaction; this keeps every "outgoing prose normalization" step
+    #    grouped together ahead of the HTML-emphasis conversion.
+    text = normalize_dashes(text)
     # 5. Emphasis: bold before italic so ** is never read as two *.
     text = _MD_BOLD_STAR_RE.sub(r"<b>\1</b>", text)
     text = _MD_BOLD_UNDER_RE.sub(r"<b>\1</b>", text)
     text = _MD_STRIKE_RE.sub(r"<s>\1</s>", text)
     text = _MD_ITALIC_STAR_RE.sub(r"<i>\1</i>", text)
     text = _MD_ITALIC_UNDER_RE.sub(r"<i>\1</i>", text)
+    # DGN-1169: whatever `*...*` survived the word-only italic pass is
+    # multi-word -- demote it to bold instead of leaking literal asterisks.
+    text = _demote_multiword_star(text, wrap=True)
     # 6. Restore stashed spans in reverse: later entries (links) may contain
     #    placeholders of earlier ones (a code span inside link text).
     for i in range(len(stash) - 1, -1, -1):
         text = text.replace("\x00{}\x00".format(i), stash[i])
     return text
+
+
+# --- DGN-969: de-marked streaming display -------------------------------------
+#
+# The live streaming draft bubble is sent as PLAIN text (no parse_mode), so raw
+# markdown syntax (**bold**, __bold__, ~~strike~~, `code`) was fully visible
+# for the whole turn until a single final edit converted it to HTML. This
+# section renders a DISPLAY-ONLY de-marked form for that live bubble:
+#   - a COMPLETE markdown span (both markers present) is stripped to its bare
+#     content using the EXACT SAME regexes as markdown_to_telegram_html, so
+#     any case with a real closing pair behaves identically to the eventual
+#     final render (content kept, marker characters removed).
+#   - a marker still open when a stream chunk lands (a span cut mid-way, e.g.
+#     "text **bo") is ALSO stripped (marker characters only, content kept) so
+#     a raw ** is never shown while pending -- this is the streaming-specific
+#     addition the final renderer does not need, since it only ever sees
+#     complete text.
+# Deliberately NOT covered by the dangling-open strip: single-character
+# emphasis (*word*/_word_) and links ([text](url)). A lone unmatched '*' or
+# '_' is indistinguishable from literal content (glob `*.md`, math `x*y`,
+# `snake_case`) without a closing pair to confirm intent -- stripping it would
+# risk corrupting exactly that literal content during the live window. The
+# double-character markers (**, __, ~~) and a lone open backtick are far less
+# ambiguous (rare as literal prose) and are the ones named in the DGN-969
+# success criteria, so those get the extra dangling-open treatment.
+#
+# INVARIANT: this is a display transform ONLY. Callers must keep feeding the
+# ORIGINAL (untouched) accumulated text into chunking/overflow/finalize logic
+# and into the eventual bot.py _edit_streamed_prose_html conversion -- only the
+# string actually handed to Telegram for one particular send goes through
+# demark_markdown_for_stream. The finalized message is therefore byte-
+# identical to what it was before this transform existed.
+#
+# Fenced code blocks (```...```) are left completely untouched, fences
+# included -- markdown-looking characters inside code are literal content,
+# never syntax. An in-progress (unclosed) fence at the tail is also left fully
+# raw, matching the pre-existing plain display of in-flight streamed code.
+
+_MD_BOLD_STAR_OPEN_RE = re.compile(r"(?<![A-Za-z0-9*])\*\*(?![\s*])")
+_MD_BOLD_UNDER_OPEN_RE = re.compile(r"(?<![A-Za-z0-9_])__(?![\s_])")
+_MD_STRIKE_OPEN_RE = re.compile(r"~~(?=\S)")
+# DGN-969 grill finding: the bridge's own overflow-split (character-count cut,
+# formatting-agnostic) and the streaming handler's block-join newline can both
+# land a marker's CLOSING half at the start of a bubble/line with no opener in
+# that same text (the opener was sealed into a PREVIOUS, already-finalized
+# bubble). The _OPEN patterns above only catch a dangling OPENER; this mirrors
+# the CLOSING-side guard from the full paired regexes (unchanged) so an
+# orphaned closer is caught too. Both sides individually reduce to the exact
+# same alnum-adjacency guard the full regex already uses for x**2 / snake_case
+# safety, so nothing newly ambiguous is stripped -- only the shape the
+# complete-pair regex would have accepted as a valid opener/closer, just
+# missing its other half.
+_MD_BOLD_STAR_CLOSE_RE = re.compile(r"(?<![\s*])\*\*(?![A-Za-z0-9*])")
+_MD_BOLD_UNDER_CLOSE_RE = re.compile(r"(?<![\s_])__(?![A-Za-z0-9_])")
+_MD_STRIKE_CLOSE_RE = re.compile(r"(?<=\S)~~")
+
+
+def _demark_prose(text: str) -> str:
+    """De-mark ONE prose chunk (guaranteed no ``` fences inside) for display."""
+    if not text:
+        return text
+    text = text.replace("\x00", "")
+    stash: List[str] = []
+
+    def _stash(bare: str) -> str:
+        stash.append(bare)
+        return "\x00{}\x00".format(len(stash) - 1)
+
+    # 1. Inline code first: content is never touched by the passes below (same
+    #    ordering as markdown_to_telegram_html), but the backticks are dropped
+    #    (bare content only) -- streaming has no <code> styling to offer.
+    text = _INLINE_CODE_RE.sub(lambda m: _stash(m.group(1)), text)
+    # 2. Links: bare visible text, URL dropped from the display copy.
+    text = _MD_LINK_RE.sub(lambda m: m.group(1), text)
+    # 3. Complete-pair emphasis -> bare content (marker chars removed).
+    text = _MD_BOLD_STAR_RE.sub(r"\1", text)
+    text = _MD_BOLD_UNDER_RE.sub(r"\1", text)
+    text = _MD_STRIKE_RE.sub(r"\1", text)
+    text = _MD_ITALIC_STAR_RE.sub(r"\1", text)
+    text = _MD_ITALIC_UNDER_RE.sub(r"\1", text)
+    # DGN-1169: same demotion rule as the final render -- the live bubble has
+    # no styling to offer, so a multi-word span keeps its content and drops
+    # only the marker characters (it will come back as <b> at finalize).
+    text = _demote_multiword_star(text, wrap=False)
+    # 4. Dangling opens/closes (chunk or overflow-split cut mid-span): strip
+    #    just the marker characters for the low-ambiguity double-markers --
+    #    content is never touched. Both sides are needed: an opener can be cut
+    #    open (its close never arrived yet) OR a closer can arrive orphaned
+    #    (its open was sealed into a previous, already-finalized bubble).
+    text = _MD_BOLD_STAR_OPEN_RE.sub("", text)
+    text = _MD_BOLD_STAR_CLOSE_RE.sub("", text)
+    text = _MD_BOLD_UNDER_OPEN_RE.sub("", text)
+    text = _MD_BOLD_UNDER_CLOSE_RE.sub("", text)
+    text = _MD_STRIKE_OPEN_RE.sub("", text)
+    text = _MD_STRIKE_CLOSE_RE.sub("", text)
+    # A single unmatched opening backtick (odd count survives the inline-code
+    # extraction above) -- drop it so a dangling `code isn't shown raw.
+    if text.count("`") % 2 == 1:
+        text = text.replace("`", "", 1)
+    # 5. Restore stashed inline-code content, reverse order (same rule as
+    #    markdown_to_telegram_html: later stashes may nest inside earlier text).
+    for i in range(len(stash) - 1, -1, -1):
+        text = text.replace("\x00{}\x00".format(i), stash[i])
+    return text
+
+
+def demark_markdown_for_stream(text: str) -> str:
+    """De-mark markdown syntax for LIVE streaming display only (DGN-969).
+
+    Display-only transform: strips markdown syntax characters from a
+    streaming draft so raw '**', '__', backtick etc. are never visible while
+    the turn is still in progress. See the module-level DGN-969 comment above
+    for the full contract (fence handling, dangling-open scope, the byte-
+    identical-finalize invariant). Callers must NOT feed the return value back
+    into their own accumulated-text bookkeeping -- only into the Telegram
+    send/edit call for this one draft update.
+    """
+    if not text:
+        return text
+    if "```" not in text:
+        return _demark_prose(text)
+    fence = "```"
+    parts: List[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        start = text.find(fence, pos)
+        if start == -1:
+            parts.append(_demark_prose(text[pos:]))
+            break
+        if start > pos:
+            parts.append(_demark_prose(text[pos:start]))
+        end = text.find(fence, start + len(fence))
+        if end == -1:
+            # Unclosed trailing fence: in-progress code, leave fully raw.
+            parts.append(text[start:])
+            break
+        end_incl = end + len(fence)
+        parts.append(text[start:end_incl])
+        pos = end_incl
+    return "".join(parts)
 
 
 # --- DGN-891: tag-safe HTML balancing for split/truncated sends --------------
@@ -976,6 +1554,40 @@ def html_to_plain_text(html_text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
+def sanitize_message_for_telegram(text: str, rail: str = RAIL_UNKNOWN) -> str:
+    """DGN-822: sanitize a WHOLE message to Telegram-safe HTML (single entry).
+
+    Out-of-band senders (routines/push.sh cron / proactive pushes) bypass the
+    bridge send path and would otherwise leak raw markdown to Telegram. This
+    wraps the exact conversation-rail pipeline behind one call: the message is
+    split on ``` fences the same way bot.py _send_text_body does
+    (split_into_segments); code segments render via code_segment_html and
+    prose segments via markdown_to_telegram_html; the rendered segments are
+    joined back with blank lines into ONE Telegram-safe HTML string. No new
+    sanitize logic lives here -- formatting.py stays the single owner.
+
+    DGN-1209: the machine-line gate runs FIRST, on the raw pre-render text
+    (a rendered `**RAMP_DECISION**` -> `<b>` would break the line anchor).
+    `rail` is the caller's DECLARATION (machine_gate.RAIL_*): consumer rails
+    (push.sh --text, dashboard pin) alert on unregistered machine shapes,
+    the model rail (btw) only logs, an undeclared caller alerts AS undeclared.
+    """
+    if not text:
+        return text
+    text = apply_machine_line_gate(text, rail)
+    if not text:
+        return text
+    rendered: List[str] = []
+    for segment, is_code, lang in split_into_segments(text):
+        if is_code:
+            rendered.append(code_segment_html(segment, lang))
+        else:
+            prose = markdown_to_telegram_html(segment).strip("\n")
+            if prose.strip():
+                rendered.append(prose)
+    return "\n\n".join(rendered)
+
+
 # --- DGN-682: interim narration -> expandable-blockquote fold ----------------
 #
 # Fold-mode (INTERIM_MODE=fold) turns synthesize the interim narration
@@ -1001,7 +1613,7 @@ def html_to_plain_text(html_text: str) -> str:
 #     chunk's quote lines and break the collapsed rendering (grill B2).
 
 INTERIM_FOLD_CAP = 1500
-_FOLD_OMISSION_LINE = "⋯ 중략 ⋯"
+_FOLD_OMISSION_LINE = _i18n("fold_omission_line", "⋯ 중략 ⋯")
 _FOLD_RAW_LIMIT = 4000  # split_text default limit (single-chunk bound)
 _FOLD_HTML_LIMIT = 4096  # Telegram hard cap, UTF-16 code units
 _FOLD_MIN_CAP = 80
@@ -1073,13 +1685,23 @@ def _fold_quote_lines(text: str) -> str:
 #     overflow rollover is deliberately NOT used.
 # The helpers below are pure (no Telegram I/O): they return ready-to-send
 # HTML built via markdown_to_telegram_html (escaping + DGN-619 blockquote
-# rendering reused). Captions are the LOCKED copy from the spec (owner A-case,
-# 2026-08-02 14:27) -- do not edit without an owner gate.
+# rendering reused). The ko catalog values are the LOCKED copy from the spec
+# (owner A-case, 2026-08-02 14:27) -- do not edit without an owner gate.
+# DGN-851: caption TEXT lives in bridge/i18n (ko/en); the in-code fallbacks
+# below are the locked ko copy (zero-delta when i18n is unavailable).
 
-FOLD_CAPTION_NORMAL = "진행 기록"
-FOLD_CAPTION_STOPPED = "중단됨 · 진행 기록"
-FOLD_CAPTION_TIMEOUT = "시간 초과 · 진행 기록"
-FOLD_TRUNCATION_LINE = "…(생략)"
+FOLD_CAPTION_NORMAL = _i18n("fold_caption_normal", "진행 기록")
+FOLD_CAPTION_STOPPED = _i18n("fold_caption_stopped", "중단됨 · 진행 기록")
+FOLD_CAPTION_TIMEOUT = _i18n("fold_caption_timeout", "시간 초과 · 진행 기록")
+FOLD_TRUNCATION_LINE = _i18n("fold_truncation_line", "…(생략)")
+
+# UNCONFIRMED (owner gate pending, interrupt-fold ticket): caption for
+# collapsing an auto-interrupted PLAIN answer draft (StreamingMessageHandler,
+# not the dev-agent growing fold -- see FOLD_CAPTION_STOPPED for that one).
+# Candidates are listed as comments in i18n/ko.py + i18n/en.py; this fallback
+# is deliberately the most conservative reading (bare "stopped", no extra
+# claim) until the owner locks one. Do not treat this value as final copy.
+INTERRUPT_FOLD_CAPTION = _i18n("interrupt_fold_caption", "중단됨")
 
 
 def _fold_v2_body(fold_texts: List[str]) -> str:

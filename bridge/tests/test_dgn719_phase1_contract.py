@@ -196,7 +196,7 @@ def test_options_and_send_file_recognized_too():
 _PARITY_PINS = [
     ("a **bold** b", "a <b>bold</b> b"),
     ("a *ital* b", "a <i>ital</i> b"),
-    ("a *two words* b", "a *two words* b"),
+    ("a *two words* b", "a <b>two words</b> b"),  # DGN-1169 bold demotion
     ("a ~~gone~~ b", "a <s>gone</s> b"),
     ("run `x<y&z`", "run <code>x&lt;y&amp;z</code>"),
     (

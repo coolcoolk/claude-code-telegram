@@ -1,8 +1,8 @@
-"""getUpdates liveness heartbeat (two-layer watchdog, layer 1).
+"""getUpdates liveness heartbeat (DGN-140, layer 1 of the two-layer watchdog).
 
 Zombie polling = process alive, zero updates received (seen after laptop
 sleep/wake). Layer 1: bot.py checks stalled() in-process and restarts polling.
-Layer 2: the external bridge/watchdog.sh reads the heartbeat file's mtime and
+Layer 2: the external bridge/watchdog.sh reads the heartbeat FILE's mtime and
 kickstarts the whole service when even layer 1 is dead.
 
 Touch placement is exception-selective ON PURPOSE (grill FATAL-1): the beat
@@ -13,10 +13,10 @@ exceptions: a swallowed-RuntimeError hot-spin zombie would then keep
 "beating" and hide the exact failure this heartbeat exists to expose.
 
 In-process staleness uses time.monotonic(). On macOS that is
-mach_absolute_time, which PAUSES during system sleep, so waking from a long
-sleep does not instantly read as a stall; only real dead time while running
-counts. The file carries wall-clock epoch for the external watchdog, which
-has its own two-strike sleep/wake absorption.
+mach_absolute_time, which PAUSES during system sleep (verified 2026-07-05),
+so waking from a long sleep does not instantly read as a stall; only real
+dead time while running counts. The file carries wall-clock epoch for the
+external watchdog, which has its own two-strike sleep/wake absorption.
 """
 
 import os

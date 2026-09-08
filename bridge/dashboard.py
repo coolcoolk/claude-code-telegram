@@ -65,7 +65,7 @@ import telegram.error
 from telegram import Bot
 
 from bridge import ownership
-from bridge.config import config
+from bridge.config import config, notify_silent
 # MIN_EDIT_INTERVAL and _is_not_modified moved to bridge.edit_guard (DGN-594,
 # shared with the countdown helper); re-imported here as the compat surface.
 from bridge.edit_guard import (  # noqa: F401 - re-exported names
@@ -73,6 +73,13 @@ from bridge.edit_guard import (  # noqa: F401 - re-exported names
     EditRateGuard,
     _is_not_modified,
 )
+# DGN-974: the pin surface reuses the SAME converter as the chat path
+# (bridge.formatting.sanitize_message_for_telegram -- code fences -> <pre>/
+# <code>, prose -> markdown_to_telegram_html) instead of growing a second
+# one. balance_telegram_html guards against a straddling/unbalanced tag
+# reaching Telegram, same as every other parse_mode="HTML" send site.
+from bridge.formatting import balance_telegram_html, sanitize_message_for_telegram
+from bridge.machine_gate import RAIL_CONSUMER
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +108,21 @@ def _tail_cut(text: str) -> str:
     """Dumb tail-cut safeguard for oversized content.
 
     Content reaching the bridge should already fit (the generator guarantees
-    length); this only prevents a hard Telegram rejection. Cutting on a raw
-    UTF-16 boundary may split a surrogate pair -- decode ignores the orphan.
+    length); this only prevents a hard Telegram rejection. DGN-950 seam 1:
+    the old raw UTF-16 byte slice could land inside a surrogate pair and
+    corrupt the display name sitting on the cut boundary. The cut now walks
+    codepoints against the UTF-16 unit budget and slices the str at a
+    codepoint boundary, so a multibyte char (hangul, emoji) is either kept
+    whole or dropped whole -- never split.
     """
     if _utf16_len(text) <= MAX_UTF16_UNITS:
         return text
-    encoded = text.encode("utf-16-le")[: MAX_UTF16_UNITS * 2]
-    return encoded.decode("utf-16-le", errors="ignore")
+    units = 0
+    for i, ch in enumerate(text):
+        units += 2 if ord(ch) > 0xFFFF else 1
+        if units > MAX_UTF16_UNITS:
+            return text[:i]
+    return text
 
 
 def _needs_recreate(error: Exception) -> bool:
@@ -140,6 +155,21 @@ def _is_message_gone(error: Exception) -> bool:
     """
     text = str(error).lower()
     return "message to delete not found" in text or "message not found" in text
+
+
+def _is_parse_error(error: Exception) -> bool:
+    """True when a BadRequest is Telegram's HTML entity-parse rejection.
+
+    DGN-974: Telegram's parse_mode="HTML" failures are consistently prefixed
+    "Can't parse entities" (case varies by client library / server version),
+    e.g. "Can't parse entities: unsupported start tag ... at byte offset N".
+    Narrowed to that phrase ON PURPOSE: an unrelated BadRequest -- "message is
+    not modified", a length limit, a permission issue -- must NOT be caught
+    by the plain-text fallback and must keep its pre-existing handling
+    (grill finding: a fallback catching too broadly would silently mask a
+    genuine, unrelated bug).
+    """
+    return "can't parse entities" in str(error).lower()
 
 
 def _is_undeletable(error: Exception) -> bool:
@@ -315,6 +345,14 @@ class DashboardSync:
             text = self._dashboard_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return
+        if "\ufffd" in text:
+            # DGN-950 seam 1: a torn read (generator caught mid-write) can
+            # cut a multibyte char at a byte boundary; errors="replace" then
+            # materializes U+FFFD inside a display name (hangul renders as
+            # a replacement char). Never render a broken frame: stay dirty
+            # and re-read on a later tick, when the write has completed.
+            logger.debug("Dashboard read caught U+FFFD (torn read); deferring")
+            return
         if not text.strip():
             # Empty board = generator hide signal: drive the debounced
             # delete state machine instead of leaving a stale pin (DGN-541).
@@ -398,13 +436,106 @@ class DashboardSync:
         self._last_synced_mtime = mtime
         self._edit_guard.note_edit(now)
 
+    # --- DGN-974: pin surface HTML render + fail-open send helpers ---
+
+    def _render_pin_html(self, text: str) -> Optional[str]:
+        """Convert pin text through the SAME converter the chat path uses.
+
+        Returns the balanced Telegram HTML, or None on ANY conversion
+        failure (fail-open): the pin body is generator/owner-authored
+        (DGN-967 section ownership -- e.g. an agent-authored code block, or a
+        ticket title with arbitrary characters) and must never be able to
+        block the pin from updating just because it doesn't convert cleanly.
+        """
+        try:
+            # DGN-1209 R4: the pin body is generator/owner-authored consumer
+            # text (no model turn) -> declared consumer rail.
+            return balance_telegram_html(
+                sanitize_message_for_telegram(text, rail=RAIL_CONSUMER)
+            )
+        except Exception as e:  # noqa: BLE001 - conversion must never break the pin
+            logger.warning(
+                "Dashboard HTML render failed (%s); falling back to plain text", e
+            )
+            return None
+
+    async def _edit_with_fallback(
+        self, chat_id: int, message_id: int, text: str
+    ) -> None:
+        """Edit with the chat-path converter's HTML; fail-open to plain text.
+
+        DGN-974: on a Telegram parse-entity rejection (or a conversion
+        failure caught in _render_pin_html), retry the IDENTICAL edit as
+        plain text (no parse_mode) -- the pin must never stop updating over
+        a formatting problem. Every other exception (RetryAfter, Forbidden,
+        any non-parse BadRequest such as "message is not modified",
+        NetworkError, generic TelegramError) propagates UNCHANGED so the
+        caller's existing except chain handles it exactly as it did before
+        parse_mode existed -- a broad catch here would silently mask an
+        unrelated, genuine failure.
+        """
+        html_text = self._render_pin_html(text)
+        if html_text is None:
+            await self._bot.edit_message_text(
+                text=text, chat_id=chat_id, message_id=message_id
+            )
+            return
+        try:
+            await self._bot.edit_message_text(
+                text=html_text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="HTML",
+            )
+        except telegram.error.BadRequest as e:
+            if not _is_parse_error(e):
+                raise
+            logger.warning(
+                "Dashboard HTML rejected by Telegram (%s); retrying plain text", e
+            )
+            await self._bot.edit_message_text(
+                text=text, chat_id=chat_id, message_id=message_id
+            )
+
+    async def _send_with_fallback(
+        self, chat_id: int, text: str, disable_notification: bool
+    ):
+        """Send with the chat-path converter's HTML; fail-open to plain text.
+
+        Same fail-open contract as _edit_with_fallback (DGN-974), for the
+        recreate send site. Returns the sent Message.
+        """
+        html_text = self._render_pin_html(text)
+        if html_text is None:
+            return await self._bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                disable_notification=disable_notification,
+            )
+        try:
+            return await self._bot.send_message(
+                chat_id=chat_id,
+                text=html_text,
+                parse_mode="HTML",
+                disable_notification=disable_notification,
+            )
+        except telegram.error.BadRequest as e:
+            if not _is_parse_error(e):
+                raise
+            logger.warning(
+                "Dashboard HTML rejected by Telegram (%s); retrying plain text", e
+            )
+            return await self._bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                disable_notification=disable_notification,
+            )
+
     async def _sync(self, chat_id: int, text: str, mtime: float) -> None:
         now = time.monotonic()
         if self._message_id is not None:
             try:
-                await self._bot.edit_message_text(
-                    text=text, chat_id=chat_id, message_id=self._message_id
-                )
+                await self._edit_with_fallback(chat_id, self._message_id, text)
                 self._mark_synced(mtime, now)
                 return
             except telegram.error.RetryAfter as e:
@@ -464,8 +595,12 @@ class DashboardSync:
             # Silent send (DGN-541): with conditional display the board
             # re-appears routinely; a notifying send each time would be an
             # alert storm.  Matches the pin's disable_notification below.
-            message = await self._bot.send_message(
-                chat_id=chat_id, text=text, disable_notification=True
+            # DGN-932: policy-routed (class "dashboard", default silent).
+            # DGN-974: HTML via the chat-path converter, fail-open to plain.
+            message = await self._send_with_fallback(
+                chat_id,
+                text,
+                disable_notification=notify_silent("dashboard"),
             )
         except telegram.error.RetryAfter as e:
             self._edit_guard.note_retry_after(
@@ -487,10 +622,14 @@ class DashboardSync:
         self._save_state()
 
         try:
+            # DGN-932: pin alert follows the same class value as the send.
+            # Default (silent) -> no notifications. A loud override on the
+            # non-default path produces two alerts (one send + one pin service
+            # notification), which is acceptable: the override is deliberate.
             await self._bot.pin_chat_message(
                 chat_id=chat_id,
                 message_id=message.message_id,
-                disable_notification=True,
+                disable_notification=notify_silent("dashboard"),
             )
         except telegram.error.TelegramError as e:
             # Message exists and is tracked; a failed pin only loses the

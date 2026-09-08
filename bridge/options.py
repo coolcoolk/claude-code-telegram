@@ -15,7 +15,20 @@ from typing import List, Optional, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-OPTIONS_MARKER = "[[OPTIONS]]"
+# DGN-822: the marker constant is defined in bridge.formatting (a telegram-free
+# module) so the shell sanitize hop can import formatting without
+# python-telegram-bot. Re-exported here for existing consumers.
+from bridge.formatting import (
+    LINK_PREVIEW_MARKER,
+    OPTIONS_MARKER,
+    SEND_FILE_MARKER,
+    is_options_marker_line,
+    parse_options_marker_labels,
+)
+
+# DGN-881: the overflow number-handle button label is localized (ko "N번" /
+# en "No.N"). t() resolves the active locale at call time (config.locale).
+from bridge.i18n import t
 
 # Numbered option line: "1. label", "2) label", CJK punctuation variants, etc.
 _OPTION_RE = re.compile(r"^\s*(\d+)[.、)）]\s*(.+)", re.MULTILINE)
@@ -59,25 +72,135 @@ One word, yes or no:"""
 
 
 def strip_options_marker(text: str) -> Tuple[str, bool]:
-    """Remove every standalone [[OPTIONS]] marker line.
+    """Remove every standalone [[OPTIONS]] marker line (bare or labeled).
 
     Returns (clean_text, had_marker). A marker line is one whose stripped form
-    equals the marker exactly, regardless of position. Surrounding text is kept
-    intact; trailing whitespace is stripped.
+    is the bare marker exactly OR a labeled marker "[[OPTIONS: a | b]]"
+    (DGN-992), regardless of position. Surrounding text is kept intact;
+    trailing whitespace is stripped.
     """
     if not text:
         return text, False
     lines = text.split("\n")
-    kept = [ln for ln in lines if ln.strip() != OPTIONS_MARKER]
+    kept = [ln for ln in lines if not is_options_marker_line(ln)]
     if len(kept) == len(lines):
         return text, False
     return "\n".join(kept).rstrip(), True
+
+
+def has_options_marker(text: str) -> bool:
+    """True when any standalone marker line (bare or labeled) is present.
+
+    Used by the classifier gate (sdk_bridge._maybe_mark_options) so a labeled
+    marker suppresses auto-injection the same way the bare marker's substring
+    check always has (DGN-992: "[[OPTIONS]]" is not a substring of
+    "[[OPTIONS: a | b]]", so the substring check alone misses it).
+    """
+    return any(is_options_marker_line(ln) for ln in (text or "").split("\n"))
+
+
+def _is_foreign_marker_line(stripped: str) -> bool:
+    """True for non-OPTIONS control-marker lines (send_file:: etc.).
+
+    Used as a stop condition when collecting bare-marker trailing labels --
+    another marker line can never be a button label.
+    """
+    return (
+        stripped.startswith(SEND_FILE_MARKER)
+        or stripped.startswith(LINK_PREVIEW_MARKER)
+    )
+
+
+def extract_marker_labels(text: str) -> List[str]:
+    """Extract button labels declared next to an [[OPTIONS]] marker (DGN-992).
+
+    Priority (first source that yields labels wins; later sources unseen):
+      1. LABELED marker line "[[OPTIONS: a | b]]" -- labels inside the marker.
+      2. BARE marker trailing block -- the contiguous non-blank lines DIRECTLY
+         after a standalone "[[OPTIONS]]" line, one line = one label, stopping
+         at the first blank line, another marker line, or a code fence. This
+         is the natural authoring shape observed in the real incident (labels
+         written under the marker, no numbered run anywhere) -- the machine
+         accepts it instead of requiring authors to memorize a format.
+    Callers fall back to the body numbered-run path (extract_options /
+    strip_consumed_options) only when this returns [].
+
+    Fence guard (DGN-085 class): marker lines inside ``` never arm, and label
+    collection never crosses into a fence. When several markers exist the
+    LAST one wins (mirrors the last-run semantics of extract_options). A
+    sentence-looking trailing line is still accepted as a label -- an
+    over-wide label rides the existing DGN-881 number-handle degradation on
+    the button (choices must not evaporate over authoring shape; no new
+    judgment heuristics invented).
+    """
+    src = text or ""
+    spans = [m.span() for m in _FENCED_CODE_RE.finditer(src)]
+    lines = src.split("\n")
+    fenced: List[bool] = []
+    labeled: List[str] = []
+    bare_idx: Optional[int] = None
+    offset = 0
+    for i, ln in enumerate(lines):
+        start, end = offset, offset + len(ln)
+        offset = end + 1
+        in_fence = any(s <= start and end <= e for s, e in spans)
+        fenced.append(in_fence)
+        if in_fence:
+            continue
+        parsed = parse_options_marker_labels(ln)
+        if parsed:
+            labeled = parsed
+        elif ln.strip() == OPTIONS_MARKER:
+            bare_idx = i
+    if labeled:
+        return labeled
+    if bare_idx is None:
+        return []
+    trailing: List[str] = []
+    for j in range(bare_idx + 1, len(lines)):
+        if fenced[j]:
+            break
+        stripped = lines[j].strip()
+        if not stripped:
+            break
+        if is_options_marker_line(lines[j]) or _is_foreign_marker_line(stripped):
+            break
+        # A numbered trailing line ("1. label") sheds its number prefix via
+        # the EXISTING option-line regex (no new heuristic) --
+        # build_option_keyboard prepends "{i}. " itself, so keeping the
+        # prefix would render a double-numbered button ("1. 1. label").
+        m = _OPTION_RE.match(lines[j])
+        trailing.append(m.group(2).strip() if m else stripped)
+    return trailing
 
 
 def has_numbered_list(text: str) -> bool:
     """True when the text (outside code blocks) has >=2 numbered lines (classifier gate)."""
     prose = _FENCED_CODE_RE.sub("", text)
     return len(_NUMBERED_RE.findall(prose)) >= 2
+
+
+def has_single_trailing_option(text: str) -> bool:
+    """True for the single-option decision-menu shape (DGN-1128).
+
+    The >=2 threshold above (kept conservative since DGN-325 "to avoid false
+    positives on incidental single-item lists") means a reply offering exactly
+    ONE choice never reaches the classifier, so no buttons attach unless the
+    author hand-writes the marker -- and a forgotten marker leaves the user
+    with nothing to tap. This predicate widens ONLY the classifier gate
+    (sdk_bridge._maybe_mark_options), not the has_options OR-arms, and only
+    for the shape a real one-item menu takes: outside code blocks there is
+    EXACTLY one numbered line, it is a "1." item, and it is the LAST
+    non-blank line of the prose (a menu awaits the pick at the end; an
+    incidental "1." inside running prose is followed by more text). The
+    Haiku classifier remains the actual judge -- this is a cheap structural
+    pre-filter, not a new judgment heuristic.
+    """
+    prose = _FENCED_CODE_RE.sub("", text or "")
+    if len(_NUMBERED_RE.findall(prose)) != 1:
+        return False
+    lines = [ln for ln in prose.split("\n") if ln.strip()]
+    return bool(lines) and re.match(r"\s*1\.\s+\S", lines[-1]) is not None
 
 
 def _option_line_entries(text: str) -> List[Tuple[int, str, int]]:
@@ -143,41 +266,75 @@ def extract_options(text: str) -> List[str]:
     return [label.strip() for _, label, _ in _last_option_run(_option_line_entries(text))]
 
 
-def _label_has_description(label: str) -> bool:
-    """Return True when a raw option label contains a description clause.
+def _overflows_to_handle(label: str) -> bool:
+    """Return True when this option label would degrade to a number handle on the button.
 
-    A description clause is text after the first separator (em-dash, double-
-    hyphen, or space-hyphen-space) that follows an actual action phrase. This
-    is the SAME sep-strip predicate used by _shorten_button_label so the
-    strip_consumed_options keep-in-body decision and the button sep-strip never
-    diverge (DGN-790 blocker5 / 704c regression prevention).
+    The caller passes the reconstructed button form "{n}. {label}" -- the same
+    text _shorten_button_label width-checks (DGN-881: no separator parsing, the
+    two predicates are the same one-line width comparison and cannot diverge).
 
-    A label whose body STARTS with a separator (DGN-704c number-only-button
-    guard) is treated as having NO description -- the separator is part of the
-    action phrase itself, not a label/description boundary.
-
-    Colon (':') is intentionally NOT a separator here (DGN-790: colon removed
-    from _LABEL_SEPARATORS; Korean labels with colons stay whole).
+    Used by strip_consumed_options to guarantee the full label stays visible in
+    the message body whenever the button degrades to a number handle (DGN-879).
     """
-    prefix_match = re.match(r"^(\d+[.)]\s*)", label)
-    body = label[len(prefix_match.group(1)):] if prefix_match else label
-    sep_match = _LABEL_SEPARATORS.search(body)
-    if not sep_match:
-        return False
-    head = body[: sep_match.start()].strip()
-    # Only a non-empty action phrase before the separator makes it a real boundary.
-    return bool(head)
+    return _label_width(label) > _BUTTON_LABEL_MAX_WIDTH
 
 
-def strip_consumed_options(text: str) -> Tuple[str, List[str]]:
+def _strip_verbatim_label_block(clean: str, labels: List[str]) -> str:
+    """Remove the LAST contiguous line block whose stripped lines equal
+    `labels` exactly (DGN-992 rev2: bare-marker trailing labels consumed by
+    the buttons must not stay in the display as a duplicate list).
+
+    Blocks inside fenced code are never touched (DGN-085 class). When no
+    exact match exists the text is returned unchanged -- removal is an
+    optimization, never a requirement, so a miss is always safe.
+    """
+    if not labels:
+        return clean
+    lines = clean.split("\n")
+    spans = [m.span() for m in _FENCED_CODE_RE.finditer(clean)]
+    fenced: List[bool] = []
+    offset = 0
+    for ln in lines:
+        start, end = offset, offset + len(ln)
+        offset = end + 1
+        fenced.append(any(s <= start and end <= e for s, e in spans))
+    n = len(labels)
+    for i in range(len(lines) - n, -1, -1):
+        if any(fenced[i + k] for k in range(n)):
+            continue
+        if all(lines[i + k].strip() == labels[k] for k in range(n)):
+            del lines[i:i + n]
+            return "\n".join(lines).rstrip()
+    return clean
+
+
+def strip_consumed_options(
+    text: str, marker_labels: Optional[List[str]] = None
+) -> Tuple[str, List[str]]:
     """Split a reply into (display_text, options) for button-only choices (DGN-665).
 
-    Locates the SAME last contiguous 1..N run that extract_options selects
-    (code blocks excluded), removes exactly those lines plus every standalone
-    [[OPTIONS]] marker line from the display text, then rstrips. When no run is
-    found, options is [] and the display keeps the full body (marker lines
-    still removed) so callers can fall back to showing the original list --
-    the user must never be left choice-less.
+    DGN-992: marker-declared labels (labeled marker "[[OPTIONS: a | b]]", or
+    the bare marker's TRAILING lines -- see extract_marker_labels priority)
+    are the primary label source -- they become the options directly,
+    independent of body formatting, so a bullet/prose body still gets
+    buttons. The numbered-run parse is demoted to a body-dedup optimization:
+    the run is stripped from the display ONLY when it exists, is
+    line-adjacent, its labels EXACTLY match the marker labels (a mismatched
+    run is unrelated content -- the DGN-984 hijack shape -- and must stay in
+    the body), and no label would degrade to a number handle (DGN-879 keep
+    rule). Bare-marker trailing labels consumed by the buttons are removed
+    from the display via _strip_verbatim_label_block under the same overflow
+    keep rule. `marker_labels` lets callers pass labels precomputed from the
+    ORIGINAL content (the marker may already be stripped from `text`); None
+    means "extract from text here".
+
+    Bare-marker path (marker carries no labels) is unchanged: locates the
+    SAME last contiguous 1..N run that extract_options selects (code blocks
+    excluded), removes exactly those lines plus every standalone [[OPTIONS]]
+    marker line from the display text, then rstrips. When no run is found,
+    options is [] and the display keeps the full body (marker lines still
+    removed) so callers can fall back to showing the original list -- the
+    user must never be left choice-less.
 
     Safety (DGN-665 rework): the numbered items only feed the strip when their
     SOURCE LINES are physically adjacent (each line index == previous + 1).
@@ -187,14 +344,52 @@ def strip_consumed_options(text: str) -> Tuple[str, List[str]]:
     line-adjacent the options still build (buttons unchanged) but the body keeps
     the list -- the old safe behavior.
 
-    DGN-720 / DGN-790: when any label in the run carries a description clause
-    (detected via _label_has_description -- the same sep-strip predicate used
-    by the button shortener), the entire run is KEPT in the display body so the
-    full descriptions are visible above the buttons. Only runs where every label
-    is a bare short phrase (no description) are dropped from the body.
+    DGN-879 / DGN-881: the body is kept when any option would degrade to a
+    number handle on the button (detected via _overflows_to_handle -- the same
+    width check the button shortener applies). A number-handle button gives no
+    context on its own; keeping the full label in the body ensures the user
+    can read the option before tapping. Runs where every button shows its
+    label in full are dropped from the body (descriptions live in the message
+    body per the thin-label contract, not in the labels -- DGN-881).
     """
     clean, _ = strip_options_marker(text or "")
+    if marker_labels is None:
+        marker_labels = extract_marker_labels(text or "")
     run = _last_option_run(_option_line_entries(clean))
+    if marker_labels:
+        # DGN-992: marker labels are the options; body content is only a
+        # duplicate to remove -- and only when it provably IS a duplicate.
+        # DGN-879 keep rule applies to both removal shapes below: when any
+        # label degrades to a number handle, the body keeps the full text.
+        overflow = any(
+            _overflows_to_handle(f"{i}. {opt}")
+            for i, opt in enumerate(marker_labels, 1)
+        )
+        stripped_any = False
+        if run:
+            run_labels = [label.strip() for _, label, _ in run]
+            line_indices = [idx for _, _, idx in run]
+            adjacent = all(
+                line_indices[i] == line_indices[i - 1] + 1
+                for i in range(1, len(line_indices))
+            )
+            if adjacent and run_labels == marker_labels and not overflow:
+                drop = set(line_indices)
+                lines = clean.split("\n")
+                clean = "\n".join(
+                    ln for i, ln in enumerate(lines) if i not in drop
+                ).rstrip()
+                stripped_any = True
+        if not stripped_any and not overflow:
+            # DGN-992 rev2: bare-marker TRAILING labels remain in the body
+            # after the marker line is stripped (they came from the lines
+            # under the marker) -- the buttons consumed them, so remove the
+            # matching block to avoid a duplicate display. Same mechanism
+            # also removes a verbatim (unnumbered) restatement of labeled-
+            # marker labels. Only an EXACT contiguous match is touched; a
+            # non-matching body always survives intact (fail-safe).
+            clean = _strip_verbatim_label_block(clean, marker_labels)
+        return clean, marker_labels
     if not run:
         return clean, []
     options = [label.strip() for _, label, _ in run]
@@ -204,11 +399,17 @@ def strip_consumed_options(text: str) -> Tuple[str, List[str]]:
     )
     if not adjacent:
         return clean, options
-    # DGN-720: keep the body lines when any option has a description clause.
-    # The button shortener strips the clause from the button text; the full
-    # label stays in the body so the user can read the explanation.
-    has_any_description = any(_label_has_description(opt) for opt in options)
-    if has_any_description:
+    # DGN-879: keep the body when any option would degrade to a number handle
+    # on the button -- the handle alone gives no context, so the full label
+    # must remain visible above the buttons.
+    # NOTE: options here are raw labels WITHOUT the "N. " prefix (stripped by
+    # _option_line_entries). build_option_keyboard reconstructs "{i}. {opt}",
+    # so we reconstruct the same form for _overflows_to_handle to match.
+    has_any_overflow_handle = any(
+        _overflows_to_handle(f"{num}. {opt}")
+        for (num, _, _), opt in zip(run, options)
+    )
+    if has_any_overflow_handle:
         return clean, options
     drop = set(line_indices)
     lines = clean.split("\n")
@@ -240,34 +441,17 @@ def resolve_choice(data: str, inline_keyboard: Optional[list]) -> str:
     return fallback
 
 
-# Separators that mark the boundary between the action phrase and the
-# description clause in an option label, in priority order.
-# "--" (ASCII double-hyphen) and the Unicode em-dash are treated equally.
-# " - " (space-hyphen-space) is a secondary separator.
-# Colon (":") is intentionally excluded: Korean labels frequently use ":" as
-# part of the action phrase itself (e.g. "실행: 빠르게"), and colon-splitting
-# caused widespread mis-truncation (DGN-790 Q4).
-# The leading "N." of the number prefix must NOT be treated as a separator,
-# so these patterns are only applied to the body after the prefix is stripped.
-_LABEL_SEPARATORS = re.compile(r"\s*(?:--|—)\s*|\s+-\s+")
-
 # Generation contract width: the expected maximum weighted display width for a
 # one-line Telegram inline button label. Derived from on-device measurements
 # (DGN-779): a label stays on one line at <= 31 weighted
 # units. Counts CJK/full-width (east_asian_width W/F) as 1.5,
 # whitespace as 0.4, and everything else (latin/digit/symbol) as 1.0.
-# NOTE: this constant is the GENERATION CONTRACT VALUE (roughly 18-20 pure-
-# Korean chars or ~28 pure-ASCII chars); it is NOT the trim trigger. Trimming
-# uses _BUTTON_LABEL_HARD_CAP (40.0). Manual "..." truncation is removed (DGN-
-# 790 part2); Telegram client handles display-side ellipsis for overflow.
+# This constant is also the overflow threshold (DGN-879/DGN-881): labels
+# exceeding this width degrade to a localized number handle (ko "N번" /
+# en "No.N"). Manual "..." truncation is removed (DGN-790 part2); raw
+# glyph-cut is also removed (DGN-879); separator parsing is removed (DGN-881:
+# labels are thin tokens by contract, descriptions live in the message body).
 _BUTTON_LABEL_MAX_WIDTH = 31.0
-
-# Hard cap: labels exceeding this weighted width are force-trimmed (raw cut,
-# no "..." appended -- Telegram client supplies the visual ellipsis). Value is
-# ~31 * 1.3 = 40.3, rounded down to 40.0. This is an arbitrary headroom margin
-# designed only as a runaway safeguard; any label under the generation contract
-# (31) naturally stays well below this cap and is never trimmed.
-_BUTTON_LABEL_HARD_CAP = 40.0
 
 
 def _label_width(text: str) -> float:
@@ -291,69 +475,33 @@ def _label_width(text: str) -> float:
     return width
 
 
+def _number_handle_label(number: int) -> str:
+    """Localized number-handle button text (ko "N번" / en "No.N", DGN-881)."""
+    return t("option_number_handle").format(n=number)
+
+
 def _shorten_button_label(label: str) -> str:
-    """Extract the action phrase from an option label for Telegram button display.
+    """Return the button text for a numbered option label (DGN-881).
 
-    Strategy (DGN-790 part2):
-    1. Parse the number prefix (e.g. "1. ", "2) ") from the label.
-    2. Strip the description clause that follows the first separator
-       (em-dash or double-hyphen, or " - ") from the action phrase.
-       Colon is NOT a separator (DGN-790: removed to prevent Korean mis-splits).
-    3. After sep-strip, if the weighted width is at or under _BUTTON_LABEL_HARD_CAP
-       (40.0), return as-is -- no trimming, no ellipsis. Telegram client handles
-       any display-side overflow with its own ellipsis.
-    4. Only labels exceeding the hard cap (40.0) are force-trimmed glyph-by-glyph
-       (raw cut, NO "..." appended). This is purely a runaway safeguard; labels
-       produced under the generation contract (_BUTTON_LABEL_MAX_WIDTH = 31.0)
-       never reach the hard cap.
+    Single-label API: kept as-is for callers that need a per-label decision
+    in isolation (unit tests). build_option_keyboard does NOT call this for
+    its bundle degrade decision (DGN-1092) -- it uses _overflows_to_handle
+    across the whole option set first so a keyboard never mixes full labels
+    with number handles.
 
-    The number prefix dot "." is NOT treated as a separator -- it is only
-    consumed as part of the "N. " / "N) " prefix pattern (DGN-704c guard).
+    Labels are thin tokens by contract (vendor contract, vendors/telegram.md
+    Options rules): descriptions and the
+    recommendation marker live in the message body, so no separator parsing
+    happens here. Within the width contract the label passes through
+    untouched. On overflow the button degrades to a localized number handle
+    (ko "N번" / en "No.N", i18n key option_number_handle) -- the full label
+    stays readable in the body (strip_consumed_options overflow-keep).
+    The number prefix always exists: build_option_keyboard prepends "{i}. ".
     """
-    # Match the number prefix: "1. ", "2) ", "3. ", etc.
-    prefix_match = re.match(r"^(\d+[.)]\s*)", label)
-    if prefix_match:
-        prefix = prefix_match.group(1)
-        body = label[len(prefix):]
-    else:
-        prefix = ""
-        body = label
-
-    # Strip description clause after the first separator in the action body.
-    # Only split when an action phrase actually precedes the separator: a label
-    # whose body STARTS with a separator (e.g. "--html opt-in ...") would
-    # otherwise collapse to an empty body, leaving a number-only button.
-    # In that case the separator is part of the label body itself -- keep it.
-    sep_match = _LABEL_SEPARATORS.search(body)
-    if sep_match:
-        head = body[: sep_match.start()].strip()
-        if head:
-            body = head
-
-    # Reassemble and check against hard cap (runaway safeguard only).
-    short = prefix + body
-    if _label_width(short) <= _BUTTON_LABEL_HARD_CAP:
-        # Within safe range: return as-is, no trim, no ellipsis.
-        # Telegram client provides display-side ellipsis if needed.
-        return short
-
-    # Force-trim labels that exceed the hard cap: raw cut, no "..." appended.
-    # This path should never be reached for labels generated under the contract
-    # (_BUTTON_LABEL_MAX_WIDTH = 31.0); it is a pure runaway safeguard.
-    used = 0.0
-    kept = []
-    for ch in short:
-        if unicodedata.east_asian_width(ch) in ("W", "F"):
-            w = 1.5
-        elif ch.isspace():
-            w = 0.4
-        else:
-            w = 1.0
-        if used + w > _BUTTON_LABEL_HARD_CAP:
-            break
-        kept.append(ch)
-        used += w
-    return "".join(kept)
+    if _label_width(label) <= _BUTTON_LABEL_MAX_WIDTH:
+        return label
+    number = int(re.match(r"^(\d+)", label).group(1))
+    return _number_handle_label(number)
 
 
 # DGN-775: regexes for stripping inline markdown from button label text.
@@ -390,24 +538,28 @@ def strip_markdown_label(text: str) -> str:
 def build_option_keyboard(options: List[str]) -> Optional[InlineKeyboardMarkup]:
     """Build inline buttons; callback 'opt:{i}. {label}' with 'opt:{i}' fallback.
 
-    The button TEXT is shortened via _shorten_button_label so it fits within
-    the safe Telegram inline button width (DGN-704). The callback_data and the
-    resolve_choice path use the index-based "opt:{i}" fallback for Korean/CJK
-    labels, so shortening the display text has no effect on choice resolution.
+    DGN-1092: the degrade decision is bundle-level, not per-button. A first
+    pass checks _overflows_to_handle across every reconstructed "{i}. {label}"
+    in the set; if ANY one would overflow, EVERY button in this keyboard
+    renders as a number handle (ko "N번" / en "No.N") -- never a mix of full
+    labels and number handles in the same keyboard. If none overflow, every
+    button shows its full label untouched. callback_data and resolve_choice
+    still use the index-based "opt:{i}" fallback for Korean/CJK labels, so the
+    degrade decision has no effect on choice resolution.
 
     DGN-775: markdown syntax is stripped from the label before width trimming
     so button text is always plain text (never leaks **bold** etc. to Telegram).
     """
     if not options:
         return None
+    labels = [f"{i}. {strip_markdown_label(opt)}" for i, opt in enumerate(options, 1)]
+    degrade_all = any(_overflows_to_handle(label) for label in labels)
     buttons = []
-    for i, opt in enumerate(options, 1):
-        clean_opt = strip_markdown_label(opt)
-        label = f"{i}. {clean_opt}"
+    for i, label in enumerate(labels, 1):
         cb_data = f"opt:{label}"
         if len(cb_data.encode("utf-8")) > 64:
             cb_data = f"opt:{i}"
-        button_text = _shorten_button_label(label)
+        button_text = _number_handle_label(i) if degrade_all else label
         buttons.append([InlineKeyboardButton(button_text, callback_data=cb_data)])
     return InlineKeyboardMarkup(buttons)
 

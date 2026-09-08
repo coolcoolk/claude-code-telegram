@@ -32,7 +32,9 @@ _MD2HTML_PINS = [
     ("a __bold__ b", "a <b>bold</b> b"),
     ("a *ital* b", "a <i>ital</i> b"),
     ("a _ital_ b", "a <i>ital</i> b"),
-    ("a *two words* b", "a *two words* b"),  # word-only italic rule
+    # DGN-1169: multi-word is DEMOTED TO BOLD (the word-only italic rule
+    # itself is unchanged -- the span never becomes <i>).
+    ("a *two words* b", "a <b>two words</b> b"),
     ("a ~~gone~~ b", "a <s>gone</s> b"),
     ("run `x<y&z`", "run <code>x&lt;y&amp;z</code>"),
     (
@@ -82,14 +84,21 @@ def test_compose_interim_fold_parity():
 
 def test_growing_fold_render_parity():
     # DGN-699: live phase = plain text; finalize = caption inside the
-    # expandable blockquote. Captions are locked copy.
+    # expandable blockquote. DGN-851: caption TEXT moved to the bridge i18n
+    # catalogs (locale-dependent), so structure is pinned via the constants
+    # and the LOCKED ko copy is pinned against the ko catalog directly.
     assert render_fold_live(["step one", "step two"]) == "step one\n\nstep two"
     assert render_fold_final(["step one"], FOLD_CAPTION_NORMAL) == (
-        "<blockquote expandable>진행 기록\nstep one</blockquote>"
+        "<blockquote expandable>" + FOLD_CAPTION_NORMAL + "\nstep one</blockquote>"
     )
     assert render_fold_final(["s1", "s2"], FOLD_CAPTION_STOPPED) == (
-        "<blockquote expandable>중단됨 · 진행 기록"
-        "\ns1\n\ns2</blockquote>"
+        "<blockquote expandable>" + FOLD_CAPTION_STOPPED
+        + "\ns1\n\ns2</blockquote>"
     )
-    assert FOLD_CAPTION_TIMEOUT == "시간 초과 · 진행 기록"
-    assert FOLD_TRUNCATION_LINE == "…(생략)"
+    # LOCKED ko copy pins (owner A-case 2026-08-02).
+    from bridge.i18n import ko
+    assert ko.STRINGS["fold_caption_normal"] == "진행 기록"
+    assert ko.STRINGS["fold_caption_stopped"] == "중단됨 · 진행 기록"
+    assert ko.STRINGS["fold_caption_timeout"] == "시간 초과 · 진행 기록"
+    assert ko.STRINGS["fold_truncation_line"] == "…(생략)"
+    assert ko.STRINGS["fold_omission_line"] == "⋯ 중략 ⋯"

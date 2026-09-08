@@ -15,10 +15,12 @@ from typing import Any, List, Optional
 from telegram import Bot, LinkPreviewOptions
 from telegram.error import BadRequest, RetryAfter, TelegramError
 
-from bridge.config import config
+from bridge.config import config, notify_silent
 from bridge.formatting import (
     balance_telegram_html,
+    demark_markdown_for_stream,
     html_to_plain_text,
+    render_fold_final,
     split_text,
     strip_display_markers,
 )
@@ -84,6 +86,10 @@ async def send_fold_html(bot: Bot, chat_id: int, html_text: str) -> Optional[int
                 chat_id=chat_id,
                 text=text,
                 link_preview_options=_LINK_PREVIEW_OFF,
+                # DGN-932 mechanism A: the fold is a progress surface; its
+                # FIRST send is silent by default (class "fold") and every
+                # later edit is notification-free at the Telegram level.
+                disable_notification=notify_silent("fold"),
             )
             if parse_mode:
                 kwargs["parse_mode"] = parse_mode
@@ -196,7 +202,17 @@ async def finalize_fold_html(
                 if parse_mode is None:
                     logger.error("Fold finalize plain fallback also failed: %s", e)
                     return False
-                logger.warning("Fold finalize HTML rejected (400), retrying plain: %s", e)
+                # DGN-946 observability: a finalize-time HTML rejection means
+                # the balanced render still failed the Telegram parser (seen
+                # 2026-08-15: unmatched </b> before </blockquote>). Log a
+                # bounded tail of the offending HTML so the assembly bug is
+                # diagnosable from the log alone.
+                logger.warning(
+                    "Fold finalize HTML rejected (400), retrying plain: %s; "
+                    "html tail: %r",
+                    e,
+                    html_text[-300:],
+                )
                 break  # break inner loop -> outer loop tries plain
             except RetryAfter as e:
                 if attempt == max_retries - 1:
@@ -280,12 +296,20 @@ class StreamingMessageHandler:
             body = strip_display_markers(chunk)
             if not body.strip():
                 continue
+            # DGN-969: overflow bubbles are sent as PLAIN text (no
+            # parse_mode) and are never revisited with a converted HTML
+            # edit in the single-bubble path -- de-mark so they never show
+            # raw markdown, here or later.
+            display_body = demark_markdown_for_stream(body)
             try:
                 await self._retry_with_backoff(
-                    lambda body=body: self.bot.send_message(
+                    lambda display_body=display_body: self.bot.send_message(
                         chat_id=self.chat_id,
-                        text=body,
+                        text=display_body,
                         link_preview_options=_LINK_PREVIEW_OFF,
+                        # DGN-932: overflow bubbles belong to the answer
+                        # surface -> class "draft" (loud by default).
+                        disable_notification=notify_silent("draft"),
                     )
                 )
             except Exception as e:
@@ -299,12 +323,21 @@ class StreamingMessageHandler:
         if len(chunks) > 1:
             await self._send_extra_chunks(chunks[:-1])
         content = chunks[-1] or "..."
+        # DGN-969: DISPLAY-only de-mark -- draft.text below still stores the
+        # raw `content` untouched, so downstream char-count math, overflow
+        # splitting, and the eventual HTML finalize all see the original text.
+        display_content = demark_markdown_for_stream(content)
         try:
             sent = await self._retry_with_backoff(
                 lambda: self.bot.send_message(
                     chat_id=self.chat_id,
-                    text=content,
+                    text=display_content,
                     link_preview_options=_LINK_PREVIEW_OFF,
+                    # DGN-932 mechanism A: notification is decided at this
+                    # FIRST send only (class "draft", loud by default = the
+                    # answer-arrival signal); later streaming edits are
+                    # notification-free at the Telegram level.
+                    disable_notification=notify_silent("draft"),
                 )
             )
             mid = self._message_id(sent)
@@ -322,12 +355,15 @@ class StreamingMessageHandler:
             return None
 
     async def update_draft(self, draft: DraftState, new_text: str) -> bool:
+        # DGN-969: DISPLAY-only de-mark -- draft.text is set to the raw
+        # `new_text` below unconditionally, untouched by the transform.
+        display_text = demark_markdown_for_stream(strip_display_markers(new_text))
         try:
             await self._retry_with_backoff(
                 lambda: self.bot.edit_message_text(
                     chat_id=self.chat_id,
                     message_id=draft.message_id,
-                    text=strip_display_markers(new_text),
+                    text=display_text,
                     link_preview_options=_LINK_PREVIEW_OFF,
                 )
             )
@@ -450,12 +486,17 @@ class StreamingMessageHandler:
         # message is edited to the first chunk; any overflow beyond it is sent as
         # extra finalized bubbles so nothing is dropped. (RELIABILITY #1)
         chunks = split_text(strip_display_markers(draft.text)) or [""]
+        # DGN-969: DISPLAY-only de-mark of the sealed chunk -- `chunks`
+        # (derived from the raw draft.text) is what the overflow-scrub /
+        # multi-bubble delete+resend logic keys off; only the string handed
+        # to Telegram here is transformed.
+        display_first = demark_markdown_for_stream(chunks[0]) or "..."
         try:
             await self._retry_with_backoff(
                 lambda: self.bot.edit_message_text(
                     chat_id=self.chat_id,
                     message_id=draft.message_id,
-                    text=chunks[0] or "...",
+                    text=display_first,
                     link_preview_options=_LINK_PREVIEW_OFF,
                 )
             )
@@ -470,6 +511,36 @@ class StreamingMessageHandler:
             await self._send_extra_chunks(chunks[1:])
         return ok
 
+    async def seal_segment(self) -> None:
+        """DGN-947: seal accumulated interim bubbles as permanent messages so
+        the terminal answer opens a FRESH draft.
+
+        Restores the finalize-consumer invariant that _reply_smart's
+        delete / edit / skip branches assume: drafts == final-answer bubbles
+        only. In inline mode the reader loop streams interim narration and the
+        terminal answer into the SAME handler; without this seal the two glue
+        into one draft, so the decision-turn finalize (delete-drafts, HTML
+        no-op skip, overflow scrub) operates on interim+final glue and either
+        wipes the narration or freezes raw tags. Sealing at the terminal
+        boundary edits each interim bubble to its permanent form and clears
+        the draft list, leaving the narration as its own standing bubbles
+        (DGN-930 inline live-narration intent, preserved) while the terminal
+        answer streams cleanly into a new draft.
+
+        NOT finalize_all: the handler is NOT latched (_finalized stays False),
+        so the terminal answer's own finalize_all still runs. Idempotent on an
+        empty draft list; never opens an empty bubble.
+        """
+        if self._finalized or not self.drafts:
+            return
+        if self.accumulated_text:
+            self.drafts[-1].text = self.accumulated_text
+        for draft in self.drafts:
+            await self.finalize_draft(draft)
+        self.drafts.clear()
+        self.accumulated_text = ""
+        self._need_new_draft = False
+
     async def finalize_all(self) -> bool:
         if self._finalized:
             return False
@@ -480,10 +551,65 @@ class StreamingMessageHandler:
             await self.finalize_draft(draft)
         return True
 
-    async def cancel(self) -> bool:
+    async def cancel(self, fold_caption: Optional[str] = None) -> bool:
+        """Cancel the in-flight streaming turn.
+
+        fold_caption=None (default, UNCHANGED): delete every draft bubble
+        outright. Every existing caller (/new, the /stop hard-teardown
+        fallback) keeps today's silent-removal UX -- not this ticket's call
+        to make.
+
+        fold_caption=<str> (auto-interrupt only, interrupt-fold ticket):
+        instead of deleting, collapse whatever streamed so far into ONE
+        expandable fold quote -- the same render_fold_final +
+        finalize_fold_html swap the growing dev-fold already uses on
+        interrupt (see sdk_bridge._fold_finalize) -- so the user keeps a
+        visible, collapsed record of the answer that got cut off. A draft
+        list with no real content (nothing survives fold rendering, e.g. an
+        empty/placeholder-only draft) still falls through to a plain delete:
+        an empty collapsed quote would be pure noise.
+        """
         if self._finalized:
             return False
         self._finalized = True
+        if fold_caption is not None and self.drafts:
+            if self.accumulated_text:
+                self.drafts[-1].text = self.accumulated_text
+            # "..." is create_draft's internal placeholder for "nothing real
+            # has streamed yet" (DGN-947 invariant), never genuine content --
+            # excluded here so an all-placeholder draft list renders no fold
+            # body and falls through to the plain-delete branch below.
+            fold_texts = [
+                d.text for d in self.drafts if d.text.strip() not in ("", "...")
+            ]
+            html = render_fold_final(fold_texts, fold_caption) if fold_texts else ""
+            if html:
+                target = self.drafts[-1]
+                ok = await finalize_fold_html(
+                    self.bot, self.chat_id, target.message_id, html
+                )
+                if not ok:
+                    logger.error(
+                        "Interrupt fold finalize failed for chat %s (msg %s)",
+                        self.chat_id,
+                        target.message_id,
+                    )
+                # Earlier overflow bubbles are now redundant -- their content
+                # is folded into the single collapsed quote above.
+                for draft in self.drafts[:-1]:
+                    try:
+                        await self._retry_with_backoff(
+                            lambda: self.bot.delete_message(
+                                chat_id=self.chat_id, message_id=draft.message_id
+                            )
+                        )
+                    except TelegramError as e:
+                        logger.error(
+                            "Failed to delete draft %s: %s", draft.message_id, e
+                        )
+                self.drafts.clear()
+                self.accumulated_text = ""
+                return True
         for draft in self.drafts:
             try:
                 await self._retry_with_backoff(

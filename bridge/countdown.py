@@ -2,9 +2,15 @@
 
 One transient (NON-pinned) message per countdown, edited in place every
 `cadence` seconds to show remaining time + a fixed-width progress bar, then
-finalized with a done line. Silent-edit channel only (channel 1): milestone
+finalized with a done line. Edit channel only (channel 1): milestone
 notification pushes (60s/30s/start) are a SEPARATE push path (channel 2) and
 are deliberately out of scope here.
+
+Notification (DGN-932, owner lock 2026-08-19): the FIRST send of the tick
+bubble notifies by default (class "countdown" -> loud: the set-start signal);
+every later tick is an in-place edit, notification-free at the Telegram
+level. This supersedes the original DGN-594 always-silent first send; an
+instance can restore it via NOTIFY_POLICY="countdown=silent".
 
 In-process API (spec: worklog 2026-08-06-dgn594-countdown-helper-spec):
     handle = start_countdown(bot, chat_id, seconds, label, cadence=10)
@@ -15,9 +21,15 @@ dashboard.md file-driven pattern):
     <bot_data_dir>/countdown/<id>.json =
         {"seconds": int, "label": str, "cadence": int (optional, default 10),
          "icon": str (optional), "done_icon": str (optional),
-         "glyph": str preset name OR [filled, empty] pair (optional)}
+         "glyph": str preset name OR [filled, empty] pair (optional),
+         "done_button": bool (optional, default true)}
         The appearance fields (DGN-780b) are optional and free-form: an unsafe
         or unknown value falls back silently to the default look, never
+        rejecting the countdown.
+        done_button (DGN-1174) gates the completion-affordance keyboard
+        (DGN-915) on natural end; the done TEXT is unaffected either way.
+        Default true keeps every caller that predates this field unchanged.
+        A non-bool value is fail-open: treated as true (button shown), never
         rejecting the countdown.
     - file appears  -> CountdownDriver starts a countdown targeting the OWNER
       chat. Any chat_id inside the file is IGNORED: the control file is
@@ -44,13 +56,13 @@ import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Callable, Dict, Optional, Set, Tuple
 
 import telegram.error
-from telegram import Bot
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 from bridge import messages, ownership
-from bridge.config import config
+from bridge.config import config, notify_silent
 from bridge.edit_guard import EditOutcome, EditRateGuard
 
 logger = logging.getLogger(__name__)
@@ -85,6 +97,18 @@ BAR_FILLED, BAR_EMPTY = GLYPH_SETS[DEFAULT_GLYPH_SET]
 DEFAULT_ICON = "⏳"
 DEFAULT_DONE_ICON = "✅"
 
+# DGN-915: callback_data prefix for the completion-affordance button.
+# Tapping it clears the inline keyboard from the done message (removes dead-air).
+# Format: CDN_DONE_PREFIX + str(message_id).
+# NOTE (DGN-922): the message_id suffix is encoded in the callback_data but the
+# current handler (bot.py _handle_callback cdn:done branch) does NOT use it for
+# an anti-stale check -- it simply calls edit_message_reply_markup(None) and lets
+# the Telegram API return an error for any message that is already gone.  The
+# suffix is preserved for future use (e.g. session cross-check) and does not
+# harm anything.  The stale-message drop that previously killed these taps is
+# bypassed by the skip_stale=True path added in DGN-922 FIX 2.
+CDN_DONE_PREFIX = "cdn:done:"
+
 # Markdown-risk characters forbidden in any caller-supplied icon/glyph
 # (DGN-780b). These are the Telegram/markdown control chars that would break
 # or hijack the PLAIN message surface. Emoji carry none of these and pass.
@@ -108,6 +132,24 @@ def _is_safe_glyph(value: object) -> bool:
     if "\n" in value or "\r" in value:
         return False
     return True
+
+
+# --- completion affordance (DGN-915) ---
+
+def _build_done_keyboard(message_id: int) -> InlineKeyboardMarkup:
+    """Single-button keyboard for the countdown completion affordance.
+
+    The callback_data encodes the message_id so a stale tap (button from a
+    previous session) is detectable by the handler without session state.
+    The handler edits the reply_markup away on tap; if the message is already
+    gone Telegram returns an error which the handler swallows fail-soft.
+    """
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            text=messages.COUNTDOWN_DONE_BUTTON,
+            callback_data=f"{CDN_DONE_PREFIX}{message_id}",
+        )
+    ]])
 
 
 # --- rendering ---
@@ -231,6 +273,7 @@ class Countdown:
         icon: object = None,
         done_icon: object = None,
         glyph: object = None,
+        done_button: bool = True,
     ) -> None:
         self._bot = bot
         self._chat_id = chat_id
@@ -245,6 +288,10 @@ class Countdown:
         self._icon = icon
         self._done_icon = done_icon
         self._glyph = glyph
+        # DGN-1174: gates the completion-affordance keyboard on natural end;
+        # the done TEXT is unaffected either way. Default true = unchanged
+        # behavior for every caller that predates this field.
+        self._done_button = done_button
         self._stop = asyncio.Event()
         self._message_id: Optional[int] = None
         self.task: Optional[asyncio.Task] = None
@@ -273,7 +320,11 @@ class Countdown:
                     self._label, self._seconds, self._seconds,
                     icon=self._icon, glyph=self._glyph,
                 ),
-                disable_notification=True,
+                # DGN-932 mechanism A: first-tick notification is policy-
+                # driven (class "countdown", default LOUD = set-start signal,
+                # owner lock 2026-08-19 -- supersedes the DGN-594 hardcoded
+                # silence); all later ticks are silent in-place edits.
+                disable_notification=notify_silent("countdown"),
             )
         except telegram.error.TelegramError as e:
             logger.warning("Countdown send failed (fail-open): %s", e)
@@ -320,15 +371,44 @@ class Countdown:
             if outcome is EditOutcome.FAILED:
                 return  # fail-open: end quietly, session flow unaffected
 
-        # Final cleanup edit (natural end and cancel share the done line).
-        # Deliberately not gated on ready(): one closing edit is worth
-        # spending; a flood/failure here still just ends quietly.
-        await self._guard.edit(
-            self._bot,
-            self._chat_id,
-            self._message_id,
-            render_done(self._label, done_icon=self._done_icon),
-        )
+        # Final cleanup edit. Natural completion (DGN-915) WITH done_button
+        # true (default): emit the done text WITH a tappable completion
+        # affordance button so the owner has a one-tap path forward instead
+        # of dead-air. Cancel path, or natural completion with done_button
+        # false (DGN-1174, e.g. rep-based working-set rest timers): plain
+        # done text, no button -- the done TEXT itself is unchanged either
+        # way. Deliberately not gated on ready(): one closing edit is worth
+        # spending; failure still just ends quietly (fail-open discipline
+        # unchanged).
+        done_text = render_done(self._label, done_icon=self._done_icon)
+        if self.completed and self._done_button:
+            # DGN-915: affordance emit with fail-soft fallback to plain done.
+            # If the keyboard edit fails (Telegram error, message gone), we
+            # retry as a plain done edit so the timer ALWAYS terminates cleanly.
+            outcome = await self._guard.edit(
+                self._bot,
+                self._chat_id,
+                self._message_id,
+                done_text,
+                reply_markup=_build_done_keyboard(self._message_id),
+            )
+            if outcome is EditOutcome.FAILED:
+                # Affordance failed: fall back to plain done (still terminates).
+                await self._guard.edit(
+                    self._bot,
+                    self._chat_id,
+                    self._message_id,
+                    done_text,
+                )
+        else:
+            # Cancelled countdown, or completed with done_button=False:
+            # plain done, no affordance.
+            await self._guard.edit(
+                self._bot,
+                self._chat_id,
+                self._message_id,
+                done_text,
+            )
 
 
 def start_countdown(
@@ -341,16 +421,19 @@ def start_countdown(
     icon: object = None,
     done_icon: object = None,
     glyph: object = None,
+    done_button: bool = True,
 ) -> Countdown:
     """Create the transient message loop as a background task; returns handle.
 
     icon/done_icon/glyph are optional free-form overrides (DGN-780b): omit
     them for the default appearance (hourglass/check, config-or-dot bar). An
-    unsafe value falls back silently at render time.
+    unsafe value falls back silently at render time. done_button (DGN-1174)
+    defaults true (unchanged behavior); false suppresses only the completion
+    keyboard on natural end, not the done text.
     """
     countdown = Countdown(
         bot, chat_id, seconds, label, cadence=cadence, guard=guard,
-        icon=icon, done_icon=done_icon, glyph=glyph,
+        icon=icon, done_icon=done_icon, glyph=glyph, done_button=done_button,
     )
     countdown.task = asyncio.create_task(countdown._run())
     return countdown
@@ -361,11 +444,20 @@ def start_countdown(
 class CountdownDriver:
     """Polls <bot_data_dir>/countdown/*.json and drives Countdown lifecycles."""
 
-    def __init__(self, bot: Bot, control_dir: Path = COUNTDOWN_DIR) -> None:
+    def __init__(
+        self,
+        bot: Bot,
+        control_dir: Path = COUNTDOWN_DIR,
+        turn_active: Optional[Callable[[int], bool]] = None,
+    ) -> None:
         self._bot = bot
         self._dir = Path(control_dir)
         self._active: Dict[str, Countdown] = {}
         self._warned_bad: Set[str] = set()  # malformed-file log dedup
+        # turn_active(user_id) -> True while that user's turn is in flight
+        # (DGN-950 seam 2; mirrors DashboardSync). Private owner chat means
+        # chat_id == user_id. None (standalone/test use) = no deferral.
+        self._turn_active = turn_active
 
     def _owner_chat_id(self) -> Optional[int]:
         """Owner chat via ownership precedence; None = stay dormant.
@@ -440,10 +532,19 @@ class CountdownDriver:
             chat_id = self._owner_chat_id()
             if chat_id is None:
                 continue  # unclaimed bot = dormant; retried while file exists
-            seconds, label, cadence, icon, done_icon, glyph = spec
+            if self._turn_active is not None and self._turn_active(chat_id):
+                # DGN-950 seam 2: defer during the owner's turn, exactly like
+                # DashboardSync -- a rest-timer send racing the in-flight
+                # model reply inverts the message order (timer lands before
+                # the queued next-step answer). The control file stays on
+                # disk, so the countdown starts (flushes) on the first tick
+                # after the turn ends.
+                continue
+            seconds, label, cadence, icon, done_icon, glyph, done_button = spec
             self._active[cid] = start_countdown(
                 self._bot, chat_id, seconds, label, cadence=cadence,
                 icon=icon, done_icon=done_icon, glyph=glyph,
+                done_button=done_button,
             )
 
     @staticmethod
@@ -463,7 +564,7 @@ class CountdownDriver:
 
     def _read_spec(
         self, path: Path
-    ) -> Optional[Tuple[int, str, int, object, object, object]]:
+    ) -> Optional[Tuple[int, str, int, object, object, object, bool]]:
         """Parse+validate a control file; None = invalid (skip, do not start).
 
         Any chat_id key in the file is deliberately ignored (owner-only
@@ -471,7 +572,11 @@ class CountdownDriver:
         (dashboard state-load precedent). The optional icon/done_icon/glyph
         appearance fields (DGN-780b) are passed through raw: the render layer
         validates and falls back safely, so a bad value never rejects the
-        countdown -- it just yields the default look.
+        countdown -- it just yields the default look. done_button (DGN-1174)
+        follows the same fail-open discipline: absent or non-bool -> True
+        (button shown, i.e. today's unconditional behavior), never rejecting
+        the countdown -- unlike seconds/label/cadence, a bad done_button is
+        not a reason to skip the control file.
         """
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -491,7 +596,13 @@ class CountdownDriver:
         icon = data.get("icon")
         done_icon = data.get("done_icon")
         glyph = self._spec_glyph(data.get("glyph"))
-        return seconds, label.strip(), cadence, icon, done_icon, glyph
+        done_button = data.get("done_button", True)
+        if not isinstance(done_button, bool):
+            done_button = True  # fail-open: bad type never suppresses the button
+        return (
+            seconds, label.strip(), cadence, icon, done_icon, glyph,
+            done_button,
+        )
 
     def _emit_done(self, cid: str) -> None:
         try:

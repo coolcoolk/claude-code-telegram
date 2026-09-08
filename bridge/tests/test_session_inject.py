@@ -1,4 +1,4 @@
-"""Background-turn injection + NO_PUSH suppression tests."""
+"""DGN-217: background-turn injection + NO_PUSH suppression tests."""
 
 import asyncio
 import unittest
@@ -76,13 +76,13 @@ class TestNoPushSentinel(unittest.TestCase):
         st.proactive_push.assert_awaited_once()
 
     def test_leading_sentinel_with_trailing_footer_suppresses(self):
-        # Leak case: Stop-hook footer appended AFTER the sentinel.
+        # DGN-217 leak case: Stop-hook footer appended AFTER the sentinel.
         st = self._flush(["NO_PUSH\n[live] status footer line"])
         st.proactive_push.assert_not_awaited()
 
     def test_trailing_sentinel_after_report_suppresses(self):
-        # Report body first, sentinel as the final line.
-        st = self._flush(["verify done, all healthy.\ndetails in log.\nNO_PUSH"])
+        # DGN-234 leak case: report body first, sentinel as the final line.
+        st = self._flush(["verify done, all healthy.\ndetails in ticket.\nNO_PUSH"])
         st.proactive_push.assert_not_awaited()
 
     def test_trailing_sentinel_with_whitespace_suppresses(self):

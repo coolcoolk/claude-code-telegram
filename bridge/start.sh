@@ -37,7 +37,12 @@ if [[ -z "$PROJECT_PATH" ]]; then
 fi
 
 # Predictable PATH so the Claude CLI and ffmpeg resolve under launchd.
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# $HOME/.local/bin FIRST (DGN-963): the Claude CLI native installer lands
+# there and self-updates; it must win over any stale root-owned npm-global
+# or Homebrew shadow copy. Homebrew still precedes /usr/local/bin so other
+# brewed tools resolve normally. The launchd plist (newbridge) carries the
+# same order -- keep both PATH declarations symmetric.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 # Resolve the python interpreter: prefer a venv next to this script, else env, else python3.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

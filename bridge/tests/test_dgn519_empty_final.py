@@ -128,42 +128,93 @@ class TestEmptyFinalDropped(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# (b) Error turn: PROCESSING_FAILED path intact
+# (b) Error turn: DGN-686 classified LOCKED-notice path
 # ---------------------------------------------------------------------------
 
-class TestErrorTurnProcessingFailed(unittest.TestCase):
-    """is_error=True must still reach PROCESSING_FAILED regardless of content."""
+class TestErrorTurnClassifiedNotice(unittest.TestCase):
+    """is_error=True is classified into a LOCKED ko notice (DGN-686).
+
+    The raw English detail is preserved in .error (for the stderr log) but the
+    user-facing .content is the mapped notice; auth errors carry no retry.
+    """
 
     def setUp(self):
         self.bridge = SdkBridge()
         self.state = _make_state()
 
-    def test_error_turn_with_content_resolves_failed(self):
+    def test_transient_error_maps_to_retry_notice(self):
+        from bridge import messages as m
         req = _make_req(last_texts=[])
-        msg = _make_result_msg(result_text="SDK connection refused", is_error=True)
+        msg = _make_result_msg(result_text="upstream 529 overloaded_error", is_error=True)
         _run_finalize(self.bridge, self.state, req, msg)
-        self.assertTrue(req.future.done(), "Future must be resolved on error turn")
+        self.assertTrue(req.future.done())
         result = req.future.result()
         self.assertFalse(result.success)
-        self.assertIn("SDK connection refused", result.error)
+        self.assertIn("overloaded", result.error)  # raw detail retained for log
+        self.assertEqual(result.content, m.ERROR_TRANSIENT_RETRY)
+        self.assertTrue(result.retry_offer)
+        # DGN-686 MAJOR-1: error_kind must be stamped so the BOT seat (not the
+        # reader loop) can auto-retry once on transient before showing notice.
+        self.assertEqual(result.error_kind, "transient")
+
+    def test_auth_error_maps_to_relogin_no_retry(self):
+        from bridge import messages as m
+        req = _make_req(last_texts=[])
+        msg = _make_result_msg(result_text="HTTP 401 invalid_api_key", is_error=True)
+        _run_finalize(self.bridge, self.state, req, msg)
+        result = req.future.result()
+        self.assertFalse(result.success)
+        self.assertEqual(result.content, m.ERROR_AUTH_RELOGIN)
+        self.assertFalse(result.retry_offer)
+        # auth is NOT transient -> the bot seat must not auto-retry it.
+        self.assertEqual(result.error_kind, "auth")
+
+    def test_other_error_maps_to_generic_retry(self):
+        from bridge import messages as m
+        req = _make_req(last_texts=[])
+        msg = _make_result_msg(result_text="some unexpected failure", is_error=True)
+        _run_finalize(self.bridge, self.state, req, msg)
+        result = req.future.result()
+        self.assertFalse(result.success)
+        self.assertEqual(result.content, m.ERROR_GENERIC_RETRY)
+        self.assertTrue(result.retry_offer)
 
     def test_error_turn_empty_content_still_resolves_failed(self):
-        # Even when the error result text is None/empty, PROCESSING_FAILED must fire.
+        # Even when the error result text is None/empty, the future resolves
+        # failed (empty detail classifies as "other" -> generic retry notice).
+        from bridge import messages as m
         req = _make_req(last_texts=[])
         msg = _make_result_msg(result_text=None, is_error=True)
         _run_finalize(self.bridge, self.state, req, msg)
-        self.assertTrue(req.future.done(), "Future must be resolved on error turn")
+        self.assertTrue(req.future.done())
         result = req.future.result()
         self.assertFalse(result.success)
+        self.assertEqual(result.content, m.ERROR_GENERIC_RETRY)
 
-    def test_error_turn_uses_processing_failed_format(self):
-        from bridge import messages as bridge_messages
-        req = _make_req(last_texts=[])
-        msg = _make_result_msg(result_text="timeout", is_error=True)
-        _run_finalize(self.bridge, self.state, req, msg)
-        result = req.future.result()
-        expected_content = bridge_messages.PROCESSING_FAILED.format(error=result.error)
-        self.assertEqual(result.content, expected_content)
+    def test_finalize_never_redispatches(self):
+        # DGN-686 MAJOR-1 invariant: the reader-loop finalize must NEVER re-run
+        # a query itself (re-entrancy risk). The transient auto-retry lives in
+        # the bot caller seat; _finalize_result only stamps error_kind. Parse
+        # the AST and inspect CALLS (not comments/strings) so a mention of the
+        # split in a docstring does not trip the check.
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(SdkBridge._finalize_result).lstrip())
+        forbidden = {
+            "process_message", "resume_caller",
+            "_reconnect_and_retry", "_dispatch_next_query",
+        }
+        called = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                fn = node.func
+                name = getattr(fn, "attr", None) or getattr(fn, "id", None)
+                if name:
+                    called.add(name)
+        offenders = forbidden & called
+        self.assertEqual(
+            set(), offenders,
+            f"_finalize_result must not re-dispatch (calls: {offenders})")
 
 
 # ---------------------------------------------------------------------------

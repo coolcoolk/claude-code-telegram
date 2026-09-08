@@ -1,4 +1,4 @@
-"""Post-restart resume must not stall until an owner message.
+"""DGN-399: post-restart resume must not stall until an owner message.
 
 Two levels:
   1. Bridge unit -- ensure_owner_stream bootstraps a stream when none exists,
@@ -86,7 +86,7 @@ def _fake_self(push):
 
 
 class TestSessionInboxLoopBootstrap(unittest.TestCase):
-    OWNER_ID = 1  # generic user id
+    OWNER_ID = 1  # generic placeholder for template; replace with real user id
 
     def _run_loop(self, *, stream_exists, max_ticks=2):
         """Drive the real loop body against a temp spool dir.

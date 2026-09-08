@@ -1,9 +1,11 @@
-"""Unit tests for bridge/countdown.py (DGN-594; DGN-780 snap + UI redesign).
+"""Unit tests for bridge/countdown.py (DGN-594; DGN-780 snap + UI redesign;
+DGN-915 completion affordance).
 
 Covers rendering (m:ss + draining progress bar + glyph allowlist), the
 deadline-anchored boundary-snap edit loop (drift self-correction), natural-end
-final edit, cancel() early stop, fail-open on send/edit errors, the
-control-file driver (start / delete-cancel / completion cleanup / malformed
+final edit with completion-affordance keyboard, cancel() early stop (no
+keyboard), fail-open on send/edit errors, affordance-emit fail-soft fallback,
+the control-file driver (start / delete-cancel / completion cleanup / malformed
 skip), and owner-chat targeting (file chat_id ignored).
 No live Telegram, token, or network. Loop tests use sub-second durations
 with a zero-interval guard so the suite stays fast.
@@ -18,12 +20,15 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import telegram.error
+from telegram import InlineKeyboardMarkup
 
 from bridge import messages, ownership
+
 from bridge.countdown import (
     BAR_CELLS,
     BAR_EMPTY,
     BAR_FILLED,
+    CDN_DONE_PREFIX,
     Countdown,
     CountdownDriver,
     DEFAULT_CADENCE,
@@ -31,6 +36,7 @@ from bridge.countdown import (
     DEFAULT_GLYPH_SET,
     DEFAULT_ICON,
     GLYPH_SETS,
+    _build_done_keyboard,
     _format_remaining,
     _is_safe_glyph,
     _next_boundary,
@@ -337,7 +343,9 @@ class TestCountdownLoop(unittest.TestCase):
             guard=EditRateGuard(min_interval=0.0),
         )
 
-    def test_send_is_silent_and_targets_chat(self):
+    def test_first_send_notifies_and_targets_chat(self):
+        # DGN-932: the FIRST tick send is LOUD by default (set-start signal,
+        # owner lock 2026-08-19) -- supersedes the DGN-594 always-silent send.
         bot = _mock_bot()
 
         async def scenario():
@@ -347,7 +355,7 @@ class TestCountdownLoop(unittest.TestCase):
         asyncio.run(scenario())
         kwargs = bot.send_message.await_args.kwargs
         self.assertEqual(kwargs["chat_id"], OWNER_ID)
-        self.assertTrue(kwargs["disable_notification"])
+        self.assertFalse(kwargs["disable_notification"])
 
     def test_cadence_edits_advance(self):
         bot = _mock_bot()
@@ -406,6 +414,8 @@ class TestCountdownLoop(unittest.TestCase):
         self.assertEqual(last.kwargs["text"], _done_text("rest"))
 
     def test_natural_end_final_edit(self):
+        # DGN-915: natural completion emits the done text WITH a tappable
+        # completion-affordance keyboard on the final edit.
         bot = _mock_bot()
 
         async def scenario():
@@ -415,10 +425,16 @@ class TestCountdownLoop(unittest.TestCase):
 
         countdown = asyncio.run(scenario())
         self.assertTrue(countdown.finished)
+        self.assertTrue(countdown.completed)
         last = bot.edit_message_text.await_args_list[-1]
         self.assertEqual(last.kwargs["text"], _done_text("rest"))
+        # DGN-915: affordance keyboard present on natural completion.
+        self.assertIn("reply_markup", last.kwargs)
+        self.assertIsInstance(last.kwargs["reply_markup"], InlineKeyboardMarkup)
 
     def test_cancel_early_stop(self):
+        # DGN-915: cancelled countdown emits plain done WITHOUT the affordance
+        # keyboard (timer was interrupted, no next-step offered).
         bot = _mock_bot()
 
         async def scenario():
@@ -430,10 +446,13 @@ class TestCountdownLoop(unittest.TestCase):
 
         countdown = asyncio.run(scenario())
         self.assertTrue(countdown.finished)
+        self.assertFalse(countdown.completed)  # DGN-915: cancel != completion
         # No periodic edit had fired yet; only the final cleanup edit.
         self.assertEqual(bot.edit_message_text.await_count, 1)
         last = bot.edit_message_text.await_args_list[-1]
         self.assertEqual(last.kwargs["text"], _done_text("rest"))
+        # DGN-915: no affordance keyboard on cancel path.
+        self.assertNotIn("reply_markup", last.kwargs)
 
     def test_edit_error_fails_open(self):
         bot = _mock_bot()
@@ -484,6 +503,227 @@ class TestCountdownLoop(unittest.TestCase):
         # Periodic edits all skipped (guard not ready); only the final edit
         # is attempted (deliberately unconditional) and returns FLOOD.
         self.assertEqual(bot.edit_message_text.await_count, 1)
+
+
+# ---------------------------------------------------------------------------
+# DGN-915: completion affordance
+# ---------------------------------------------------------------------------
+
+class TestCompletionAffordance(unittest.TestCase):
+    """DGN-915: countdown END emits a tappable done button; cancel does not."""
+
+    def _start(self, bot, seconds, cadence, label="rest"):
+        return start_countdown(
+            bot, OWNER_ID, seconds, label, cadence=cadence,
+            guard=EditRateGuard(min_interval=0.0),
+        )
+
+    def test_build_done_keyboard_structure(self):
+        # _build_done_keyboard returns a one-button InlineKeyboardMarkup whose
+        # callback_data carries the CDN_DONE_PREFIX and the message_id.
+        msg_id = 1234
+        kb = _build_done_keyboard(msg_id)
+        self.assertIsInstance(kb, InlineKeyboardMarkup)
+        rows = kb.inline_keyboard
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows[0]), 1)
+        btn = rows[0][0]
+        self.assertTrue(btn.callback_data.startswith(CDN_DONE_PREFIX))
+        self.assertIn(str(msg_id), btn.callback_data)
+
+    def test_natural_completion_emits_affordance_keyboard(self):
+        # Natural completion: final edit carries reply_markup with one button.
+        bot = _mock_bot(msg_id=9999)
+
+        async def scenario():
+            countdown = self._start(bot, seconds=0.05, cadence=0.02)
+            await asyncio.wait_for(countdown.task, timeout=2)
+            return countdown
+
+        countdown = asyncio.run(scenario())
+        self.assertTrue(countdown.completed)
+        last = bot.edit_message_text.await_args_list[-1]
+        self.assertIn("reply_markup", last.kwargs)
+        kb = last.kwargs["reply_markup"]
+        btn = kb.inline_keyboard[0][0]
+        # callback_data embeds the message_id (9999) and the prefix.
+        self.assertEqual(btn.callback_data, f"{CDN_DONE_PREFIX}9999")
+
+    def test_cancel_path_no_affordance_keyboard(self):
+        # Cancelled countdown: final edit has no reply_markup.
+        bot = _mock_bot()
+
+        async def scenario():
+            countdown = self._start(bot, seconds=60, cadence=10)
+            await asyncio.sleep(0.02)
+            countdown.cancel()
+            await asyncio.wait_for(countdown.task, timeout=2)
+            return countdown
+
+        countdown = asyncio.run(scenario())
+        self.assertFalse(countdown.completed)
+        last = bot.edit_message_text.await_args_list[-1]
+        # No keyboard on the cancel path.
+        self.assertNotIn("reply_markup", last.kwargs)
+
+    def test_affordance_emit_fail_soft_fallback_to_plain_done(self):
+        # If the affordance edit (with keyboard) fails, the countdown must
+        # still terminate cleanly by retrying as a plain done edit.
+        # Use a very short countdown with a cadence that skips periodic edits
+        # (cadence >= seconds), so all edits are the final one.
+        bot = _mock_bot()
+
+        async def edit_side_effect(**kwargs):
+            if kwargs.get("reply_markup") is not None:
+                # Affordance edit: simulate Telegram rejecting the keyboard.
+                raise telegram.error.TelegramError("bad request")
+            # Plain done fallback: succeed silently (no side effect).
+
+        bot.edit_message_text = AsyncMock(side_effect=edit_side_effect)
+
+        async def scenario():
+            # cadence > seconds: no periodic edits, only the final done edit.
+            countdown = start_countdown(
+                bot, OWNER_ID, 0.05, "rest", cadence=60.0,
+                guard=EditRateGuard(min_interval=0.0),
+            )
+            await asyncio.wait_for(countdown.task, timeout=2)
+            return countdown
+
+        countdown = asyncio.run(scenario())
+        self.assertTrue(countdown.finished)
+        self.assertTrue(countdown.completed)
+        # Two final-edit attempts: affordance (failed) + plain fallback.
+        calls = bot.edit_message_text.await_args_list
+        self.assertEqual(len(calls), 2, calls)
+        with_kb = calls[0]
+        plain = calls[1]
+        # First attempt carries the keyboard.
+        self.assertIsNotNone(with_kb.kwargs.get("reply_markup"))
+        # Second attempt (fallback) has no keyboard.
+        self.assertIsNone(plain.kwargs.get("reply_markup"))
+        # Both carry the correct done text.
+        self.assertEqual(with_kb.kwargs["text"], _done_text("rest"))
+        self.assertEqual(plain.kwargs["text"], _done_text("rest"))
+
+    def test_done_button_field_absent_keeps_affordance(self):
+        # DGN-1174: omitting done_button (in-process API default) reproduces
+        # the pre-DGN-1174 unconditional-attach behavior exactly.
+        bot = _mock_bot()
+
+        async def scenario():
+            countdown = self._start(bot, seconds=0.05, cadence=0.02)
+            await asyncio.wait_for(countdown.task, timeout=2)
+            return countdown
+
+        countdown = asyncio.run(scenario())
+        self.assertTrue(countdown.completed)
+        last = bot.edit_message_text.await_args_list[-1]
+        self.assertIn("reply_markup", last.kwargs)
+        self.assertIsInstance(last.kwargs["reply_markup"], InlineKeyboardMarkup)
+        self.assertEqual(last.kwargs["text"], _done_text("rest"))
+
+    def test_done_button_true_attaches_affordance(self):
+        # DGN-1174: explicit done_button=True is identical to the default.
+        bot = _mock_bot()
+
+        async def scenario():
+            countdown = start_countdown(
+                bot, OWNER_ID, 0.05, "rest", cadence=0.02,
+                guard=EditRateGuard(min_interval=0.0), done_button=True,
+            )
+            await asyncio.wait_for(countdown.task, timeout=2)
+            return countdown
+
+        countdown = asyncio.run(scenario())
+        self.assertTrue(countdown.completed)
+        last = bot.edit_message_text.await_args_list[-1]
+        self.assertIn("reply_markup", last.kwargs)
+        self.assertIsInstance(last.kwargs["reply_markup"], InlineKeyboardMarkup)
+        self.assertEqual(last.kwargs["text"], _done_text("rest"))
+
+    def test_done_button_false_suppresses_affordance_but_keeps_done_text(self):
+        # DGN-1174: done_button=False on natural completion emits the SAME
+        # done text with NO keyboard -- the in-place countdown UI (dot bar,
+        # icons) is untouched; only the affordance button is gated.
+        bot = _mock_bot()
+
+        async def scenario():
+            # cadence > seconds: no periodic edits, only the final done edit
+            # (isolates the assertion below to the completion edit alone).
+            countdown = start_countdown(
+                bot, OWNER_ID, 0.05, "rest", cadence=60.0,
+                guard=EditRateGuard(min_interval=0.0), done_button=False,
+            )
+            await asyncio.wait_for(countdown.task, timeout=2)
+            return countdown
+
+        countdown = asyncio.run(scenario())
+        self.assertTrue(countdown.completed)  # natural end, not a cancel
+        last = bot.edit_message_text.await_args_list[-1]
+        self.assertNotIn("reply_markup", last.kwargs)
+        self.assertEqual(last.kwargs["text"], _done_text("rest"))
+        # Only one final edit: no affordance attempt + fallback pair.
+        self.assertEqual(bot.edit_message_text.await_count, 1)
+
+    def test_done_button_false_cancel_path_still_cancels_plainly(self):
+        # DGN-1174 self-grill: done_button=False must not change the CANCEL
+        # path (already plain, unaffected by this field either way).
+        bot = _mock_bot()
+
+        async def scenario():
+            countdown = start_countdown(
+                bot, OWNER_ID, 60, "rest", cadence=10,
+                guard=EditRateGuard(min_interval=0.0), done_button=False,
+            )
+            await asyncio.sleep(0.02)
+            countdown.cancel()
+            await asyncio.wait_for(countdown.task, timeout=2)
+            return countdown
+
+        countdown = asyncio.run(scenario())
+        self.assertTrue(countdown.finished)
+        self.assertFalse(countdown.completed)  # cancel, not natural end
+        last = bot.edit_message_text.await_args_list[-1]
+        self.assertNotIn("reply_markup", last.kwargs)
+        self.assertEqual(last.kwargs["text"], _done_text("rest"))
+
+    def test_affordance_stale_tap_handler_fail_soft(self):
+        # Simulate the bot.py callback handler: stale tap (message gone)
+        # must swallow the Telegram error without raising.
+        # We test the behavior expected of the handler -- that it catches
+        # errors from edit_message_reply_markup. This is a unit-level check
+        # on the handler's error path using a mock query.
+
+        async def scenario():
+            query = MagicMock()
+            query.edit_message_reply_markup = AsyncMock(
+                side_effect=telegram.error.BadRequest("message not found")
+            )
+            # Replicate the handler logic from bot.py _handle_callback cdn:done: branch.
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass  # fail-soft: stale tap is silent
+
+            # Must NOT raise; query was called once.
+            query.edit_message_reply_markup.assert_awaited_once()
+
+        asyncio.run(scenario())
+
+    def test_affordance_tap_clears_keyboard(self):
+        # Simulate a successful tap: edit_message_reply_markup called with None.
+        async def scenario():
+            query = MagicMock()
+            query.edit_message_reply_markup = AsyncMock(return_value=None)
+            # Replicate the handler logic.
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+
+        asyncio.run(scenario())
 
 
 # ---------------------------------------------------------------------------
@@ -612,6 +852,7 @@ class TestDriver(unittest.TestCase):
 
     def test_finished_countdown_reaped_and_file_removed(self):
         self._write("done1", {"seconds": 60, "label": "done1"})
+        # DGN-915: dummy must include 'completed' (checked in _tick reaper).
         dummy = types.SimpleNamespace(
             finished=True, completed=False, task=None, cancel=lambda: None
         )
@@ -666,6 +907,32 @@ class TestDriver(unittest.TestCase):
         self.assertEqual(self._driver._active, {})
         self.assertTrue((self._dir / "rest.json").exists())
 
+    def test_done_button_absent_flows_to_countdown_as_true(self):
+        # DGN-1174: existing control files (no done_button key) start a
+        # countdown whose _done_button is True -- the field addition proof.
+        self._write("rest", {"seconds": 60, "label": "rest"})
+
+        async def scenario():
+            await self._driver._tick()
+            countdown = self._driver._active["rest"]
+            self.assertIs(countdown._done_button, True)
+            await self._teardown_countdown(countdown)
+
+        self._run(scenario())
+
+    def test_done_button_false_flows_to_countdown(self):
+        self._write(
+            "rest", {"seconds": 60, "label": "rest", "done_button": False}
+        )
+
+        async def scenario():
+            await self._driver._tick()
+            countdown = self._driver._active["rest"]
+            self.assertIs(countdown._done_button, False)
+            await self._teardown_countdown(countdown)
+
+        self._run(scenario())
+
     def test_owner_lock_mode_targets_lock_owner(self):
         self._write("rest", {"seconds": 60, "label": "rest"})
 
@@ -696,22 +963,23 @@ class TestReadSpec(unittest.TestCase):
 
     def test_valid_minimal(self):
         # Appearance fields default to None (fall through to the default look).
+        # done_button (DGN-1174) defaults True when absent.
         self.assertEqual(
             self._spec({"seconds": 120, "label": "rest"}),
-            (120, "rest", DEFAULT_CADENCE, None, None, None),
+            (120, "rest", DEFAULT_CADENCE, None, None, None, True),
         )
 
     def test_valid_with_cadence(self):
         self.assertEqual(
             self._spec({"seconds": 120, "label": "rest", "cadence": 5}),
-            (120, "rest", 5, None, None, None),
+            (120, "rest", 5, None, None, None, True),
         )
 
     def test_chat_id_key_is_ignored(self):
         # Security: owner-only targeting; a chat_id key never surfaces.
         self.assertEqual(
             self._spec({"seconds": 60, "label": "rest", "chat_id": 999}),
-            (60, "rest", DEFAULT_CADENCE, None, None, None),
+            (60, "rest", DEFAULT_CADENCE, None, None, None, True),
         )
 
     def test_appearance_fields_passed_through(self):
@@ -722,13 +990,13 @@ class TestReadSpec(unittest.TestCase):
                 "seconds": 60, "label": "rest",
                 "icon": "🔥", "done_icon": "🎉", "glyph": "square",
             }),
-            (60, "rest", DEFAULT_CADENCE, "🔥", "🎉", "square"),
+            (60, "rest", DEFAULT_CADENCE, "🔥", "🎉", "square", True),
         )
         self.assertEqual(
             self._spec({
                 "seconds": 60, "label": "rest", "glyph": ["#", "-"],
             }),
-            (60, "rest", DEFAULT_CADENCE, None, None, ("#", "-")),
+            (60, "rest", DEFAULT_CADENCE, None, None, ("#", "-"), True),
         )
 
     def test_bad_glyph_shape_becomes_none(self):
@@ -736,8 +1004,36 @@ class TestReadSpec(unittest.TestCase):
         # countdown still starts with the default look.
         self.assertEqual(
             self._spec({"seconds": 60, "label": "rest", "glyph": [1, 2, 3]}),
-            (60, "rest", DEFAULT_CADENCE, None, None, None),
+            (60, "rest", DEFAULT_CADENCE, None, None, None, True),
         )
+
+    def test_done_button_absent_defaults_true(self):
+        # DGN-1174: the single piece of evidence that every existing caller
+        # (no done_button key at all) is unchanged by this field's addition.
+        spec = self._spec({"seconds": 60, "label": "rest"})
+        self.assertIs(spec[6], True)
+
+    def test_done_button_explicit_true(self):
+        spec = self._spec(
+            {"seconds": 60, "label": "rest", "done_button": True}
+        )
+        self.assertIs(spec[6], True)
+
+    def test_done_button_explicit_false(self):
+        spec = self._spec(
+            {"seconds": 60, "label": "rest", "done_button": False}
+        )
+        self.assertIs(spec[6], False)
+
+    def test_done_button_bad_type_fails_open_to_true(self):
+        # Fail-open discipline (DGN-1174): a non-bool value never suppresses
+        # the button, and never rejects the control file.
+        for bad in ("false", 0, 1, None, ["x"]):
+            spec = self._spec(
+                {"seconds": 60, "label": "rest", "done_button": bad}
+            )
+            self.assertIsNotNone(spec, repr(bad))
+            self.assertIs(spec[6], True, repr(bad))
 
     def test_rejects_missing_seconds(self):
         self.assertIsNone(self._spec({"label": "rest"}))

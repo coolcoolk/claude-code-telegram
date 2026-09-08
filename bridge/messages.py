@@ -11,11 +11,6 @@ and bridge/i18n/ko.py; the active locale comes from config.config.locale
 To add or change a string: edit the i18n catalogs (add the same key to both
 en.py and ko.py), then add a matching constant here. Constant names and count
 must stay in parity with the catalog keys.
-
-EXCEPTION -- model-facing strings: anything sent to Claude (photo/doc prompts,
-resume continuation, system prompt fragment, tool denials) is NOT i18n. It is
-defined here directly as a plain English constant, single source, never
-translated. Keep them short, direct, imperative.
 """
 
 from bridge.i18n import t
@@ -37,14 +32,31 @@ MODEL_SELECT = t("model_select")
 MODEL_SWITCH_WARNING = t("model_switch_warning")
 MODEL_UNKNOWN = t("model_unknown")
 MODEL_STATE_FALLBACK = t("model_state_fallback")
+MODEL_ALREADY_ACTIVE = t("model_already_active")
 STOP_PAUSED = t("stop_paused")
 STOP_NOTHING = t("stop_nothing")
 STOP_INTERRUPTED = t("stop_interrupted")
+# DGN-1015: fires ONLY when sdk_bridge.pop_interrupt_killed() confirms at
+# least one tracked background subagent actually died in this interrupt
+# (auto or /stop). {names} = comma-joined descriptions. Copy
+# owner-approved 2026-08-24 (see the i18n comment).
+BG_SUBAGENT_KILLED_NOTICE = t("bg_subagent_killed_notice")
+# DGN-1016 O1: dedicated copy for the AUTOMATIC in-flight interrupt notice
+# (BRIDGE_INFLIGHT_INTERRUPT_NOTICE opt-in; default stays OFF per the
+# 2026-08-17 owner decision). The flag previously reused STOP_INTERRUPTED,
+# which describes an action the user never took. DRAFT copy -- owner
+# confirmation pending; the flag must not ship enabled before approval.
+AUTO_INTERRUPT_NOTICE = t("auto_interrupt_notice")
+STOP_FORCED = t("stop_forced")
 NO_SESSION = t("no_session")
 TASK_TERMINATED = t("task_terminated")
 
 # --- Help ---
-HELP_TEXT = t("help_text")
+# DGN-919: help_text is no longer a static string. The command-list body is
+# generated at render time in TelegramBot._cmd_help from COMMAND_MENU_SPEC.
+# Only the header and footer remain as i18n-bound constants.
+HELP_TEXT_HEADER = t("help_text_header")
+HELP_TEXT_FOOTER = t("help_text_footer")
 
 # --- Skills listing ---
 SKILLS_NONE = t("skills_none")
@@ -56,39 +68,66 @@ CMD_DESC_NEW = t("cmd_desc_new")
 CMD_DESC_STOP = t("cmd_desc_stop")
 CMD_DESC_MODEL = t("cmd_desc_model")
 CMD_DESC_RESUME = t("cmd_desc_resume")
-CMD_DESC_HISTORY = t("cmd_desc_history")
 CMD_DESC_SKILLS = t("cmd_desc_skills")
 CMD_DESC_USAGE = t("cmd_desc_usage")
 CMD_DESC_HELP = t("cmd_desc_help")
+CMD_DESC_BTW = t("cmd_desc_btw")
+CMD_DESC_QUEUE = t("cmd_desc_queue")
+CMD_DESC_RESTART = t("cmd_desc_restart")  # DGN-997
+# DGN-986 D1: /health menu entry (owner amendment of the DGN-919 10-cmd lock).
+CMD_DESC_HEALTH = t("cmd_desc_health")
 
-# --- Usage report (/usage -> routines/claude-usage.sh) ---
-USAGE_SCRIPT_MISSING = t("usage_script_missing")
-USAGE_TIMEOUT = t("usage_timeout")
-USAGE_FAILED = t("usage_failed")
+# --- /health command (DGN-986 [c]) ---
+HEALTH_FAILED = t("health_failed")
+
+# --- /btw command (DGN-902) ---
+BTW_MARKER = t("btw_marker")
+BTW_NO_QUESTION = t("btw_no_question")
+BTW_NO_SESSION = t("btw_no_session")
+BTW_FORK_FAILED = t("btw_fork_failed")
+BTW_THINKING = t("btw_thinking")
+
+# --- /authsync (RETIRED, DGN-1050) ---
+# The DGN-759 sync surface (RUNNING/MATCH/MISMATCH/SYNC_OK/... strings and
+# the DGN-994 restart CTA button) is gone with the poisonous file->keychain
+# sync path. The only surviving copy is the retirement notice the hidden
+# stub handler replies with.
+AUTHSYNC_RETIRED = t("authsync_retired")
+
+# --- /restart command (DGN-997) ---
+# Progress/completion notice is NOT here -- self_restart.sh owns that push
+# on its own (default fallback copy). This is the failure-path fallback
+# only (script missing / launch exception / non-zero exit), restart-scoped
+# so the copy stays accurate.
+RESTART_ERROR = t("restart_error")
+# dec-094: success-path immediate ack (owner-approved copy 2026-08-21). Fires
+# once the launch subprocess returns 0, BEFORE the detached worker's SIGTERM
+# (~6s later) -- distinct from the completion push self_restart.sh owns.
+RESTART_ACK = t("restart_ack")
+# DGN-1010 layer-2 backstop terminal-close notice: sent by the NEW bridge only
+# when the self_restart.sh worker died before its own terminal push (pending
+# marker unclaimed + worker pid dead). Copy status: 미확정 (형님 확인 대기).
+RESTART_BACKSTOP_NOTICE = t("restart_backstop_notice")
+
 
 # --- Transient countdown (DGN-594) ---
 COUNTDOWN_BODY = t("countdown_body")
 COUNTDOWN_DONE = t("countdown_done")
+# DGN-915: button label on the completion affordance (inline keyboard).
+COUNTDOWN_DONE_BUTTON = t("countdown_done_button")
 
 # --- Slash command usage ---
 USAGE_SKILL = t("usage_skill")
 USAGE_COMMAND = t("usage_command")
 
-# --- Inbound photo / document prompts (model-facing, English only) ---
-PHOTO_PROMPT_SINGLE = (
-    "User sent a photo. Read the image file at the path below, then respond."
-)
-PHOTO_PROMPT_PATH = "Image path: {path}"
-PHOTO_PROMPT_ALBUM = (
-    "User sent {count} photos as one album. Read ALL image files at the paths "
-    "below, consider them together, answer in ONE response."
-)
-PHOTO_PROMPT_ALBUM_PATH = "Image {index} path: {path}"
-DOC_PROMPT = (
-    "User sent a file. Read the file at the path below, then respond."
-)
-DOC_PROMPT_PATH = "File path: {path}"
-USER_CAPTION = "User caption: {caption}"
+# --- Inbound photo / document prompts (sent to Claude) ---
+PHOTO_PROMPT_SINGLE = t("photo_prompt_single")
+PHOTO_PROMPT_PATH = t("photo_prompt_path")
+PHOTO_PROMPT_ALBUM = t("photo_prompt_album")
+PHOTO_PROMPT_ALBUM_PATH = t("photo_prompt_album_path")
+DOC_PROMPT = t("doc_prompt")
+DOC_PROMPT_PATH = t("doc_prompt_path")
+USER_CAPTION = t("user_caption")
 
 # --- Resume (session history) ---
 NO_SESSION_HISTORY = t("no_session_history")
@@ -97,12 +136,11 @@ RESUME_HINT = t("resume_hint")
 RESUME_SWITCHED = t("resume_switched")
 RESUME_INVALID_NUMBER = t("resume_invalid_number")
 
-# --- History ---
-NO_HISTORY = t("no_history")
-HISTORY_HEADER = t("history_header")
-
 # --- Queue / overflow ---
 QUEUE_BUSY = t("queue_busy")
+
+# --- /queue command (DGN-911) ---
+QUEUE_USAGE = t("queue_usage")
 
 # --- Options keyboard ---
 SELECT_PROMPT = t("select_prompt")
@@ -115,6 +153,11 @@ EXTERNAL_FILE_CANCEL = t("external_file_cancel")
 EXTERNAL_FILE_CANCELLED = t("external_file_cancelled")
 EXTERNAL_FILE_NONE = t("external_file_none")
 EXTERNAL_FILE_CONFIRMED = t("external_file_confirmed")
+# DGN-966 verification round: non-interactive rail (fast-path/proactive, no
+# live message to answer an Allow/Deny tap) -- log + plain notice, no button.
+# Copy approved by owner 2026-08-21 (dec-094 gate passed; "작업 폴더(PROJECT_ROOT)"
+# dual-notation per owner instruction -- plain term first, internal token in parens).
+EXTERNAL_FILE_OMITTED_NONINTERACTIVE = t("external_file_omitted_noninteractive")
 
 # --- Timeout / resume (A4) ---
 TIMEOUT_PAUSED = t("timeout_paused")
@@ -126,12 +169,8 @@ RESUME_CONTINUING = t("resume_continuing")
 STILL_WORKING = t("still_working")
 RESUME_FAILED = t("resume_failed")
 
-# A4 continuation prompt re-issued to Claude on resume (model-facing).
-RESUME_CONTINUATION_PROMPT = (
-    "Previous task was cut off by a time limit. Continue from where it "
-    "stopped. Do NOT start over. Skip parts already done, finish only the "
-    "remaining work."
-)
+# A4 continuation prompt re-issued to Claude on resume.
+RESUME_CONTINUATION_PROMPT = t("resume_continuation_prompt")
 
 # --- Voice ---
 VOICE_TOO_LONG = t("voice_too_long")
@@ -149,52 +188,64 @@ PROCESSING_FAILED = t("processing_failed")
 GENERIC_ERROR = t("generic_error")
 NETWORK_TIMEOUT = t("network_timeout")
 
+# --- DGN-686: is_error result notices (LOCKED user-facing copy) ---
+# Shown INSTEAD of the raw English failure detail (which goes to stderr only).
+# TRANSIENT/GENERIC pair with a [retry] button; AUTH offers no retry.
+ERROR_TRANSIENT_RETRY = t("error_transient_retry")
+ERROR_AUTH_RELOGIN = t("error_auth_relogin")
+ERROR_GENERIC_RETRY = t("error_generic_retry")
+ERROR_RETRY_BUTTON = t("error_retry_button")
+ERROR_RETRYING = t("error_retrying")
+ERROR_RETRY_EXPIRED = t("error_retry_expired")
+
 # --- File send failure (send_file:: retry exhausted) ---
+# DGN-649: reason-specific variants -- SEND_FILE_FAILED keeps the network
+# wording and now fires only for network-classified failures.
 SEND_FILE_FAILED = t("send_file_failed")
+SEND_FILE_FAILED_DIMENSIONS = t("send_file_failed_dimensions")
+SEND_FILE_FAILED_TOO_LARGE = t("send_file_failed_too_large")
+SEND_FILE_FAILED_API = t("send_file_failed_api")
 
 # --- Outage / failure notices ---
-OUTAGE_RECOVERED = t("outage_recovered")
+# (OUTAGE_RECOVERED removed by DGN-851 -- the recovery push was disabled per
+#  owner request 2026-06-30, so the constant was dead weight. See
+#  bot._notify_outage_recovered.)
 PROACTIVE_TURN_FAILED = t("proactive_turn_failed")
+# DGN-1209: machine-line gate owner alert (placeholder copy -- owner
+# confirmation pending; see machine_gate.format_alert_text).
+MACHINE_LINE_ALERT = t("machine_line_alert")
+MACHINE_LINE_ALERT_UNDECLARED = t("machine_line_alert_undeclared")
 
-# --- System prompt fragment (model-facing, English only) ---
-SYSTEM_PROMPT = (
-    "\n\n## User Questions and Choices\n\n"
-    "The AskUserQuestion tool is NOT available in this environment. "
-    "When you need to ask the user a question with multiple choice options:\n"
-    "1. Output the question and context clearly\n"
-    "2. List options with numbers (1., 2., 3., ...)\n"
-    "3. STOP and WAIT for the user's response\n"
-    "4. Do NOT continue execution or make assumptions\n"
-    "5. Do NOT try to use the AskUserQuestion tool\n\n"
-    "## Sending Images and Files\n\n"
-    "When the user asks you to send/show/deliver an image or file, do NOT read it "
-    "with the Read tool. Instead, output a line that starts with 'send_file::' "
-    "followed by the absolute path. One file per line. The system detects these "
-    "lines and sends the files to the user.\n"
-    "Example: send_file:: /path/to/image.png\n"
-    "Supported image formats: .png, .jpg, .jpeg, .gif, .webp; other files are sent "
-    "as documents. After generating a file, always include its send_file:: line.\n\n"
-    "## Subagent Task Delegation (DGN-086)\n\n"
-    "When you delegate work using the Task tool, the subagent prompt MUST include "
-    "this line verbatim at the top:\n"
-    "\"You are the direct executor of this task. You MUST perform the work "
-    "yourself using the available tools. Do NOT delegate, defer, or report that "
-    "you are waiting for another agent. Do NOT output placeholder messages like "
-    "'working in background' or 'waiting for completion'. Complete the task "
-    "directly and output the result.\"\n"
-    "If a subagent returns a placeholder response (e.g. 'still working', "
-    "'waiting for completion notice', 'background agent running') instead of "
-    "actual results, that is a flake. Send a follow-up message telling it: "
-    "\"You are the executor. Do not delegate. Execute the task directly now "
-    "and output the result.\""
-)
+# --- Subagent placeholder-flake recovery (DGN-670) ---
+# FLAKE_RETRY_PREFIX is model-facing (English on purpose); the bridge appends
+# the original user message verbatim. FLAKE_RECOVERY_FAILED is the user-facing
+# notice when the single retry also failed.
+FLAKE_RETRY_PREFIX = t("flake_retry_prefix")
+FLAKE_RECOVERY_FAILED = t("flake_recovery_failed")
 
-# DGN-699: appended to SYSTEM_PROMPT ONLY when effective interim mode is
-# "fold". Other modes (suppress/inline/off) must not receive this fragment
-# because the premise ("you emitted progress the user already saw live") is
-# false for them. Call site: sdk_bridge._create_user_stream() opts assembly.
+# --- Turn-death safety net (DGN-163) ---
+# A consumed inbound update must never yield zero user-visible output: any
+# exception between "update accepted" and the first reply routes through these.
+TURN_FAILED = t("turn_failed")
+TURN_FAILED_PHOTO = t("turn_failed_photo")
+TURN_FAILED_DOCUMENT = t("turn_failed_document")
+TURN_FAILED_VOICE = t("turn_failed_voice")
+TURN_INCOMPLETE = t("turn_incomplete")
+
+# --- Fast-path interceptor (DGN-801) ---
+# Death-notice when an exit-0 handler push failed after retries: state is
+# committed, only the screen update was lost -- never re-fed to the model.
+FASTPATH_PUSH_FAILED = t("fastpath_push_failed")
+
+# --- System prompt fragment (sent to Claude, English on purpose) ---
+SYSTEM_PROMPT = t("system_prompt")
+
+# DGN-699 FATAL-1: fold-mode register split, appended to the system prompt by
+# sdk_bridge._compose_system_prompt() ONLY when the effective interim mode is
+# "fold" -- other modes must never receive the "user already saw your
+# progress" premise. Model-facing, English on purpose, not i18n.
 SYSTEM_PROMPT_FOLD_FRAGMENT = (
-    "\n\n## Progress Narration vs Final Answer (DGN-699)\n\n"
+    "\n\n## Progress Narration vs Final Answer\n\n"
     "The interim text you emit BETWEEN tool calls is shown to the user "
     "live as a progress log (a collapsible quote bubble), and your final "
     "end-of-turn message is delivered separately below it. Treat them as "
@@ -205,27 +256,19 @@ SYSTEM_PROMPT_FOLD_FRAGMENT = (
     "already seen it."
 )
 
+# DGN-429 hybrid leg 1: output-language rule template appended to the system
+# prompt by sdk_bridge._compose_system_prompt(). Carries a {language}
+# placeholder (human locale name), formatted at compose time so the rule
+# always reflects the live config.locale value.
+OUTPUT_LANG_PROMPT_TEMPLATE = t("output_lang_prompt")
+
 # Denial message returned to Claude when it tries AskUserQuestion.
-ASK_USER_QUESTION_DENY = (
-    "AskUserQuestion is not available in this environment. "
-    "Do NOT mention this to the user. Instead, output the question followed by "
-    "numbered options (1., 2., 3., ...), then STOP and WAIT for the user's choice. "
-    "The system converts the numbered options into clickable buttons."
-)
+ASK_USER_QUESTION_DENY = t("ask_user_question_deny")
 
 # Denial message returned to Claude when an out-of-root path is detected.
-OUTSIDE_PATH_DENY = (
-    "Detected access to paths outside PROJECT_ROOT. Requires confirmation.\n"
-    "{preview}\n"
-    "Output these two options to the user and wait for a reply:\n"
-    "1. {allow_token} (Allow this external path access)\n"
-    "2. {deny_token} (Deny)"
-)
+OUTSIDE_PATH_DENY = t("outside_path_deny")
 
 # Denial returned to Claude for a protected/out-of-root path on a no-pending
 # (background/proactive) turn, where no interactive confirm is possible.
-OUTSIDE_PATH_DENY_NO_CONFIRM = (
-    "Access to a protected or out-of-root path was denied. This is a "
-    "background turn with no user available to confirm it. Skip this path or "
-    "ask the user directly in their next message."
-)
+OUTSIDE_PATH_DENY_NO_CONFIRM = t("outside_path_deny_no_confirm")
+

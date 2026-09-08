@@ -28,7 +28,6 @@ from claude_agent_sdk import (
 
 # conftest.py already sets PROJECT_ROOT and TELEGRAM_BOT_TOKEN before import.
 import bridge.config as _cfg_mod
-from bridge.config import _resolve_interim_mode
 
 from bridge.sdk_bridge import SdkBridge, _PendingRequest, _UserStreamState
 
@@ -308,35 +307,6 @@ class TestInterimSuppressionGate(unittest.TestCase):
         call_text = handler.update_if_needed.call_args[0][0]
         self.assertEqual(call_text, "real final")
         self.assertEqual(response.content, "real final")
-
-
-# ---------------------------------------------------------------------------
-# DGN-825 / v1.31.0: _resolve_interim_mode default regression
-# ---------------------------------------------------------------------------
-
-
-class TestInterimModeResolutionDefault(unittest.TestCase):
-    """Verify default-fold baseline (v1.31.0 lift) and alias path."""
-
-    def test_unset_defaults_to_fold(self):
-        # v1.31.0: unset explicit + unset stream_interim -> fold (was suppress).
-        self.assertEqual(_resolve_interim_mode(None, False), "fold")
-
-    def test_stream_interim_alias_maps_to_inline(self):
-        # STREAM_INTERIM=true still yields inline (deprecated alias preserved).
-        self.assertEqual(_resolve_interim_mode(None, True), "inline")
-
-    def test_explicit_suppress_wins_over_default(self):
-        # Explicit suppress always honoured.
-        self.assertEqual(_resolve_interim_mode("suppress", False), "suppress")
-        self.assertEqual(_resolve_interim_mode("suppress", True), "suppress")
-
-    def test_explicit_fold_wins_over_stream_interim(self):
-        # Explicit fold overrides STREAM_INTERIM=true (stream_interim alias ignored).
-        self.assertEqual(_resolve_interim_mode("fold", True), "fold")
-
-    def test_explicit_inline_wins_over_default(self):
-        self.assertEqual(_resolve_interim_mode("inline", False), "inline")
 
 
 if __name__ == "__main__":

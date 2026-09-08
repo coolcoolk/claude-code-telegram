@@ -21,8 +21,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-
 if importlib.util.find_spec("telegram") is None:
     sys.modules.setdefault("telegram", MagicMock())
 
@@ -232,7 +230,6 @@ def test_reply_rejection_falls_back_to_plain_send():
     assert "answer survives rejection" in sent[0]["text"]
 
 
-@pytest.mark.skip(reason="DGN-376 HTML-finalize send path not present in this bridge variant")
 def test_streamed_link_deletes_draft_and_resends_linked():
     bot_mod = _load_bot()
     bot = _make_bot(bot_mod, last_incoming={42: 101})
@@ -250,7 +247,6 @@ def test_streamed_link_deletes_draft_and_resends_linked():
     assert "<b>answer</b>" in sent[0]["text"]
 
 
-@pytest.mark.skip(reason="DGN-376 HTML-finalize send path not present in this bridge variant")
 def test_streamed_plain_keeps_edit_in_place():
     bot_mod = _load_bot()
     bot = _make_bot(bot_mod, last_incoming={42: 100})

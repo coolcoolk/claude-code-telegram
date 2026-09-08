@@ -14,6 +14,8 @@ Covers:
   confirm the grown fold (collapse + locked caption), never delete it.
 - D8 lazy creation: short turns never open a bubble and keep the DGN-682
   finalize-time compose fallback.
+- DGN-777 final-sacred: the final answer keeps every word, always; overlap
+  is subtracted from the FOLD (_subtract_paras), never from the answer.
 """
 
 import asyncio
@@ -131,11 +133,23 @@ class TestFoldRender(unittest.TestCase):
         )
 
     def test_locked_caption_copy(self):
-        # Spec LOCK (owner A-case 2026-08-02): do not drift.
-        self.assertEqual(FOLD_CAPTION_NORMAL, "진행 기록")
-        self.assertEqual(FOLD_CAPTION_STOPPED, "중단됨 · 진행 기록")
-        self.assertEqual(FOLD_CAPTION_TIMEOUT, "시간 초과 · 진행 기록")
-        self.assertEqual(FOLD_TRUNCATION_LINE, "…(생략)")
+        # Spec LOCK (owner A-case 2026-08-02): do not drift. DGN-851 moved
+        # the caption TEXT to the bridge i18n catalogs; the ko catalog
+        # carries the locked copy, and the module constants must bind
+        # through the catalogs (active locale, en fallback) -- never
+        # diverge from both.
+        from bridge.i18n import en, ko
+        self.assertEqual(ko.STRINGS["fold_caption_normal"], "진행 기록")
+        self.assertEqual(ko.STRINGS["fold_caption_stopped"], "중단됨 · 진행 기록")
+        self.assertEqual(ko.STRINGS["fold_caption_timeout"], "시간 초과 · 진행 기록")
+        self.assertEqual(ko.STRINGS["fold_truncation_line"], "…(생략)")
+        for key, const in (
+            ("fold_caption_normal", FOLD_CAPTION_NORMAL),
+            ("fold_caption_stopped", FOLD_CAPTION_STOPPED),
+            ("fold_caption_timeout", FOLD_CAPTION_TIMEOUT),
+            ("fold_truncation_line", FOLD_TRUNCATION_LINE),
+        ):
+            self.assertIn(const, (ko.STRINGS[key], en.STRINGS[key]))
 
     def test_html_escaping(self):
         html = render_fold_live(["a <tag> & stuff"])
@@ -203,29 +217,225 @@ class TestDedupBackstop(unittest.TestCase):
         self.assertEqual(SdkBridge._dedup_final_against_interim("x", []), "x")
 
 
-class TestFinalFullyInInterim(unittest.TestCase):
-    """Owner 2026-08-02 (option 1): full-overlap predicate behind fold delete."""
+class TestSubtractParas(unittest.TestCase):
+    """DGN-777 final-sacred: overlap is subtracted from the FOLD, not the
+    answer -- pure helper contract."""
 
-    def test_all_paragraphs_present_is_full_dup(self):
-        self.assertTrue(
-            SdkBridge._final_fully_in_interim("A\n\nB", ["A", "B"])
+    def test_partial_overlap_removes_only_matching_entries(self):
+        out = SdkBridge._subtract_paras(
+            ["I did step A", "I did step B"], "I did step A\n\nFinal answer"
         )
+        self.assertEqual(out, ["I did step B"])
 
-    def test_partial_overlap_is_not_full_dup(self):
-        self.assertFalse(
-            SdkBridge._final_fully_in_interim("A\n\nFinal answer", ["A", "B"])
+    def test_multi_paragraph_entry_split_and_rejoined(self):
+        # A single fold entry may hold several paragraphs: only the
+        # overlapping paragraph is dropped, the rest re-join in order.
+        out = SdkBridge._subtract_paras(
+            ["P1\n\nP2\n\nP3"], "P2\n\nFinal answer"
         )
+        self.assertEqual(out, ["P1\n\nP3"])
 
-    def test_no_interim_is_false(self):
-        self.assertFalse(SdkBridge._final_fully_in_interim("A", []))
+    def test_no_overlap_unchanged(self):
+        fold = ["step one", "step two"]
+        out = SdkBridge._subtract_paras(fold, "Completely new answer")
+        self.assertEqual(out, ["step one", "step two"])
 
-    def test_empty_content_is_false(self):
-        self.assertFalse(SdkBridge._final_fully_in_interim("", ["A"]))
+    def test_all_overlap_returns_empty_list(self):
+        out = SdkBridge._subtract_paras(["A", "B"], "A\n\nB\n\nC")
+        self.assertEqual(out, [])
 
     def test_normalized_whitespace_match(self):
-        self.assertTrue(
-            SdkBridge._final_fully_in_interim("A  did\nstep", ["A did step"])
+        out = SdkBridge._subtract_paras(
+            ["I  did\nstep A", "other"], "I did step A\n\nRest"
         )
+        self.assertEqual(out, ["other"])
+
+    def test_containment_never_removes(self):
+        # Fold paragraph is a SUBSTRING of a final paragraph: must stay
+        # (normalized FULL-paragraph match only, same as the dedup helpers).
+        out = SdkBridge._subtract_paras(
+            ["step A"], "I did step A and then step B"
+        )
+        self.assertEqual(out, ["step A"])
+
+    def test_empty_final_passthrough(self):
+        fold = ["step one"]
+        self.assertEqual(SdkBridge._subtract_paras(fold, ""), fold)
+
+    def test_empty_fold_passthrough(self):
+        self.assertEqual(SdkBridge._subtract_paras([], "answer"), [])
+
+    def test_order_preserved(self):
+        out = SdkBridge._subtract_paras(
+            ["one", "dup", "two", "three"], "dup\n\nanswer"
+        )
+        self.assertEqual(out, ["one", "two", "three"])
+
+
+# ---------------------------------------------------------------------------
+# DGN-876: superset fold trim -- extra progress paragraphs survive
+# ---------------------------------------------------------------------------
+
+
+class TestDgn876FoldTrim(unittest.TestCase):
+    """DGN-876: _subtract_paras unification removes the full-dup fast-path.
+    Extra (non-duplicated) progress paragraphs must survive even when the
+    final answer fully duplicates the narrated subset."""
+
+    def _run(self, messages_seq, fold_interval: float = 0.0, bot=None):
+        async def _inner():
+            handler = _mock_handler(bot=bot)
+            bridge_obj = SdkBridge()
+            req = _make_pending_req(streaming_handler=handler)
+            state = _UserStreamState(client=MagicMock(), model=None)
+            state.pending.append(req)
+            req.sent = True
+
+            async def fake_receive():
+                for m in messages_seq:
+                    yield m
+
+            state.client.receive_messages = fake_receive
+            bridge_obj._streams[1] = state
+
+            with patch("bridge.sdk_bridge.INTERIM_MODE", "fold"), patch(
+                "bridge.sdk_bridge.FOLD_UPDATE_INTERVAL", fold_interval
+            ):
+                await bridge_obj._reader_loop(1, state)
+
+            result = await asyncio.wait_for(req.future, timeout=1.0)
+            return result, handler, req
+
+        return asyncio.run(_inner())
+
+    # (A) interim == final -> fold DELETED (grown path)
+    def test_a_grown_full_dup_deletes_fold(self):
+        whole = "I did step A\n\nI did step B"
+        msgs = [
+            _make_assistant_msg("tool_use", [TextBlock(text="I did step A")]),
+            _make_assistant_msg("tool_use", [TextBlock(text="I did step B")]),
+            _make_assistant_msg("end_turn", [TextBlock(text=whole)]),
+            _make_result_msg(result=""),
+        ]
+        response, handler, req = self._run(msgs)
+        handler.bot.delete_message.assert_awaited_once()
+        self.assertTrue(req.fold_finalized)
+        self.assertEqual(response.content, whole)
+
+    # (A) interim == final -> live bubble opened, then emptied -> deleted
+    # (DGN-930 1st-interim gate; was the compose no-fold path).
+    def test_a_single_interim_full_dup_deletes_bubble(self):
+        whole = "step one"
+        msgs = [
+            _make_assistant_msg("tool_use", [TextBlock(text=whole)]),
+            _make_assistant_msg("end_turn", [TextBlock(text=whole)]),
+            _make_result_msg(result=""),
+        ]
+        response, handler, req = self._run(msgs)
+        handler.bot.send_message.assert_awaited_once()
+        handler.bot.delete_message.assert_awaited_once()
+        self.assertTrue(req.fold_finalized)
+        self.assertNotIn(">!", response.content)
+        self.assertEqual(response.content, whole)
+
+    # (B) interim STRICT SUPERSET of final -> fold KEPT with extra paragraphs
+    # (grown bubble path -- the DGN-876 bug fix)
+    def test_b_grown_superset_keeps_extra_progress_para(self):
+        # Interim has: "extra progress para" + "final para A".
+        # Final answer is only: "final para A" + "final para B".
+        # Old behavior: _final_fully_in_interim returns False (not fully in),
+        #   then _subtract_paras removes "final para A" -> fold has "extra progress para".
+        # Also correct after fix. But the true bug: interim narrated "extra progress para"
+        # AND "final para A" AND "final para B" -- all of final IS in interim.
+        # Old code: _final_fully_in_interim=True -> delete entire fold (BUG).
+        # New code: _subtract_paras removes A+B -> fold keeps "extra progress para".
+        msgs = [
+            _make_assistant_msg("tool_use", [TextBlock(text="extra progress para")]),
+            _make_assistant_msg("tool_use", [TextBlock(text="final para A")]),
+            _make_assistant_msg("tool_use", [TextBlock(text="final para B")]),
+            _make_assistant_msg(
+                "end_turn",
+                [TextBlock(text="final para A\n\nfinal para B")],
+            ),
+            _make_result_msg(result=""),
+        ]
+        response, handler, req = self._run(msgs)
+        # Fold must NOT be deleted -- extra progress para survives.
+        handler.bot.delete_message.assert_not_called()
+        # "extra progress para" must be in the surviving fold_buf.
+        self.assertIn("extra progress para", req.fold_buf)
+        # Final paragraphs subtracted from fold.
+        combined_fold = " ".join(req.fold_buf)
+        self.assertNotIn("final para A", combined_fold)
+        self.assertNotIn("final para B", combined_fold)
+        # Answer untouched.
+        self.assertEqual(response.content, "final para A\n\nfinal para B")
+        # No new send_message beyond the fold bubble itself.
+        # (Only one send for fold creation, no extra Telegram message for the trim.)
+        self.assertEqual(handler.bot.send_message.await_count, 1)
+
+    # (B) DGN-930 1st-interim gate: single interim superset of final -> live
+    # bubble opened; survivor kept in the GROWN fold (not compose-prepended).
+    def test_b_single_interim_superset_keeps_survivor_in_grown_fold(self):
+        # Interim: "extra step\n\nfinal answer" (superset).
+        # Final: "final answer".
+        # After subtract: "extra step" survives -> grown fold confirmed.
+        msgs = [
+            _make_assistant_msg(
+                "tool_use",
+                [TextBlock(text="extra step\n\nfinal answer")],
+            ),
+            _make_assistant_msg("end_turn", [TextBlock(text="final answer")]),
+            _make_result_msg(result=""),
+        ]
+        response, handler, req = self._run(msgs)
+        handler.bot.send_message.assert_awaited_once()
+        handler.bot.delete_message.assert_not_called()
+        # Final answer stands alone, not duplicated, no compose fold prepended.
+        self.assertEqual(response.content, "final answer")
+        self.assertNotIn(">!", response.content)
+        # Grown fold keeps the extra step, overlap subtracted.
+        self.assertEqual(req.fold_buf, ["extra step"])
+        final_html = _edit_texts(handler.bot)[-1]
+        self.assertIn("extra step", final_html)
+
+    # (C) partial overlap -> trim behaves as before (unchanged)
+    def test_c_partial_overlap_trims_correctly_grown(self):
+        msgs = [
+            _make_assistant_msg("tool_use", [TextBlock(text="I did step A")]),
+            _make_assistant_msg("tool_use", [TextBlock(text="I did step B")]),
+            _make_assistant_msg(
+                "end_turn",
+                [TextBlock(text="I did step A\n\nFinal answer here")],
+            ),
+            _make_result_msg(result=""),
+        ]
+        response, handler, req = self._run(msgs)
+        # Answer untouched.
+        self.assertEqual(response.content, "I did step A\n\nFinal answer here")
+        # Fold kept: step B survives, step A subtracted.
+        handler.bot.delete_message.assert_not_called()
+        self.assertEqual(req.fold_buf, ["I did step B"])
+
+    # DGN-832 Notification-0: trim-and-keep path sends NO new Telegram message.
+    # On the trim-and-keep path only edit_message_text (finalize) is called,
+    # never a second send_message.
+    def test_notification0_trim_and_keep_no_new_send(self):
+        msgs = [
+            _make_assistant_msg("tool_use", [TextBlock(text="extra progress para")]),
+            _make_assistant_msg("tool_use", [TextBlock(text="final para A")]),
+            _make_assistant_msg("tool_use", [TextBlock(text="final para B")]),
+            _make_assistant_msg(
+                "end_turn",
+                [TextBlock(text="final para A\n\nfinal para B")],
+            ),
+            _make_result_msg(result=""),
+        ]
+        response, handler, req = self._run(msgs)
+        # Only the fold bubble creation send -- no additional message for trim.
+        self.assertEqual(handler.bot.send_message.await_count, 1)
+        # Final answer delivered without a new send (goes through future.set_result).
+        self.assertEqual(response.content, "final para A\n\nfinal para B")
 
 
 # ---------------------------------------------------------------------------
@@ -262,43 +472,83 @@ class TestGrowingFoldReaderLoop(unittest.TestCase):
 
         return asyncio.run(_inner())
 
-    def test_d8_single_short_interim_no_bubble_compose_fallback(self):
+    def test_dgn930_single_interim_opens_live_bubble(self):
+        # DGN-930: the creation gate is now the 1st interim (live-then-fold),
+        # so a single interim block opens the live progress bubble instead of
+        # falling through to the finalize-time compose fallback. The final
+        # answer is a separate message; the fold bubble confirms with the
+        # locked caption.
         msgs = [
             _make_assistant_msg("tool_use", [TextBlock(text="step one")]),
             _make_assistant_msg("end_turn", [TextBlock(text="final answer")]),
             _make_result_msg(result="final answer"),
         ]
         response, handler, req = self._run(msgs)
-        handler.bot.send_message.assert_not_awaited()  # no fold bubble opened
-        self.assertIsNone(req.fold_msg_id)
-        # DGN-682 finalize-time compose fallback still applies.
-        self.assertTrue(response.content.startswith(">! step one"))
-        self.assertIn("final answer", response.content)
+        handler.bot.send_message.assert_awaited_once()  # live bubble opened
+        self.assertEqual(req.fold_msg_id, 777)
+        # Final answer stands alone -- no compose fold prepended (D4).
+        self.assertEqual(response.content, "final answer")
+        self.assertNotIn(">!", response.content)
+        self.assertNotIn(777, response.draft_message_ids)
+        # Fold confirmed with the normal caption + collapse.
+        final_html = _edit_texts(handler.bot)[-1]
+        self.assertTrue(
+            final_html.startswith("<blockquote expandable>" + FOLD_CAPTION_NORMAL)
+        )
 
-    def test_dgn710_compose_fallback_partial_dup_trimmed(self):
-        # DGN-710: opening streamed as a non-terminal chunk (captured as
-        # interim), then the end_turn body re-included it. The compose
-        # fallback must trim the duplicated opening from the body so it is
-        # NOT shown twice (once in the fold, once in the body).
+    def test_dgn930_partial_dup_body_kept_whole_fold_emptied_deletes(self):
+        # DGN-710 + DGN-777 final-sacred, under the DGN-930 1st-interim gate:
+        # the opening streams as a live bubble, then the end_turn body
+        # re-includes it. The body keeps every word; the duplicated opening is
+        # subtracted from the FOLD. Here the capture holds nothing else, so the
+        # emptied fold bubble is DELETED and the clean body stands alone.
         opening = "확인됐습니다 -- 배선이 살아있다는 첫 실증입니다."
+        final_body = opening + "\n\n두 건이 진행 중입니다."
         msgs = [
             _make_assistant_msg("tool_use", [TextBlock(text=opening)]),
+            _make_assistant_msg("end_turn", [TextBlock(text=final_body)]),
+            _make_result_msg(result=""),
+        ]
+        response, handler, req = self._run(msgs)
+        # Live bubble opened then emptied by subtraction -> deleted.
+        handler.bot.send_message.assert_awaited_once()
+        handler.bot.delete_message.assert_awaited_once()
+        self.assertTrue(req.fold_finalized)
+        # Opening appears exactly once, in the WHOLE body -- never trimmed.
+        self.assertEqual(response.content.count(opening), 1)
+        self.assertNotIn(">!", response.content)
+        self.assertEqual(response.content, final_body)
+
+    def test_dgn930_single_interim_two_paras_keeps_nonoverlap_in_grown_fold(self):
+        # DGN-777 under the DGN-930 1st-interim gate: the single interim block
+        # holds an overlapping AND a non-overlapping paragraph. It opens a live
+        # bubble; at finalize the overlap is subtracted, the survivor stays in
+        # the GROWN fold (confirmed, not compose-prepended), the body is whole.
+        msgs = [
             _make_assistant_msg(
-                "end_turn", [TextBlock(text=opening + "\n\n스컬이 두 건을 물고 있습니다.")]
+                "tool_use", [TextBlock(text="P1 shared para\n\nP2 fold only")]
+            ),
+            _make_assistant_msg(
+                "end_turn", [TextBlock(text="P1 shared para\n\nP3 new answer")]
             ),
             _make_result_msg(result=""),
         ]
         response, handler, req = self._run(msgs)
-        self.assertIsNone(req.fold_msg_id)
-        # Opening appears exactly once (inside the fold), never repeated in body.
-        self.assertEqual(response.content.count(opening), 1)
-        self.assertTrue(response.content.startswith(">! " + opening))
-        self.assertIn("스컬이 두 건을", response.content)
+        handler.bot.send_message.assert_awaited_once()  # live bubble opened
+        handler.bot.delete_message.assert_not_called()  # survivor kept
+        # Body whole: both final paragraphs intact, no compose fold prepended.
+        self.assertEqual(response.content, "P1 shared para\n\nP3 new answer")
+        self.assertNotIn(">!", response.content)
+        # Grown fold holds ONLY the non-overlapping paragraph; shared subtracted.
+        self.assertEqual(req.fold_buf, ["P2 fold only"])
+        final_html = _edit_texts(handler.bot)[-1]
+        self.assertIn("P2 fold only", final_html)
+        self.assertNotIn("P1 shared para", final_html)
 
-    def test_dgn710_compose_fallback_full_dup_drops_fold(self):
-        # DGN-710: when the whole final body already sits in the captured
-        # interim, no fold is attached -- the clean final stands alone
-        # (symmetric with the grown-bubble full-dup delete).
+    def test_dgn930_single_interim_full_dup_deletes_fold(self):
+        # DGN-710 under the DGN-930 1st-interim gate: when the whole final body
+        # already sits in the single interim, the live bubble opens then is
+        # emptied by subtraction -> deleted; the clean final stands alone.
         whole = "확인됐습니다 -- 첫 실증입니다."
         msgs = [
             _make_assistant_msg("tool_use", [TextBlock(text=whole)]),
@@ -306,7 +556,9 @@ class TestGrowingFoldReaderLoop(unittest.TestCase):
             _make_result_msg(result=""),
         ]
         response, handler, req = self._run(msgs)
-        self.assertIsNone(req.fold_msg_id)
+        handler.bot.send_message.assert_awaited_once()
+        handler.bot.delete_message.assert_awaited_once()
+        self.assertTrue(req.fold_finalized)
         self.assertNotIn(">!", response.content)  # no fold prepended
         self.assertEqual(response.content, whole)
 
@@ -360,15 +612,22 @@ class TestGrowingFoldReaderLoop(unittest.TestCase):
             _make_result_msg(result="done"),
         ]
         response, handler, req = self._run(msgs, fold_interval=0.0)
-        # One live growth edit (3rd interim) + one finalize swap.
-        self.assertEqual(handler.bot.edit_message_text.await_count, 2)
+        # DGN-930: bubble created on the 1st interim, so the 2nd and 3rd interim
+        # each land a live growth edit + one finalize swap = 3 edits (was 2
+        # under the old 2nd-interim creation gate).
+        self.assertEqual(handler.bot.edit_message_text.await_count, 3)
         live_html = _edit_texts(handler.bot)[0]
         # Owner 2026-08-02: live growth edit is plain text (no blockquote).
         self.assertNotIn("<blockquote>", live_html)
         self.assertNotIn("<blockquote expandable>", live_html)
-        self.assertIn("step three", live_html)
+        # The last live edit (index -2, before finalize) carries all 3 steps.
+        pre_finalize = _edit_texts(handler.bot)[-2]
+        self.assertIn("step three", pre_finalize)
 
-    def test_d5_final_body_dedup_on_grown_fold_turn(self):
+    def test_dgn777_partial_overlap_keeps_answer_whole_trims_fold(self):
+        # DGN-777 final-sacred case (a): final = narrated P1 + new P2. The
+        # answer keeps BOTH paragraphs; the fold loses P1 (subtracted) but
+        # keeps its other narration.
         msgs = [
             _make_assistant_msg("tool_use", [TextBlock(text="I did step A")]),
             _make_assistant_msg("tool_use", [TextBlock(text="I did step B")]),
@@ -378,7 +637,61 @@ class TestGrowingFoldReaderLoop(unittest.TestCase):
             _make_result_msg(result=""),
         ]
         response, handler, req = self._run(msgs)
-        self.assertEqual(response.content, "Final answer here")
+        # Answer sacred: every word kept.
+        self.assertEqual(response.content, "I did step A\n\nFinal answer here")
+        # Fold bubble kept (not deleted) and confirmed with the trimmed body.
+        handler.bot.delete_message.assert_not_called()
+        self.assertEqual(req.fold_buf, ["I did step B"])
+        final_html = _edit_texts(handler.bot)[-1]
+        self.assertTrue(
+            final_html.startswith("<blockquote expandable>" + FOLD_CAPTION_NORMAL)
+        )
+        self.assertIn("I did step B", final_html)
+        self.assertNotIn("I did step A", final_html)
+
+    def test_dgn777_no_overlap_final_and_fold_unchanged(self):
+        # DGN-777 case (c): no overlap at all -- answer and fold untouched.
+        msgs = [
+            _make_assistant_msg("tool_use", [TextBlock(text="step one")]),
+            _make_assistant_msg("tool_use", [TextBlock(text="step two")]),
+            _make_assistant_msg(
+                "end_turn", [TextBlock(text="Completely new answer")]
+            ),
+            _make_result_msg(result=""),
+        ]
+        response, handler, req = self._run(msgs)
+        self.assertEqual(response.content, "Completely new answer")
+        handler.bot.delete_message.assert_not_called()
+        self.assertEqual(req.fold_buf, ["step one", "step two"])
+        final_html = _edit_texts(handler.bot)[-1]
+        self.assertIn("step one", final_html)
+        self.assertIn("step two", final_html)
+
+    def test_dgn777_fold_emptied_by_subtraction_deleted(self):
+        # DGN-777 case (d): every fold paragraph reappears in the final (which
+        # also carries NEW material, so _final_fully_in_interim is False).
+        # The trim empties the fold -> the bubble is deleted (no empty fold),
+        # answer fully intact.
+        msgs = [
+            _make_assistant_msg("tool_use", [TextBlock(text="I did step A")]),
+            _make_assistant_msg("tool_use", [TextBlock(text="I did step B")]),
+            _make_assistant_msg(
+                "end_turn",
+                [
+                    TextBlock(
+                        text="I did step A\n\nI did step B\n\nPlus a new conclusion"
+                    )
+                ],
+            ),
+            _make_result_msg(result=""),
+        ]
+        response, handler, req = self._run(msgs)
+        handler.bot.delete_message.assert_awaited_once()
+        self.assertTrue(req.fold_finalized)  # latched -> finalize swap is a no-op
+        self.assertEqual(
+            response.content,
+            "I did step A\n\nI did step B\n\nPlus a new conclusion",
+        )
 
     def test_full_dup_final_deletes_fold(self):
         # Owner 2026-08-02 (option 1): when EVERY final paragraph was already

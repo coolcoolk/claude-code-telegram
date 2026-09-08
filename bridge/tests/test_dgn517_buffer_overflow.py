@@ -25,7 +25,7 @@ from bridge.config import CLAUDE_MAX_BUFFER_SIZE
 
 
 # ---------------------------------------------------------------------------
-# Exact error string observed in Warg logs on 2026-07-20 and 2026-07-21
+# Exact error string observed in live instance logs on 2026-07-20 and 2026-07-21
 # ---------------------------------------------------------------------------
 _OBSERVED_ERROR = (
     "Failed to decode JSON: JSON message exceeded maximum buffer size of 1048576 bytes"
@@ -39,7 +39,7 @@ class TestBufferOverflowRetryable(unittest.TestCase):
     """_is_retryable_sdk_error must classify the buffer overflow as retryable."""
 
     def test_observed_error_string_is_retryable(self):
-        """The exact error from Warg logs must be classified retryable."""
+        """The exact error from live instance logs must be classified retryable."""
         err = Exception(_OBSERVED_ERROR)
         self.assertTrue(
             _is_retryable_sdk_error(err),

@@ -7,6 +7,7 @@ blips (launchd owns crash-restart). Per-user serialized queue (max 3 in-flight,
 
 import asyncio
 import html
+import json
 import logging
 import os
 import re
@@ -15,7 +16,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import telegram.error
 from telegram import (
@@ -39,24 +40,36 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from bridge import heartbeat, messages, model_state
+from bridge import btw as btw_module
+from bridge import ext
+from bridge import fastpath, heartbeat, messages, model_state
+from bridge.i18n import skill_display_name
 from bridge.config import (
     AUTO_RESUME,
     AUTO_RESUME_MAX,
+    BRIDGE_INFLIGHT_DEBOUNCE_S,
+    BRIDGE_INFLIGHT_DEFER_CAP_S,
+    BRIDGE_INFLIGHT_INTERRUPT_NOTICE,
+    PACKAGE_DIR,
     PROCESS_TIMEOUT,
     REPLY_LINK_ENABLED,
     REPLY_LINK_LATENCY_S,
     config,
+    notify_silent,
 )
 from bridge import ownership
 from bridge.formatting import (
+    FOLD_OPEN_MARKER,
     IMAGE_EXTS,
     balance_telegram_html,
     code_segment_html,
+    compose_fold_block,
+    contains_telegram_html,
     html_to_plain_text,
     markdown_to_telegram_html,
     rebalance_html_chunks,
     resolve_send_paths,
+    sanitize_message_for_telegram,
     split_into_segments,
     split_paths_by_scope,
     split_text,
@@ -65,11 +78,31 @@ from bridge.formatting import (
     strip_send_markers,
     strip_toolcall_markup,
 )
+from bridge.machine_gate import (
+    RAIL_CONSUMER,
+    RAIL_MODEL,
+    RAIL_UNKNOWN,
+    MachineLineAlertLedger,
+    apply_machine_line_gate,
+    format_alert_text,
+    set_machine_line_alert_sink,
+    today_key,
+)
 from bridge.health import PollingConflict, PollingRestart, polling_watchdog
+from bridge.image_send import (
+    classify_send_error,
+    downscale_for_photo,
+    photo_send_verdict,
+    probe_image_dimensions,
+)
 from bridge.options import (
     OPTIONS_MARKER,
     build_option_keyboard,
+    extract_marker_labels,
     extract_options,
+    has_options_marker,
+    resolve_choice,
+    strip_consumed_options,
     strip_options_marker,
 )
 from bridge.permissions import (
@@ -82,14 +115,65 @@ from bridge.permissions import (
 from bridge.sdk_bridge import ChatResponse, PROJECT_ROOT, sdk_bridge
 from bridge.session import session_manager
 from bridge.dashboard import DashboardSync
-from bridge.countdown import CountdownDriver
+from bridge.countdown import CDN_DONE_PREFIX, CountdownDriver
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
 logger = logging.getLogger(__name__)
 
+# DGN-919: single source of truth for the slash-command menu.
+# Order here drives BOTH the BotCommand popup menu AND the /help numbered list.
+# Hidden commands must NOT appear here.  Accurate per-command status:
+#   /start     -- CommandHandler registered in _setup_handlers, off-menu.
+#   /usageretry -- CommandHandler registered in _setup_handlers, off-menu.
+#   /claim     -- NO CommandHandler; intercepted by _check_access via the
+#                 MODE_CLAIM ownership path (catch-all _handle_claim_attempt).
+#                 A post-ownership "/claim x" falls through to the catch-all
+#                 MessageHandler and is forwarded to the model as a slash cmd.
+#   kill       -- no handler at all; must not appear anywhere.
+#   /authsync  -- RETIRED (DGN-1050): its file->keychain overwrite re-injected
+#                 superseded refresh tokens after CLI runtime rotations and
+#                 killed the whole estate's auth. A hidden CommandHandler stub
+#                 remains registered (off-menu) solely so a typed /authsync is
+#                 answered with the retirement notice instead of being
+#                 forwarded to the SDK session by the catch-all. It can never
+#                 write credentials. Must NOT reappear in this menu.
+#   /health    -- DGN-986 D1 owner amendment (2026-08-21): "authsync 다음,
+#                 help 앞" (after authsync, before help). authsync was
+#                 retired from this menu by DGN-1050 AFTER D1 was decided,
+#                 so the literal anchor ("after authsync") no longer exists
+#                 in this list -- this merge (DGN-986 integration) places
+#                 health immediately before help, preserving the half of D1
+#                 that is still satisfiable ("help 앞"/before help) and the
+#                 DGN-997/DGN-1050 ordering as landed on main. NOT re-run
+#                 past the owner -- flagged for confirmation.
+COMMAND_MENU_SPEC = [
+    ("new",      lambda: messages.CMD_DESC_NEW),
+    ("stop",     lambda: messages.CMD_DESC_STOP),
+    ("btw",      lambda: messages.CMD_DESC_BTW),
+    ("queue",    lambda: messages.CMD_DESC_QUEUE),
+    ("model",    lambda: messages.CMD_DESC_MODEL),
+    ("skills",   lambda: messages.CMD_DESC_SKILLS),
+    ("resume",   lambda: messages.CMD_DESC_RESUME),
+    # DGN-997: owner-only explicit restart command.
+    ("restart",  lambda: messages.CMD_DESC_RESTART),
+    ("help",     lambda: messages.CMD_DESC_HELP),
+]
+
 STALE_MESSAGE_SECONDS = 20 * 60
+# DGN-616: cap on concurrent turns per user for the CONTROL path only
+# (/stop, /new, /model, opt: and resume: callbacks route through
+# _enqueue_user_task). Regular messages (text/voice/photo/document) are
+# serialized to exactly ONE in-flight turn via the coalescing path; keeping
+# this at 3 lets a control command run immediately even while that turn runs.
 MAX_INFLIGHT_MESSAGES = 3
+# DGN-616: memory-safety cap on the per-user coalescing buffer. Normal usage
+# never approaches this; only a runaway flood past it surfaces a notice.
+COALESCE_MAX = 50
+# DGN-801 (grill M3): retry backoff for the fast-path exit-0 push. State is
+# already committed when this send runs, so the push must be GUARANTEED-ish:
+# len+1 total attempts, then a death-notice -- never a model fallback.
+FASTPATH_PUSH_RETRY_DELAYS = (1.0, 3.0)
 STALE_AUDIO_SECONDS = 24 * 60 * 60
 MIN_UPTIME = 30
 MAX_RAPID_CRASHES = 5
@@ -97,17 +181,17 @@ MAX_RAPID_CRASHES = 5
 CONFLICT_BACKOFF_BASE = 5  # seconds, base backoff before re-initializing polling
 CONFLICT_BACKOFF_MAX = 30  # seconds, cap for incremental backoff
 CONFLICT_SUSTAINED_SECONDS = 300  # log an error if conflict persists past this
-# After this many seconds of unresolved conflict, switch the retry cadence from
-# linear (CONFLICT_BACKOFF_BASE -> CONFLICT_BACKOFF_MAX) to pure exponential
-# starting from CONFLICT_BACKOFF_MAX and doubling up to CONFLICT_BACKOFF_EXPO_CAP.
-# One ERROR line is emitted on the first entry into this mode; subsequent retries
-# are silent until the conflict clears.
+# DGN-330: after this many seconds of unresolved conflict, switch the retry
+# cadence from linear (CONFLICT_BACKOFF_BASE -> CONFLICT_BACKOFF_MAX) to pure
+# exponential starting from CONFLICT_BACKOFF_MAX and doubling up to
+# CONFLICT_BACKOFF_EXPO_CAP. One ERROR line is emitted on the first entry into
+# this mode; subsequent retries are silent until the conflict clears.
 CONFLICT_BACKOFF_EXPONENTIAL_AFTER = 600  # 10 minutes
 CONFLICT_BACKOFF_EXPO_CAP = 300  # 5 minutes, cap for exponential backoff
-# In-process getUpdates heartbeat stall detection (layer 1; layer 2 is the
-# external bridge/watchdog.sh). The heartbeat beats on every getUpdates round
-# trip (success or transport timeout); silence past the threshold means the
-# polling task itself is dead while the process lives (zombie polling).
+# DGN-140: in-process getUpdates heartbeat stall detection (layer 1; layer 2 is
+# the external bridge/watchdog.sh). The heartbeat beats on every getUpdates
+# round trip (success or transport timeout); silence past the threshold means
+# the polling task itself is dead while the process lives (zombie polling).
 HEARTBEAT_STALL_SECONDS = 120  # no poll beat for this long -> restart polling
 STALL_STREAK_RESET_SECONDS = 600  # healthy gap that resets the stall-restart streak
 STALL_STREAK_SUSPECT = 3  # more consecutive stall restarts than this -> CRITICAL log
@@ -115,24 +199,39 @@ STALL_STREAK_SUSPECT = 3  # more consecutive stall restarts than this -> CRITICA
 # media_group_id. Buffer same-group photos for this debounce window, then flush
 # them as a single task. 1.5s >> real album inter-arrival (~100ms), big margin.
 MEDIA_GROUP_DEBOUNCE = 1.5
-# DGN-376: auto link previews are OFF on every outbound text send by default.
-# A reply opts back in with a standalone "link_preview::" line (stripped before
-# sending), which restores Telegram's default preview for that reply's text.
-LINK_PREVIEW_OFF = LinkPreviewOptions(is_disabled=True)
-# Telegram splits a single long message at the 4096-char limit into N separate
-# text updates, delivered back-to-back. A message at/above this length is a
-# split-boundary candidate: buffer it and wait SPLIT_MERGE_WINDOW seconds for the
-# continuation in the same chat, then dispatch all parts as ONE turn. Short
-# messages never enter this path (zero-delay preserved). If a follow-up part is
-# itself boundary-length, the window is extended so 3+ part splits merge too.
-# Accepted false-positive: an unrelated message arriving inside the window after
-# a boundary-length message is merged -- negligible, not defended against.
+# DGN-351: Telegram splits a single long message at the 4096-char limit into N
+# separate text updates, delivered back-to-back. A message at/above this length
+# is a split-boundary candidate: buffer it and wait SPLIT_MERGE_WINDOW seconds
+# for the continuation in the same chat, then dispatch all parts as ONE turn.
+# Short messages never enter this path (zero-delay preserved). If a follow-up
+# part is itself boundary-length, the window is extended so 3+ part splits merge
+# too. Accepted false-positive: an unrelated message arriving inside the window
+# after a boundary-length message is merged -- negligible, not defended against.
 SPLIT_MERGE_THRESHOLD = 4000
 SPLIT_MERGE_WINDOW = 3.0
 # An out-of-root / protected-path one-time approval expires this many seconds
 # after the deny prompt was shown, so a stale grant can never authorize a much
 # later call (F7 hardening).
 OUTSIDE_APPROVAL_TTL = 600  # 10 minutes
+# Restart re-trigger latch window (formerly AUTHSYNC_RESTART_LATCH_S, DGN-994;
+# the /authsync CTA that introduced it is retired per DGN-1050 -- the latch
+# itself is retained for /restart): duplicate /restart triggers inside this
+# window are dropped (restart is already in flight). Window-based (not a
+# sticky flag) so an aborted restart (e.g. smoke-gate exit 4 in the detached
+# worker) cannot leave the command dead until the next process restart.
+RESTART_LATCH_S = 120
+# DGN-1010 layer-2: terminal-state backstop for self_restart.sh. The restart
+# completion push is owned by the detached worker -- a single point of
+# failure (2026-08-22: the worker was reaped with the old bridge's process
+# group and the owner's CTA tap ended in silence). Initial grace covers the
+# worker's normal runway (delay ~6s + poll wait <=60s + push); the poll
+# keeps waiting while the worker is still alive (e.g. a long --verify).
+RESTART_BACKSTOP_INITIAL_S = 90
+RESTART_BACKSTOP_POLL_S = 60
+# DGN-376: auto link previews are OFF on every outbound text send by default.
+# A reply opts back in with a standalone "link_preview::" line (stripped before
+# sending), which restores Telegram's default preview for that reply's text.
+LINK_PREVIEW_OFF = LinkPreviewOptions(is_disabled=True)
 
 _MODEL_LABELS = {
     "sonnet": "Claude Sonnet",
@@ -140,6 +239,10 @@ _MODEL_LABELS = {
     "haiku": "Claude Haiku",
     "fable": "Claude Fable",
 }
+
+# DGN-192: performance ordering for the /model picker -- strongest first.
+# Unknown names sort last (rank 99 in the sort key) alphabetically.
+_MODEL_PERF_RANK = {"fable": 0, "opus": 1, "sonnet": 2, "haiku": 3}
 
 
 def _model_whitelist() -> List[str]:
@@ -187,16 +290,49 @@ class TelegramBot:
         self._user_run_tasks: Dict[int, set[asyncio.Task]] = {}
         self._user_queue_locks: Dict[int, asyncio.Lock] = {}
         self._active_tasks: Dict[int, asyncio.Task] = {}
+        # DGN-616: per-user coalescing buffer. Messages land here in arrival
+        # order and the in-flight turn's done-callback drains the buffer,
+        # merging everything into ONE combined follow-up turn. Control commands
+        # never touch this buffer -- they run immediately via
+        # _enqueue_user_task. Each entry: (text, arrival_ts, update).
+        # DGN-911: this buffer is no longer the DEFAULT in-flight path -- it is
+        # fed by the explicit /queue command and by the debounce-expiry hand-off
+        # below (and it remains the fail-safe landing zone for every path).
+        self._user_pending_texts: Dict[int, List[tuple]] = {}
+        # DGN-911: default in-flight policy = debounce-interrupt. A REGULAR
+        # message (text/voice/photo/document) arriving while a turn is in
+        # flight lands here and (re)arms the per-user debounce timer. On
+        # expiry the buffer moves into _user_pending_texts, the in-flight turn
+        # is soft-interrupted (DGN-581), and the finishing turn's drain path
+        # dispatches the merged messages as ONE new turn. Same entry shape as
+        # _user_pending_texts: (text, arrival_ts, update).
+        self._debounce_texts: Dict[int, List[tuple]] = {}
+        self._debounce_timers: Dict[int, asyncio.Task] = {}
+        # DGN-1016: monotonic timestamp of the FIRST auto-interrupt deferral
+        # of the current in-flight wait (set when a debounce expiry skips the
+        # interrupt because live background tasks exist). Cleared whenever the
+        # wait ends: drain (turn finished), actual interrupt, or /stop. Bounds
+        # the cumulative deferral to BRIDGE_INFLIGHT_DEFER_CAP_S.
+        self._interrupt_deferred_since: Dict[int, float] = {}
         self._audio_dir = config.bot_data_dir / "audio"
         # Inbound photos land here: ephemeral runtime buffer, pruned after 7 days
         # by the cleanup cron. photo input restored.
         self._image_dir = config.bot_data_dir / "images"
         # media_group_id -> buffered album state, flushed as one task.
         self._media_groups: Dict[str, dict] = {}
+        # DGN-1209: the machine-line gate's READER. Unregistered machine-shape
+        # lines that PASS on a consumer/unknown rail become an owner-chat
+        # notice (loud), dedup'd per (rail, token, day) by a durable marker
+        # written only AFTER the notice send succeeded.
+        self._machine_alert_ledger = MachineLineAlertLedger(
+            config.bot_data_dir / "machine-line-alerts"
+        )
+        self._machine_alert_inflight: set[tuple] = set()
+        set_machine_line_alert_sink(self._machine_line_alert_sink)
         self._media_group_lock = asyncio.Lock()
         # chat_id -> buffered split-message state (DGN-351). A boundary-length
-        # (>= SPLIT_MERGE_THRESHOLD) text opens a merge window; continuation parts
-        # in the same chat are concatenated and flushed as one turn.
+        # (>= SPLIT_MERGE_THRESHOLD) text opens a merge window; continuation
+        # parts in the same chat are concatenated and flushed as one turn.
         self._split_buffers: Dict[int, dict] = {}
         self._split_buffer_lock = asyncio.Lock()
         # DGN-555: per-chat newest incoming user message_id, recorded on every
@@ -211,9 +347,19 @@ class TelegramBot:
         self._audio_processor = AudioProcessor(ffmpeg_path=config.ffmpeg_path)
         self._build_transcriber = build_transcriber
         self._transcriber = None
-        # Consecutive heartbeat-stall restart streak (loud-log guard).
+        # DGN-140: consecutive heartbeat-stall restart streak (loud-log guard).
         self._stall_restart_count = 0
         self._last_stall_restart: Optional[float] = None
+        # DGN-902: /btw fork table -- ephemeral side conversations.
+        self._btw_forks = btw_module.BtwForkManager()
+        # DGN-922 FIX 4: btw fork tasks are tracked SEPARATELY from
+        # _user_run_tasks so they do NOT participate in the in-flight /
+        # debounce decision for regular messages.  A normal message arriving
+        # while only a fork is running must dispatch immediately (5s reaction
+        # contract); tracking the fork in _user_run_tasks was causing it to
+        # block the main conversation for up to BTW_TURN_TIMEOUT seconds
+        # (DGN-1177: now the full PROCESS_TIMEOUT budget).
+        self._btw_fork_tasks: Dict[int, set] = {}
 
     # --- lifecycle ---
 
@@ -229,8 +375,8 @@ class TelegramBot:
             write_timeout=10.0,
             pool_timeout=3.0,
         )
-        # Heartbeat-wrapped transport for getUpdates only, so the stall detector
-        # and the external watchdog see real polling liveness.
+        # DGN-140: heartbeat-wrapped transport for getUpdates only, so the
+        # stall detector and the external watchdog see real polling liveness.
         get_updates_request = heartbeat.HeartbeatHTTPXRequest(
             connection_pool_size=4,
             connect_timeout=5.0,
@@ -261,13 +407,14 @@ class TelegramBot:
         # First wall-clock time of an ongoing Conflict streak; reset on recovery.
         conflict_since: Optional[float] = None
         conflict_backoff = CONFLICT_BACKOFF_BASE
-        # Set to True the first time we cross CONFLICT_BACKOFF_EXPONENTIAL_AFTER
-        # seconds of sustained conflict; used to gate the one-time ERROR log entry
-        # that announces the switch to the slow exponential cadence.
+        # DGN-330: set to True the first time we cross
+        # CONFLICT_BACKOFF_EXPONENTIAL_AFTER seconds of sustained conflict; used
+        # to gate the one-time ERROR log entry that announces the switch to the
+        # slow exponential cadence.
         conflict_in_exponential: bool = False
-        # Drop pending updates ONLY on the very first polling start of this
-        # process. In-process re-inits (PollingRestart/Conflict) must NOT drop
-        # -- messages sent during the gap would be lost silently.
+        # DGN-140 MAJOR-1: drop pending updates ONLY on the very first polling
+        # start of this process. In-process re-inits (PollingRestart/Conflict)
+        # must NOT drop -- messages sent during the gap would be lost silently.
         first_boot = True
         while not stop_event.is_set():
             if not self.application:
@@ -297,16 +444,24 @@ class TelegramBot:
             inbox_task = None
             dashboard_task = None
             countdown_task = None
+            restart_backstop_task = None
             try:
                 await self.application.start()
                 await self.application.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=first_boot,
-                    # Never give up re-establishing getUpdates after network
-                    # loss (e.g. laptop sleep/wake).
+                    # DGN-140: never give up re-establishing getUpdates after
+                    # network loss (e.g. laptop sleep/wake).
                     bootstrap_retries=-1,
                     error_callback=self._on_polling_error,
                 )
+                if first_boot:
+                    # DGN-1173: extension boot hooks, run once per process
+                    # right before the "Bot is running" marker (the DGN-986
+                    # boot-snapshot slot, generalized).  run_boot_hooks()
+                    # absorbs ALL failures (one WARNING line per hook) -- a
+                    # boot hook can never block the boot.
+                    ext.run_boot_hooks()
                 first_boot = False
                 logger.info("Bot is running")
                 heartbeat.touch()
@@ -317,9 +472,9 @@ class TelegramBot:
                         on_recovery=self._notify_outage_recovered,
                     )
                 )
-                # session-inbox watcher -- external crons drop a summary file,
-                # we inject it as a background turn into the owner's live
-                # session. Same lifecycle as the watchdog task.
+                # DGN-217: session-inbox watcher -- external crons drop a
+                # summary file, we inject it as a background turn into the
+                # owner's live session. Same lifecycle as the watchdog task.
                 inbox_task = asyncio.create_task(self._session_inbox_loop())
                 # Pinned live-dashboard sync: polls dashboard.md and edits
                 # the owner's pinned message in place. Same lifecycle as the
@@ -334,8 +489,20 @@ class TelegramBot:
                 # control dir and edits transient owner-chat messages in
                 # place. Same lifecycle as the tasks above (cancelled in the
                 # same finally; its own finally reaps live countdown tasks).
+                # DGN-950 seam 2: countdown starts share the dashboard's
+                # turn_active deferral so a rest-timer send can never race
+                # ahead of the in-flight model reply.
                 countdown_task = asyncio.create_task(
-                    CountdownDriver(bot=self.application.bot).run()
+                    CountdownDriver(
+                        bot=self.application.bot,
+                        turn_active=self._user_turn_active,
+                    ).run()
+                )
+                # DGN-1010 layer-2: a restart always brings up a NEW bridge,
+                # so this process is the natural second leg for the restart
+                # completion push. Same lifecycle as the tasks above.
+                restart_backstop_task = asyncio.create_task(
+                    self._restart_backstop_loop()
                 )
                 await self._wait_for_polling_exit(stop_event)
             except PollingConflict:
@@ -354,9 +521,9 @@ class TelegramBot:
                     conflict_since = time.time()
                 elapsed = time.time() - conflict_since
                 if elapsed >= CONFLICT_BACKOFF_EXPONENTIAL_AFTER:
-                    # Sustained past the slow-backoff threshold: switch to
-                    # exponential cadence starting from the linear cap. One ERROR
-                    # line on first entry; subsequent retries are silent.
+                    # DGN-330: sustained past the slow-backoff threshold: switch
+                    # to exponential cadence starting from the linear cap. One
+                    # ERROR line on first entry; subsequent retries are silent.
                     if not conflict_in_exponential:
                         conflict_in_exponential = True
                         conflict_backoff = CONFLICT_BACKOFF_MAX
@@ -431,6 +598,21 @@ class TelegramBot:
                         await countdown_task
                     except asyncio.CancelledError:
                         pass
+                if restart_backstop_task and not restart_backstop_task.done():
+                    restart_backstop_task.cancel()
+                    try:
+                        await restart_backstop_task
+                    except asyncio.CancelledError:
+                        pass
+                if stop_event.is_set():
+                    # DGN-946: flush in-flight fold bubbles while the HTTP
+                    # client is still alive. The late CancelledError cleanup
+                    # (asyncio.run teardown, after "Bot stopped") otherwise
+                    # hits the torn-down client and freezes bubbles in their
+                    # last live form. Real stop only: transient restarts
+                    # (Conflict/NetworkError) keep their turns alive and must
+                    # not collapse live folds.
+                    await sdk_bridge.flush_folds_for_shutdown()
                 await self._graceful_shutdown()
         logger.info("Bot stopped")
 
@@ -442,9 +624,9 @@ class TelegramBot:
         via an event so _wait_for_polling_exit can raise PollingConflict and
         trigger a clean backoff+restart instead of silently going zombie.
 
-        RetryAfter (flood wait) means Telegram answered -- the polling loop is
-        alive but told to back off. Beat the heartbeat so a long flood-wait
-        cannot misfire the stall detector.
+        DGN-140 MINOR: RetryAfter (flood wait) means Telegram answered -- the
+        polling loop is alive but told to back off. Beat the heartbeat so a
+        long flood-wait cannot misfire the stall detector.
         """
         if isinstance(error, telegram.error.RetryAfter):
             heartbeat.touch()
@@ -473,7 +655,7 @@ class TelegramBot:
             await asyncio.sleep(1)
 
     def _note_stall_restart(self) -> None:
-        """Track consecutive heartbeat-stall restarts.
+        """Track consecutive heartbeat-stall restarts (DGN-140 MINOR).
 
         A stall restart should be rare; a tight streak of them means the
         heartbeat wiring itself is suspect (e.g. beats never arriving even
@@ -495,8 +677,8 @@ class TelegramBot:
             )
 
     async def _session_inbox_loop(self) -> None:
-        """Poll <bot_data_dir>/session-inbox/ and inject each file as a
-        background turn into the owner's live session.
+        """DGN-217: poll <bot_data_dir>/session-inbox/ and inject each file as
+        a background turn into the owner's live session.
 
         Contract with writers (cron scripts): write to a temp name, then
         mv/rename to *.md in this dir -- rename is atomic, so a half-written
@@ -504,7 +686,7 @@ class TelegramBot:
         serialized. Injection is refused (file kept, retried next tick) while
         the owner has a turn in flight. If no live stream exists yet (fresh
         restart at a quiet hour, no owner message to create one), it is
-        bootstrapped here first so a queued turn resumes on its own.
+        bootstrapped here first (DGN-399) so a queued turn resumes on its own.
         Delivery of the turn's OUTPUT rides the existing no-pending proactive
         path; a turn ending in bare NO_PUSH reaches the session but not the
         owner chat.
@@ -556,7 +738,7 @@ class TelegramBot:
                 if not text:
                     path.unlink(missing_ok=True)
                     continue
-                # Bootstrap the owner's live stream if none exists yet
+                # DGN-399: bootstrap the owner's live stream if none exists yet
                 # (fresh restart at a quiet hour, no owner message to create it).
                 # Idempotent -- a no-op refresh when a stream already exists.
                 # In a private chat the chat_id equals the owner's user id.
@@ -578,6 +760,131 @@ class TelegramBot:
                 # The watcher must never die silently on a transient error.
                 logger.error("session-inbox loop error: %s", e)
 
+    async def _restart_backstop_loop(self) -> None:
+        """DGN-1010 layer-2: terminal-state backstop for self_restart.sh.
+
+        Contract: one restart tap = exactly ONE terminal notification to the
+        owner (complete or failed), never silence. The completion push is
+        normally owned by the detached self_restart.sh worker; that worker is
+        a single point of failure (2026-08-22 08:00: it was reaped with the
+        old bridge's process group and the owner's CTA tap ended in silence).
+
+        A restart, by construction, always brings up a NEW bridge process --
+        so this process is the second leg. The worker arms
+        <bot_data_dir>/state/restart-pending.marker just before severing the
+        old bridge and CLAIMS it (atomic rename) before its own terminal
+        push. Here: if the marker is present and the worker pid recorded in
+        it is dead, the worker can never push -- claim the marker ourselves
+        and terminal-close the restart. The rename is the mutex: exactly one
+        of {worker, backstop} wins, so no duplicate notice is possible.
+
+        Lifecycle: one task per polling start, cancelled with the sibling
+        tasks. Normal boots (no marker) exit after a single check. A live
+        worker (e.g. long --verify) keeps ownership -- we just keep waiting.
+        """
+        marker = config.bot_data_dir / "state" / "restart-pending.marker"
+        # Layer-absence probe (2026-08-22 incident, second lesson): layer 1
+        # (the marker writer in self_restart.sh) was silently reverted by a
+        # framework update while this backstop stayed in place -- neither
+        # layer could see the other was gone, so the CTA silence recurred for
+        # two days. One static check per boot: if the sibling script no
+        # longer references the marker, this backstop is structurally dead --
+        # say so in the log instead of waiting forever in silence.
+        try:
+            writer = PACKAGE_DIR / "self_restart.sh"
+            if marker.name not in writer.read_text(encoding="utf-8"):
+                logger.warning(
+                    "restart backstop: self_restart.sh no longer arms %s "
+                    "(layer 1 missing -- update regression?); the backstop "
+                    "can never fire until layer 1 is restored",
+                    marker.name,
+                )
+        except OSError:
+            pass  # probe is best-effort; never block the backstop itself
+        await asyncio.sleep(RESTART_BACKSTOP_INITIAL_S)
+        while True:
+            try:
+                if not marker.is_file():
+                    return
+                worker_pid = None
+                try:
+                    for line in marker.read_text(encoding="utf-8").splitlines():
+                        if line.startswith("worker_pid="):
+                            worker_pid = int(line.split("=", 1)[1].strip())
+                            break
+                except (OSError, ValueError):
+                    worker_pid = None  # unreadable -> treat the worker as gone
+                if worker_pid is not None:
+                    try:
+                        os.kill(worker_pid, 0)
+                        # Worker alive: it still owns the terminal push.
+                        await asyncio.sleep(RESTART_BACKSTOP_POLL_S)
+                        continue
+                    except ProcessLookupError:
+                        pass  # dead -> orphaned restart, take over
+                    except PermissionError:
+                        # pid exists under another uid (not our worker, but
+                        # err on the safe side and treat it as alive).
+                        await asyncio.sleep(RESTART_BACKSTOP_POLL_S)
+                        continue
+                claimed = marker.with_name(f"{marker.name}.claimed.{os.getpid()}")
+                try:
+                    marker.rename(claimed)
+                except FileNotFoundError:
+                    return  # worker claimed in the same instant: it pushed
+                except OSError as e:
+                    logger.error("restart backstop claim failed: %s", e)
+                    return
+                try:
+                    owner_ids = config.allowed_user_ids
+                    if owner_ids and self.application:
+                        await self.application.bot.send_message(
+                            chat_id=owner_ids[0],
+                            text=messages.RESTART_BACKSTOP_NOTICE,
+                        )
+                    logger.warning(
+                        "restart backstop fired: worker pid %s dead with "
+                        "pending marker; terminal-closed the restart",
+                        worker_pid,
+                    )
+                    # DGN-1012 registration call only: the backstop just
+                    # delivered the terminal notice, so release the ledger
+                    # obligation (third leg) too -- otherwise the hourly
+                    # sweep would re-notify an already-closed restart.
+                    try:
+                        subprocess.run(
+                            [
+                                "/usr/bin/python3",
+                                str(
+                                    config.bot_data_dir.parent
+                                    / "routines"
+                                    / "terminal-state-ledger.py"
+                                ),
+                                "close", "--id", "restart-pending",
+                                "--state", "done",
+                                "--note",
+                                "bridge backstop terminal-closed "
+                                f"(worker pid {worker_pid} dead)",
+                            ],
+                            capture_output=True,
+                            timeout=10,
+                            check=False,
+                        )
+                    except Exception as tsl_err:
+                        logger.error(
+                            "terminal-state ledger close failed: %s", tsl_err
+                        )
+                finally:
+                    claimed.unlink(missing_ok=True)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Never die silently -- but also never spin: one error, one log,
+                # done. The worker path is unaffected either way.
+                logger.error("restart backstop loop error: %s", e)
+                return
+
     async def _graceful_shutdown(self, force: bool = False) -> None:
         if not self.application:
             return
@@ -585,12 +892,13 @@ class TelegramBot:
             if not force:
                 await asyncio.wait_for(self._do_graceful_stop(), timeout=5.0)
             else:
-                # Force path: skip updater/application stop (the application may
-                # not be in a started state), but ALWAYS call shutdown() so the
-                # underlying HTTPXRequest/httpx.AsyncClient instances are closed.
-                # Without this, each conflict retry leaks two AsyncClient objects
-                # (one for request, one for get_updates_request), causing fd
-                # exhaustion under sustained token contention (DGN-330).
+                # DGN-330 force path: skip updater/application stop (the
+                # application may not be in a started state), but ALWAYS call
+                # shutdown() so the underlying HTTPXRequest/httpx.AsyncClient
+                # instances are closed. Without this, each conflict retry leaks
+                # two AsyncClient objects (one for request, one for
+                # get_updates_request), causing fd exhaustion (OSError [Errno
+                # 24]) under sustained token contention.
                 await self.application.shutdown()
         except (asyncio.TimeoutError, Exception):
             logger.warning("Graceful shutdown issue, forcing cleanup")
@@ -646,9 +954,17 @@ class TelegramBot:
         app.add_handler(CommandHandler("model", self._cmd_model))
         app.add_handler(CommandHandler("resume", self._cmd_resume))
         app.add_handler(CommandHandler("stop", self._cmd_stop))
-        app.add_handler(CommandHandler("history", self._cmd_history))
+        app.add_handler(CommandHandler("queue", self._cmd_queue))
         app.add_handler(CommandHandler("skills", self._cmd_skills))
-        app.add_handler(CommandHandler("usage", self._cmd_usage))
+        # DGN-1050: /authsync is RETIRED (see _cmd_authsync). The handler
+        # stays registered (off-menu) so a typed /authsync gets the
+        # retirement notice instead of falling through to the catch-all
+        # skill forwarder and landing in the SDK session.
+        app.add_handler(CommandHandler("authsync", self._cmd_authsync))
+        # DGN-997: owner-only explicit restart command (the missing surface
+        # that made an agent announce a non-existent /restart in the first place).
+        app.add_handler(CommandHandler("restart", self._cmd_restart))
+        app.add_handler(CommandHandler("btw", self._cmd_btw))
         app.add_handler(CommandHandler("help", self._cmd_help))
         # Catch-all: any other /foo is forwarded to the agent as a slash command
         # (the dedicated /skill and /command handlers were dropped -- this already
@@ -666,16 +982,9 @@ class TelegramBot:
         app.add_handler(CallbackQueryHandler(self._handle_callback))
 
     async def _set_bot_commands(self) -> None:
-        commands = [
-            BotCommand("new", messages.CMD_DESC_NEW),
-            BotCommand("stop", messages.CMD_DESC_STOP),
-            BotCommand("model", messages.CMD_DESC_MODEL),
-            BotCommand("usage", messages.CMD_DESC_USAGE),
-            BotCommand("skills", messages.CMD_DESC_SKILLS),
-            BotCommand("resume", messages.CMD_DESC_RESUME),
-            BotCommand("history", messages.CMD_DESC_HISTORY),
-            BotCommand("help", messages.CMD_DESC_HELP),
-        ]
+        # DGN-919: build the BotCommand list from COMMAND_MENU_SPEC so order
+        # and copy are always in sync with the /help output.
+        commands = [BotCommand(cmd, desc_fn()) for cmd, desc_fn in COMMAND_MENU_SPEC]
         try:
             # Self-heal: clear stale scoped menus (e.g. left by a previous
             # bot setup). Scoped entries override the default scope and
@@ -696,24 +1005,34 @@ class TelegramBot:
             logger.warning("Failed to set bot commands: %s", e)
 
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # PTB-level catch for exceptions in a handler BODY before the turn is
+        # enqueued (e.g. access check / media-group scheduling crash). DGN-163:
+        # emit the bounded turn-death notice instead of a raw traceback so a
+        # consumed update still yields one user-visible, no-internals message.
         logger.error("Unhandled exception:", exc_info=context.error)
         if isinstance(update, Update) and update.effective_chat:
             try:
                 await context.bot.send_message(
                     update.effective_chat.id,
-                    messages.INTERNAL_ERROR.format(error=context.error),
+                    messages.TURN_FAILED,
                 )
             except Exception:
                 pass
 
     # --- access control ---
 
-    async def _check_access(self, update: Update) -> bool:
-        msg = update.message or (update.callback_query and update.callback_query.message)
-        if msg and msg.date:
-            age = (datetime.now(timezone.utc) - msg.date).total_seconds()
-            if age > STALE_MESSAGE_SECONDS:
-                return False
+    async def _check_access(self, update: Update, *, skip_stale: bool = False) -> bool:
+        # DGN-922 FIX 2: skip_stale=True exempts the caller from the 20-min
+        # stale-message drop.  Used exclusively for cdn:done: callbacks so a
+        # countdown completion affordance button stays tappable regardless of
+        # how long the countdown ran (MAX_SECONDS = 24 h).  All other callers
+        # pass the default skip_stale=False and see the original gate unchanged.
+        if not skip_stale:
+            msg = update.message or (update.callback_query and update.callback_query.message)
+            if msg and msg.date:
+                age = (datetime.now(timezone.utc) - msg.date).total_seconds()
+                if age > STALE_MESSAGE_SECONDS:
+                    return False
         user = update.effective_user
         if not user:
             return False
@@ -869,19 +1188,32 @@ class TelegramBot:
         await session_manager.update_session(user_id, session)
         return True
 
-    async def _maybe_capture_outside_approval(self, user_id: int, text: str) -> None:
+    async def _maybe_capture_outside_approval(self, user_id: int, text: str) -> bool:
+        """Consume an outside-path approval/deny reply while one is pending.
+
+        Returns True when a LIVE (non-expired) outside-approval prompt was
+        pending for this user at message time -- whether or not this message was
+        an allow/deny decision token. The caller uses that to seal DGN-801 B4
+        double-consumption: while an outside approval is being captured, a bare
+        numeric token ("1") that also grants the approval must NOT additionally
+        be parsed as a fast-path set-result (one instance kept bare-numeric a valid
+        fast-path input, so the ambiguity is resolved on the approval side; it
+        exists only while a prompt pends, and only the bridge knows that state).
+        Returns False when no prompt is pending, or the prompt had expired (both
+        leave fast-path free to fire).
+        """
         session = await session_manager.get_session(user_id)
         pending = session.get("pending_outside_paths")
         if not pending:
-            return
+            return False
         # Expire a stale deny prompt: an approval reply that arrives after the
-        # TTL no longer grants anything.
+        # TTL no longer grants anything -- and no longer suppresses fast-path.
         pending_at = session.get("pending_outside_at", 0)
         if (time.time() - pending_at) > OUTSIDE_APPROVAL_TTL:
             session.pop("pending_outside_paths", None)
             session.pop("pending_outside_at", None)
             await session_manager.update_session(user_id, session)
-            return
+            return False
         normalized = text.strip().lower()
         allow = ALLOW_OUTSIDE_ONCE_TOKEN.lower() in normalized or normalized in {
             "1", "allow", "yes", "y"
@@ -897,6 +1229,7 @@ class TelegramBot:
             session.pop("pending_outside_paths", None)
             session.pop("pending_outside_at", None)
             await session_manager.update_session(user_id, session)
+            return True
         elif deny:
             session["outside_path_approved_once"] = False
             session.pop("outside_path_approved_paths", None)
@@ -904,6 +1237,12 @@ class TelegramBot:
             session.pop("pending_outside_paths", None)
             session.pop("pending_outside_at", None)
             await session_manager.update_session(user_id, session)
+            return True
+        # A pending prompt exists but this message is not a decision token. It
+        # is still ambiguous whether the user meant to answer the prompt, so
+        # (B4) fast-path is suppressed while ANY approval is pending: signal
+        # that a prompt is live so the caller skips fast-path this turn.
+        return True
 
     # --- per-user queue ---
 
@@ -946,20 +1285,505 @@ class TelegramBot:
 
         task.add_done_callback(_on_done)
 
+    def _track_btw_fork_task(self, user_id: int, task: asyncio.Task) -> None:
+        """DGN-922 FIX 4: track a btw fork task in the SEPARATE fork set.
+
+        Fork tasks MUST NOT live in _user_run_tasks -- doing so makes
+        _prune_user_tasks truthy while the fork runs, which causes regular
+        messages to enter the debounce path and block for up to
+        BTW_TURN_TIMEOUT seconds (violates the DGN-911 5s-reaction contract).
+
+        The fork set is pruned the same way as _user_run_tasks: done tasks
+        are removed on completion via a done-callback.  _clear_user_queue
+        cancels both sets so /stop still terminates outstanding forks.
+        """
+        fork_tasks = self._btw_fork_tasks.setdefault(user_id, set())
+        # Prune stale entries (done tasks from prior forks) before adding.
+        fork_tasks.difference_update({t for t in fork_tasks if t.done()})
+        fork_tasks.add(task)
+
+        def _on_fork_done(t: asyncio.Task) -> None:
+            self._btw_fork_tasks.get(user_id, set()).discard(t)
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error(
+                    "btw fork task failed for user %s: %s", user_id, e, exc_info=True
+                )
+
+        task.add_done_callback(_on_fork_done)
+
     def _clear_user_queue(self, user_id: int) -> int:
         tasks = self._prune_user_tasks(user_id)
         cleared = len(tasks)
         for t in list(tasks):
             t.cancel()
         tasks.clear()
+        # DGN-922 FIX 4: also cancel outstanding btw fork tasks on /stop.
+        fork_tasks = self._btw_fork_tasks.get(user_id, set())
+        for ft in list(fork_tasks):
+            if not ft.done():
+                ft.cancel()
+        fork_tasks.clear()
+        # DGN-616: /stop also discards any buffered-but-not-yet-run messages so a
+        # stopped turn does not leave a phantom merged follow-up queued behind it.
+        self._user_pending_texts.pop(user_id, None)
+        # DGN-911: same discard policy for the debounce buffer + its timer.
+        self._clear_inflight_debounce(user_id)
         return cleared
+
+    def _clear_inflight_debounce(self, user_id: int) -> None:
+        """DGN-911: discard the debounce buffer and disarm the pending timer.
+
+        Used by the /stop paths (both soft-interrupt and hard teardown): a stop
+        means "drop what has not run yet", mirroring the DGN-616 pending-buffer
+        discard above.
+        """
+        timer = self._debounce_timers.pop(user_id, None)
+        if timer and not timer.done():
+            timer.cancel()
+        self._debounce_texts.pop(user_id, None)
+        # DGN-1016: a stop also ends any deferred-interrupt wait.
+        self._interrupt_deferred_since.pop(user_id, None)
+
+    @staticmethod
+    def _bundle_texts(items: List[tuple]) -> str:
+        """DGN-616: merge buffered regular messages into one combined turn input.
+
+        Single item -> returned verbatim (zero-cost, no wrapper). Multiple items
+        -> arrival order preserved, each prefixed with its [HH:MM:SS] receipt
+        time and joined by a clear "---" separator so the brain reads them as one
+        message composed of several parts. Any attachment path-reference lines
+        already baked into each item's text ride along unchanged, so photos /
+        docs / voice transcripts buffered mid-turn all reach the merged turn.
+        """
+        if len(items) == 1:
+            return items[0][0]
+        parts = []
+        for text, ts, _update in items:
+            stamp = ts.astimezone(timezone.utc).strftime("%H:%M:%S") if ts else ""
+            parts.append(f"[{stamp}] {text}" if stamp else text)
+        return "\n---\n".join(parts)
+
+    async def _enqueue_text_task(
+        self,
+        user_id: int,
+        text: str,
+        ts,
+        update,
+        *,
+        failure_message=None,
+        coalesce: bool = False,
+    ) -> None:
+        """Entry point for a REGULAR message (text/voice/photo/document).
+
+        Idle: dispatch immediately as a single turn -- zero added latency, no
+        debounce. The turn's done-callback drains whatever buffers while it
+        runs into ONE merged follow-up turn.
+
+        In flight, DEFAULT (DGN-911, coalesce=False): debounce-interrupt.
+        The message lands in the per-user debounce buffer and (re)arms the
+        BRIDGE_INFLIGHT_DEBOUNCE_S timer; on expiry the in-flight turn is
+        soft-interrupted (DGN-581) and the buffered messages run as ONE merged
+        new turn (see _debounce_expire).
+
+        In flight, coalesce=True (/queue command): legacy DGN-616 coalescing --
+        append to the pending buffer, never interrupt; the in-flight turn's
+        done-callback merges the buffer into the next turn.
+
+        failure_message selects the DGN-163 death-notice variant for an
+        immediate single-message dispatch (e.g. the voice/photo/doc-specific
+        text). A merged drain turn is a mix of message kinds, so it always uses
+        the generic TURN_FAILED.
+        """
+        async with self._get_user_queue_lock(user_id):
+            if self._prune_user_tasks(user_id):
+                if coalesce:
+                    buf = self._user_pending_texts.setdefault(user_id, [])
+                    if len(buf) >= COALESCE_MAX:
+                        await self._notify_coalesce_cap(user_id, update)
+                        return
+                    buf.append((text, ts, update))
+                    return
+                # DGN-911 default: buffer + (re)arm the debounce window.
+                buf = self._debounce_texts.setdefault(user_id, [])
+                if len(buf) >= COALESCE_MAX:
+                    # Memory-safety valve: only a runaway flood reaches here.
+                    await self._notify_coalesce_cap(user_id, update)
+                    return
+                buf.append((text, ts, update))
+                self._reset_inflight_debounce(user_id)
+                return
+        # Idle: dispatch immediately. The done-callback drains any messages that
+        # arrive while this turn runs.
+        await self._dispatch_text_turn(
+            user_id, text, ts, update, failure_message=failure_message
+        )
+
+    async def _notify_coalesce_cap(self, user_id: int, update) -> None:
+        """Memory-safety cap notice (DGN-616), shared by both buffers."""
+        chat = update.effective_chat
+        chat_id = chat.id if chat else user_id
+        try:
+            await self.application.bot.send_message(chat_id, messages.QUEUE_BUSY)
+        except Exception as e:
+            logger.error(
+                "coalesce-cap notice send failed for user %s: %s", user_id, e
+            )
+
+    def _reset_inflight_debounce(self, user_id: int) -> None:
+        """DGN-911: (re)arm the per-user in-flight debounce timer.
+
+        Called under the user's queue lock. Each new arrival inside the window
+        cancels the previous timer and starts a fresh one (continuous-typing
+        protection): the interrupt only fires after
+        BRIDGE_INFLIGHT_DEBOUNCE_S seconds of input silence.
+        """
+        old = self._debounce_timers.pop(user_id, None)
+        if old and not old.done():
+            old.cancel()
+        self._debounce_timers[user_id] = asyncio.create_task(
+            self._debounce_expire(user_id)
+        )
+
+    async def _debounce_expire(self, user_id: int) -> None:
+        """DGN-911: debounce window closed -- interrupt and re-dispatch.
+
+        Fail-safe ordering: the debounce buffer moves into _user_pending_texts
+        BEFORE the interrupt attempt, so whatever happens next (interrupt ok /
+        nothing to interrupt / interrupt raises) the DGN-616 drain machinery
+        guarantees delivery -- either the interrupted turn's done-path drains
+        it now, or a naturally-finishing turn drains it later (graceful
+        degradation to legacy coalescing). Messages are never dropped.
+
+        The move + in-flight check + interrupt all run under the user's queue
+        lock, so no new turn can dispatch and no drain can pop in between: the
+        interrupt can only target the turn that was in flight when the window
+        closed, never a successor turn carrying these very messages.
+
+        Notice policy (owner decision 2026-08-17): SILENT by default -- the
+        rationale was conversational naturalness (an interjection should
+        feel like normal dialogue), not death-invisibility; the decision
+        predates the live-task registry, and the DGN-1015 kill notice below
+        is deliberately NOT gated by it. The
+        BRIDGE_INFLIGHT_INTERRUPT_NOTICE flag stays a future opt-in; it now
+        carries a dedicated auto-interrupt copy (AUTO_INTERRUPT_NOTICE,
+        DGN-1016 O1 draft -- owner confirmation pending) instead of reusing
+        the /stop copy.
+        """
+        try:
+            await asyncio.sleep(BRIDGE_INFLIGHT_DEBOUNCE_S)
+        except asyncio.CancelledError:
+            # Reset by a newer arrival, flushed by a finishing turn's drain,
+            # or discarded by /stop.
+            raise
+        interrupted = False
+        dispatch_idle = False
+        newest_update = None
+        killed_descs: List[str] = []
+        try:
+            async with self._get_user_queue_lock(user_id):
+                self._debounce_timers.pop(user_id, None)
+                items = self._debounce_texts.pop(user_id, None)
+                if not items:
+                    return
+                newest_update = items[-1][2]
+                # Fail-safe hand-off FIRST: from here on the coalescing drain
+                # path owns delivery no matter what the interrupt does.
+                #
+                # MINOR: sort after extend so that pre-existing /queue entries
+                # (coalesced before this window) and the debounce items are
+                # merged in chronological order. Without this the interrupted
+                # turn's done-path drains _user_pending_texts via the
+                # else-branch of _drain_pending_texts (no sort) and a /queue
+                # item at t2 can precede a debounce item at t1.
+                pending_buf = self._user_pending_texts.setdefault(user_id, [])
+                pending_buf.extend(items)
+                if len(pending_buf) > 1:
+                    fallback_ts = datetime.min.replace(tzinfo=timezone.utc)
+
+                    def _expire_arrival_key(item, _fb=fallback_ts):
+                        ts_val = item[1]
+                        if ts_val is None:
+                            return _fb
+                        if ts_val.tzinfo is None:
+                            return ts_val.replace(tzinfo=timezone.utc)
+                        return ts_val
+
+                    pending_buf.sort(key=_expire_arrival_key)
+                if self._prune_user_tasks(user_id):
+                    # DGN-1016 background guard: a remote interrupt aborts the
+                    # SESSION-wide abort tree and kills every in-session
+                    # background subagent (measured, DGN-991 rev3). If tracked
+                    # live background tasks exist, skip the interrupt and let
+                    # the already-completed fail-safe hand-off above deliver
+                    # via the legacy DGN-616 coalescing drain (interrupted
+                    # stays False -> done-path drains; every turn is bounded
+                    # by PROCESS_TIMEOUT, so the wait is finite). Deferral is
+                    # capped: once the first deferred expiry is older than
+                    # BRIDGE_INFLIGHT_DEFER_CAP_S, interrupt anyway --
+                    # sustained owner input eventually wins, and a phantom
+                    # registry entry cannot gate interrupts forever. Explicit
+                    # /stop never runs through here and stays ungated.
+                    # live_task_count is a pure dict lookup (no I/O) -- safe
+                    # under the queue lock held here.
+                    live_tasks = 0
+                    if BRIDGE_INFLIGHT_DEFER_CAP_S > 0:
+                        try:
+                            live_tasks = sdk_bridge.live_task_count(user_id)
+                        except Exception as e:
+                            # Guard failure must never block the interrupt
+                            # path -- fall through as "no live tasks".
+                            logger.error(
+                                "DGN-1016 live-task probe failed for user %s: %s",
+                                user_id,
+                                e,
+                            )
+                    now_mono = time.monotonic()
+                    deferred_since = self._interrupt_deferred_since.get(user_id)
+                    if live_tasks > 0 and (
+                        deferred_since is None
+                        or now_mono - deferred_since < BRIDGE_INFLIGHT_DEFER_CAP_S
+                    ):
+                        if deferred_since is None:
+                            self._interrupt_deferred_since[user_id] = now_mono
+                        logger.info(
+                            "DGN-1016 auto-interrupt deferred for user %s: "
+                            "%d live background task(s); falling back to "
+                            "coalescing merge on turn end (deferred %.0fs)",
+                            user_id,
+                            live_tasks,
+                            0.0
+                            if deferred_since is None
+                            else now_mono - deferred_since,
+                        )
+                        return
+                    if live_tasks > 0:
+                        logger.warning(
+                            "DGN-1016 defer cap exceeded for user %s "
+                            "(%.0fs >= %.0fs): auto-interrupting despite "
+                            "%d live background task(s)",
+                            user_id,
+                            now_mono - deferred_since,
+                            BRIDGE_INFLIGHT_DEFER_CAP_S,
+                            live_tasks,
+                        )
+                    self._interrupt_deferred_since.pop(user_id, None)
+                    try:
+                        interrupted = await sdk_bridge.interrupt(
+                            user_id, trigger="auto"
+                        )
+                        if interrupted:
+                            # DGN-1015: the defer cap above only gated the
+                            # COMMON case; sustained typing can still exceed
+                            # it and interrupt with live tasks. Whatever died
+                            # is fetched now so it is never silently lost.
+                            killed_descs = sdk_bridge.pop_interrupt_killed(
+                                user_id
+                            )
+                    except Exception as e:
+                        logger.error(
+                            "DGN-911 auto-interrupt failed for user %s: %s -- "
+                            "degrading to coalescing merge on turn end",
+                            user_id,
+                            e,
+                        )
+                    # interrupted False here means the in-flight task carries
+                    # no interruptible SDK turn (already settling, or a
+                    # control task). Either way its done-path / a later turn
+                    # drains the buffer -- legacy DGN-616 behavior.
+                else:
+                    # Turn ended during the window without a drain pass (the
+                    # drain path normally flushes this buffer first; belt and
+                    # braces). Dispatch outside the lock.
+                    dispatch_idle = True
+        except Exception as e:
+            # Buffered messages already sit in _user_pending_texts (or still in
+            # _debounce_texts if the lock section itself failed) -- both are
+            # drained by later turns, so log loudly but never drop.
+            logger.error(
+                "DGN-911 debounce-expire failed for user %s: %s",
+                user_id,
+                e,
+                exc_info=True,
+            )
+            return
+        if dispatch_idle:
+            await self._drain_pending_texts(user_id)
+            return
+        if interrupted and BRIDGE_INFLIGHT_INTERRUPT_NOTICE and newest_update:
+            # Opt-in notice only; default is silence (owner-confirmed UX).
+            # DGN-1016 O1: dedicated auto-interrupt copy (draft, owner
+            # confirmation pending) -- the /stop copy this used to reuse
+            # described an action the user never took.
+            try:
+                chat = newest_update.effective_chat
+                chat_id = chat.id if chat else user_id
+                await self.application.bot.send_message(
+                    chat_id, messages.AUTO_INTERRUPT_NOTICE
+                )
+            except Exception as e:
+                logger.error(
+                    "DGN-911 interrupt notice send failed for user %s: %s",
+                    user_id,
+                    e,
+                )
+        if killed_descs and newest_update:
+            # DGN-1015: unconditional (NOT gated by BRIDGE_INFLIGHT_INTERRUPT_
+            # NOTICE) -- that flag silences "your message caused an
+            # interrupt" noise (owner decision 2026-08-17, predates the
+            # live-task registry this reports on). This is a different,
+            # narrower fact: a background subagent is confirmed dead, which
+            # is exactly the silent-death gap DGN-1015 exists to close.
+            try:
+                chat = newest_update.effective_chat
+                chat_id = chat.id if chat else user_id
+                await self.application.bot.send_message(
+                    chat_id,
+                    messages.BG_SUBAGENT_KILLED_NOTICE.format(
+                        names=", ".join(killed_descs)
+                    ),
+                )
+            except Exception as e:
+                logger.error(
+                    "DGN-1015 bg-kill notice send failed for user %s: %s",
+                    user_id,
+                    e,
+                )
+
+    async def _dispatch_text_turn(
+        self, user_id: int, text: str, ts, update, *, failure_message=None
+    ) -> None:
+        """DGN-616: run one regular turn, then drain the coalescing buffer.
+
+        Wraps _process_user_message_text in the DGN-163 turn-death safety net
+        (via _enqueue_user_task) and, on completion, flushes any messages that
+        buffered while it ran into a single merged follow-up turn. Regular turns
+        thus stay strictly serial per user: exactly one ResultMessage settles
+        before the next merged turn dispatches.
+        """
+        chat = update.effective_chat
+        chat_id = chat.id if chat else user_id
+
+        async def run_task() -> None:
+            try:
+                await self._process_user_message_text(update, user_id, text)
+            finally:
+                await self._drain_pending_texts(user_id)
+
+        async def on_overflow() -> None:
+            # Unreachable in practice: the coalescing path only dispatches when
+            # idle, so the control-path inflight cap is never hit here. Buffer as
+            # a defensive fallback rather than drop.
+            self._user_pending_texts.setdefault(user_id, []).append((text, ts, update))
+
+        await self._enqueue_user_task(
+            user_id,
+            run_task,
+            on_overflow,
+            chat_id=chat_id,
+            failure_message=failure_message,
+        )
+
+    async def _drain_pending_texts(self, user_id: int) -> None:
+        """DGN-616: flush the coalescing buffer into ONE merged follow-up turn.
+
+        Runs from the finishing turn's done path. Pops every buffered message,
+        merges them (order preserved), and dispatches a single new turn seeded
+        with the newest update for chat/reply context. That turn will itself
+        drain again on completion, so a buffer that keeps filling drains in a
+        loop -- always one merged turn at a time, never concurrent.
+
+        DGN-911: the debounce buffer flushes here too. A turn that ends
+        NATURALLY inside an open debounce window must not leave those messages
+        waiting for the timer (idle == immediate dispatch, and a later idle
+        arrival could otherwise race ahead of them). The timer is cancelled;
+        if its expiry task already started, the pop below wins or loses the
+        buffer atomically under the lock -- never both, never neither.
+        """
+        async with self._get_user_queue_lock(user_id):
+            pending = self._user_pending_texts.pop(user_id, None) or []
+            debounced = self._debounce_texts.pop(user_id, None) or []
+            timer = self._debounce_timers.pop(user_id, None)
+            # DGN-1016: the in-flight wait this drain ends is over -- reset
+            # the deferral clock so the next wait gets a fresh cap budget.
+            self._interrupt_deferred_since.pop(user_id, None)
+        if timer and not timer.done():
+            timer.cancel()
+        if debounced:
+            # Stable chronological merge across the two buffers; entries
+            # without a timestamp keep their relative position (sort key
+            # normalizes None/naive so mixed inputs can never raise).
+            fallback = datetime.min.replace(tzinfo=timezone.utc)
+
+            def _arrival_key(item):
+                ts_val = item[1]
+                if ts_val is None:
+                    return fallback
+                if ts_val.tzinfo is None:
+                    return ts_val.replace(tzinfo=timezone.utc)
+                return ts_val
+
+            items = sorted(pending + debounced, key=_arrival_key)
+        else:
+            items = pending
+        if not items:
+            return
+        merged = self._bundle_texts(items)
+        # Seed the merged turn from the newest buffered update so replies attach
+        # to the latest message and failure notices route to the right chat.
+        newest_update = items[-1][2]
+        newest_ts = items[-1][1]
+        await self._dispatch_text_turn(user_id, merged, newest_ts, newest_update)
+
+    async def _turn_death_notice(
+        self,
+        user_id: int,
+        chat_id: Optional[int],
+        failure_message: str,
+    ) -> None:
+        """DGN-163 safety net: emit ONE user-visible notice for a turn that would
+        otherwise die silently (any exception between "update accepted" and the
+        first user reply).
+
+        Never sends a raw traceback. If partial output already streamed for this
+        turn, route to the softer "reply may be incomplete" variant instead of
+        claiming the message was dropped. The send itself is best-effort: wrapped
+        so a failing notice-send logs and returns rather than crash-looping.
+        """
+        if chat_id is None:
+            chat_id = user_id
+        try:
+            if sdk_bridge.user_has_streamed_output(user_id):
+                text = messages.TURN_INCOMPLETE
+            else:
+                text = failure_message
+        except Exception:
+            text = failure_message
+        try:
+            await self.application.bot.send_message(chat_id, text)
+        except Exception as e:
+            logger.error(
+                "turn-death notice send failed for user %s chat %s: %s",
+                user_id, chat_id, e,
+            )
 
     async def _enqueue_user_task(
         self,
         user_id: int,
         run_task: Callable[[], Awaitable[None]],
         on_overflow: Callable[[], Awaitable[None]],
+        *,
+        chat_id: Optional[int] = None,
+        failure_message: Optional[str] = None,
     ) -> bool:
+        # DGN-163: wrap every enqueued turn so ANY escaping exception (handler
+        # crash, download failure, mid-turn death) still produces one bounded
+        # user-visible notice. Without this, run_task exceptions only reached the
+        # done-callback logger and the consumed update produced zero output.
+        death_message = failure_message or messages.TURN_FAILED
         accepted: Optional[asyncio.Task] = None
         async with self._get_user_queue_lock(user_id):
             tasks = self._prune_user_tasks(user_id)
@@ -968,6 +1792,13 @@ class TelegramBot:
                     self._active_tasks[user_id] = asyncio.current_task()
                     try:
                         await run_task()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        logger.error(
+                            "turn died for user %s: %s", user_id, e, exc_info=True
+                        )
+                        await self._turn_death_notice(user_id, chat_id, death_message)
                     finally:
                         self._active_tasks.pop(user_id, None)
 
@@ -977,6 +1808,196 @@ class TelegramBot:
             await on_overflow()
             return False
         return True
+
+    # --- fast-path interceptor (DGN-801) ---
+
+    async def _try_fastpath(self, user_id: int, text: str, update) -> bool:
+        """Offer a message to the domain fast-path handler before any SDK turn.
+
+        Returns True when the message was CLAIMED by the fast-path task (the
+        caller must not enqueue an SDK turn for it); False routes it to the
+        normal coalescing path. Domain-agnostic: the enable flag, a cheap
+        numeric-short prefilter, and the idle gate are the only bridge-side
+        signals -- the real verdict is the handler's (exit 2 FALLBACK degrades
+        any misdetection back to the model, fail-safe, never a drop).
+
+        Serialization (grill F4): concurrent_updates(True) runs handlers
+        concurrently, so the fast-path fires ONLY under the user's queue lock
+        and ONLY when that user is fully idle (no in-flight turn). The
+        fast-path task registers in _user_run_tasks while the lock is held, so
+        any message arriving during it buffers behind it via the DGN-616
+        coalescing path (exactly one serialization point), and a second
+        fast-path can never run concurrently for the same user.
+        """
+        if not fastpath.enabled():
+            return False
+        if not fastpath.prefilter(text):
+            return False
+        chat = update.effective_chat
+        chat_id = chat.id if chat else user_id
+
+        async def run_task() -> None:
+            try:
+                result = await fastpath.run_handler(text)
+                if result.processed:
+                    # exit 0 = commit witness: push the rendered body and
+                    # suppress the model turn. An empty body is a handler
+                    # contract violation, but state may be committed, so it
+                    # still must NOT fall back to the model -- surface the
+                    # committed-but-silent case via the death notice instead.
+                    if result.body:
+                        await self._fastpath_push_guaranteed(chat_id, result.body)
+                    else:
+                        logger.error(
+                            "fast-path handler exit 0 with empty body for user %s",
+                            user_id,
+                        )
+                        await self._fastpath_push_death_notice(chat_id)
+                else:
+                    # FALLBACK / timeout / crash -> the normal SDK turn runs on
+                    # the original text inside THIS task (still serialized).
+                    await self._process_user_message_text(update, user_id, text)
+            finally:
+                await self._drain_pending_texts(user_id)
+
+        async with self._get_user_queue_lock(user_id):
+            if self._prune_user_tasks(user_id):
+                # Turn in flight -> let the default in-flight path handle this
+                # message (DGN-911 debounce-interrupt via _enqueue_text_task).
+                return False
+
+            async def wrapped() -> None:
+                self._active_tasks[user_id] = asyncio.current_task()
+                try:
+                    await run_task()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(
+                        "fast-path turn died for user %s: %s",
+                        user_id, e, exc_info=True,
+                    )
+                    await self._turn_death_notice(
+                        user_id, chat_id, messages.TURN_FAILED
+                    )
+                finally:
+                    self._active_tasks.pop(user_id, None)
+
+            task = asyncio.create_task(wrapped())
+            self._track_user_task(user_id, task)
+        return True
+
+    async def _fastpath_push_guaranteed(self, chat_id: int, content: str) -> None:
+        """Grill M3: deliver a fast-path exit-0 body with retries, never silence.
+
+        The handler already committed state when this runs, so a failed send
+        must NOT re-route the message to the model (double-processing risk).
+        Retry with backoff; on final failure push a short death-notice through
+        the raw send path so "recorded but screen not updated" is never silent.
+        Distinct from _send_guaranteed (B3 raw send): the fast-path body is a
+        rendered table, so it must go through _send_smart formatting.
+
+        DGN-1021 4th path: this call site was the one delivery path never
+        wired to the canonical has_options_marker recognizer (the other three
+        -- model-turn finalize, proactive push, classifier -- were fixed and
+        gate-tested under DGN-1021; this one still hand-defaulted
+        force_options=False). A fast-path body that contains BOTH a fenced
+        table (DGN-085 has_code split) AND an [[OPTIONS]] marker landed with
+        the marker silently stripped and zero buttons built -- the exact
+        "code block + [[OPTIONS]] in one message" contract failure (now
+        taught by the injected grammar fragment) the
+        has_code branch in _send_smart exists to prevent, just never
+        triggered because force_options never turned on for this path.
+        Computing it here from the same canonical recognizer the other three
+        paths use closes the gap without adding a new detector.
+        """
+        has_options = has_options_marker(content)
+        last_error: Optional[Exception] = None
+        for attempt, delay in enumerate((0.0, *FASTPATH_PUSH_RETRY_DELAYS)):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                # DGN-1209 R2: handler stdout is consumer text (no model turn).
+                await self._send_smart(
+                    chat_id, content, force_options=has_options, rail=RAIL_CONSUMER
+                )
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning(
+                    "fast-path push attempt %d failed for chat %s: %s",
+                    attempt + 1, chat_id, e,
+                )
+        logger.error(
+            "fast-path push exhausted retries for chat %s: %s", chat_id, last_error
+        )
+        await self._fastpath_push_death_notice(chat_id)
+
+    async def _fastpath_push_death_notice(self, chat_id: int) -> None:
+        """Best-effort minimal-path notice: input recorded, screen update lost."""
+        try:
+            if self.application is not None:
+                await self.application.bot.send_message(
+                    chat_id, messages.FASTPATH_PUSH_FAILED
+                )
+        except Exception as e:
+            logger.error(
+                "fast-path push death-notice send failed for chat %s: %s",
+                chat_id, e,
+            )
+
+    # --- DGN-1209: machine-line gate alert reader -------------------------
+
+    def _machine_line_alert_sink(self, rail: str, tokens: tuple, sample: str) -> None:
+        """Sync sink installed into bridge.machine_gate at construction.
+
+        Called from inside a render (sync context) when an UNREGISTERED
+        machine-shape line PASSED on a consumer/unknown rail. Dedup against
+        the durable (rail, token, day) ledger plus an in-flight set, then
+        schedule the owner-chat notice on the running loop. Never raises
+        (the send this alert rides on must not fail because of the alert).
+        """
+        try:
+            day = today_key()
+            fresh = [
+                t for t in self._machine_alert_ledger.unseen(rail, tokens, day)
+                if (rail, t, day) not in self._machine_alert_inflight
+            ]
+            if not fresh:
+                return
+            owner_ids = config.allowed_user_ids
+            if not owner_ids or self.application is None:
+                logger.warning(
+                    "machine-line gate: alert has no owner chat to reach "
+                    "(rail=%s tokens=%s) -- log only: %r",
+                    rail, ",".join(fresh), sample[:120],
+                )
+                return
+            for t in fresh:
+                self._machine_alert_inflight.add((rail, t, day))
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self._send_machine_line_alert(owner_ids[0], rail, fresh, day)
+            )
+        except Exception:  # noqa: BLE001 -- never let the alert break a send
+            logger.exception("machine-line gate: alert scheduling failed")
+
+    async def _send_machine_line_alert(
+        self, chat_id: int, rail: str, tokens: List[str], day: str
+    ) -> None:
+        """Loud owner notice (no disable_notification); marker AFTER success."""
+        try:
+            text = format_alert_text(rail, tokens)
+            await self.application.bot.send_message(chat_id, text)
+            self._machine_alert_ledger.mark(rail, tokens, day)
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "machine-line gate: alert send failed for rail=%s tokens=%s: %s",
+                rail, ",".join(tokens), e,
+            )
+        finally:
+            for t in tokens:
+                self._machine_alert_inflight.discard((rail, t, day))
 
     # --- commands ---
 
@@ -1025,6 +2046,14 @@ class TelegramBot:
                     messages.MODEL_UNKNOWN.format(name=name, allowed=", ".join(allowed))
                 )
                 return
+            # DGN-192: switching to the already-active model is a no-op --
+            # never reset the session for a switch that changes nothing.
+            if name == self._get_real_model(session):
+                label = _MODEL_LABELS.get(name, name)
+                await update.message.reply_text(
+                    messages.MODEL_ALREADY_ACTIVE.format(label=label)
+                )
+                return
             session["model"] = name
             session["session_id"] = None
             session["new_session"] = True
@@ -1035,14 +2064,14 @@ class TelegramBot:
             label = _MODEL_LABELS.get(name, name)
             await update.message.reply_text(
                 messages.MODEL_SWITCHED.format(label=label)
-                + "\n"
-                + messages.MODEL_SWITCH_WARNING
             )
             return
         current = self._get_real_model(session)
         models = list(MODELS)
         if current not in dict(models):
             models.append((current, current))
+        # DGN-192: strongest model first (fable > opus > sonnet > haiku).
+        models.sort(key=lambda x: (_MODEL_PERF_RANK.get(x[0], 99), x[0]))
         buttons = [
             [InlineKeyboardButton(
                 f"{label} (current)" if name == current else label,
@@ -1067,9 +2096,36 @@ class TelegramBot:
         if not await self._check_access(update):
             return
         user_id = update.effective_user.id
+        # DGN-911/DGN-922 FIX 1: a stop discards BOTH the debounce buffer and
+        # the /queue coalescing buffer.  The comment at _clear_user_queue and
+        # in the now-reconciled block below has always said "stop discards
+        # buffered messages"; the soft path previously only cleared the debounce
+        # window, leaving _user_pending_texts alive.  A dying turn's finally-
+        # drain would then fire _drain_pending_texts on those surviving entries
+        # and dispatch a ghost merged turn -- violating the "stop drops the
+        # queue" contract.  Mirror the same two-part discard done by
+        # _clear_user_queue: pending buffer + debounce window.
+        self._user_pending_texts.pop(user_id, None)
+        self._clear_inflight_debounce(user_id)
         try:
-            if await sdk_bridge.interrupt(user_id):
-                await update.message.reply_text(messages.STOP_INTERRUPTED)
+            if await sdk_bridge.interrupt(user_id, trigger="stop"):
+                # DGN-991 (2026-09-03 owner approval): the /stop reply is
+                # this one sentence, full stop -- no standing background
+                # warning appended (DGN-991 measured that in-session
+                # subagents die on the soft interrupt while detached
+                # dispatches survive it, so a blanket claim either way would
+                # be false). The same STOP_INTERRUPTED copy is also reused by
+                # the DGN-911 auto-interrupt notice.
+                reply = messages.STOP_INTERRUPTED
+                # DGN-1015: when the live task registry (DGN-1016) confirms
+                # an actual kill, name it -- this is the fact-based notice
+                # that replaces the old standing generic warning.
+                killed_descs = sdk_bridge.pop_interrupt_killed(user_id)
+                if killed_descs:
+                    reply += "\n" + messages.BG_SUBAGENT_KILLED_NOTICE.format(
+                        names=", ".join(killed_descs)
+                    )
+                await update.message.reply_text(reply)
                 return
         except Exception as e:
             logger.error(
@@ -1080,6 +2136,49 @@ class TelegramBot:
         # Nothing to interrupt (or the interrupt send failed on a stuck turn):
         # legacy hard-stop semantics.
         await self._hard_stop(update, user_id)
+
+    async def _cmd_queue(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """DGN-911: /queue <msg> -- explicit no-interrupt enqueue.
+
+        Routes the message through the legacy DGN-616 coalescing path: while a
+        turn is in flight it appends to the pending buffer and merges into the
+        NEXT turn when the current one finishes on its own -- never interrupts.
+        When idle it simply dispatches immediately (same as a plain message),
+        so /queue is always safe to use.
+        """
+        if not await self._check_access(update):
+            return
+        message = update.message
+        user_id = update.effective_user.id
+        args = context.args or []
+        text = " ".join(args).strip()
+        if not text:
+            await message.reply_text(messages.QUEUE_USAGE)
+            return
+        await self._enqueue_text_task(
+            user_id, text, self._message_ts(message), update, coalesce=True
+        )
+
+    # DGN-941: leading "/queue" token in a photo/document CAPTION. Telegram
+    # only parses commands from message.text, so a caption "/queue ..." never
+    # reaches the CommandHandler -- the photo/doc handlers must detect and strip
+    # it themselves, then route through the coalescing path (same effect as a
+    # text /queue). Matched anchored at the caption start, optional bot-mention
+    # suffix ("/queue@bot"), followed by whitespace or end-of-string; the token
+    # is removed and the remaining caption is returned trimmed. Case-insensitive
+    # (Telegram lowercases command entities, but a hand-typed caption may not).
+    _CAPTION_QUEUE_RE = re.compile(r"^/queue(?:@\w+)?(?:\s+|$)", re.IGNORECASE)
+
+    @classmethod
+    def _split_caption_queue(cls, caption: str) -> Tuple[str, bool]:
+        """Return (cleaned_caption, coalesce). coalesce=True when the caption
+        opened with a "/queue" token; the token is stripped from the caption.
+        A caption with no leading /queue is returned unchanged with False."""
+        cap = (caption or "").strip()
+        m = cls._CAPTION_QUEUE_RE.match(cap)
+        if not m:
+            return cap, False
+        return cap[m.end():].strip(), True
 
     async def _hard_stop(self, update: Update, user_id: int) -> None:
         """Legacy hard teardown: cancel run tasks, disconnect the stream (kill
@@ -1092,7 +2191,18 @@ class TelegramBot:
             task_cancelled = True
         killed = await sdk_bridge.stop(user_id)
         cleared = self._clear_user_queue(user_id)
-        reply = messages.STOP_PAUSED if (task_cancelled or killed or cleared) else messages.STOP_NOTHING
+        # DGN-991 stopgap B: honest copy split. The old STOP_PAUSED claim
+        # ("session and conversation intact") is FALSE when the teardown
+        # actually killed the stream/CLI subprocess -- background work in that
+        # process dies too. task_cancelled or killed = the process side was
+        # torn down -> forced copy. cleared-only = queued messages dropped,
+        # no live process touched -> the old copy is still true.
+        if task_cancelled or killed:
+            reply = messages.STOP_FORCED
+        elif cleared:
+            reply = messages.STOP_PAUSED
+        else:
+            reply = messages.STOP_NOTHING
         await update.message.reply_text(reply)
 
     async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1113,94 +2223,498 @@ class TelegramBot:
         lines.append(messages.RESUME_HINT)
         await update.message.reply_text("\n".join(lines))
 
-    async def _cmd_history(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._check_access(update):
-            return
-        user_id = update.effective_user.id
-        session = await session_manager.get_session(user_id)
-        session_id = session.get("session_id")
-        if not session_id:
-            await update.message.reply_text(messages.NO_SESSION)
-            return
-        msgs = self._get_recent_messages(session_id, limit=5)
-        if not msgs:
-            await update.message.reply_text(messages.NO_HISTORY)
-            return
-        lines = [messages.HISTORY_HEADER, ""]
-        for m in msgs:
-            role = "User" if m["role"] == "user" else "Assistant"
-            content = m["content"]
-            if len(content) > 500:
-                content = content[:500] + "..."
-            lines.append(f"[{role}] {content}")
-            lines.append("")
-        reply = "\n".join(lines).strip()
-        if len(reply) > 4000:
-            reply = reply[:3997] + "..."
-        await update.message.reply_text(reply)
-
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update):
             return
-        await update.message.reply_text(messages.HELP_TEXT)
+        # DGN-919: build help text from COMMAND_MENU_SPEC so menu and help list
+        # always share the same order and copy (drift-proof single source).
+        lines = [messages.HELP_TEXT_HEADER]
+        for i, (cmd, desc_fn) in enumerate(COMMAND_MENU_SPEC, start=1):
+            lines.append(f"{i}. /{cmd} - {desc_fn()}")
+        lines.append("")
+        lines.append(messages.HELP_TEXT_FOOTER)
+        await update.message.reply_text("\n".join(lines))
 
-    async def _cmd_usage(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Run routines/claude-usage.sh and reply with its report.
 
-        No model call / no session: run the script directly (like /skills),
-        capture stdout, HTML-escape it, and wrap it in <pre> so the ASCII bars
-        and tables keep their alignment in Telegram. Long reports are split.
 
-        External dependency: this command shells out to a project-side
-        `routines/claude-usage.sh`, which is NOT shipped with this bridge. If
-        the script is absent, the command replies with a graceful
-        "script not found" notice (USAGE_SCRIPT_MISSING) and does nothing else.
-        The bridge passes LOCALE=config.locale into the script's environment so
-        a locale-aware script can match the bridge UI language (ko/en).
+    async def _cmd_authsync(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """DGN-1050: /authsync is RETIRED. This stub only explains why.
+
+        The original command (DGN-759) ran token-sync.sh, whose `sync`
+        subcommand unconditionally overwrote the macOS Keychain entry from
+        ~/.claude/.credentials.json. The Claude CLI keeps the keychain copy
+        authoritative and does NOT rewrite the file after runtime token
+        rotations, so the file is stale BY DESIGN -- the overwrite re-injected
+        superseded refresh tokens, the server revoked the token family on
+        reuse, and every instance sharing the account died (~daily).
+
+        The only safe credential writer is the CLI itself
+        (`claude auth login` in a plain terminal). This handler therefore:
+          - spawns NO subprocess and touches NO credential store, ever;
+          - replies with the retirement notice pointing to the correct
+            procedure;
+          - stays registered off-menu ONLY so the catch-all skill forwarder
+            cannot ship a typed /authsync into the SDK session (where a model
+            could otherwise be talked into running the retired skill script).
+
+        The DGN-994 sync-ok restart CTA died with the sync path; /restart
+        (DGN-997) is the surviving restart surface.
         """
         if not await self._check_access(update):
             return
-        script = PROJECT_ROOT / "routines" / "claude-usage.sh"
-        if not script.is_file():
-            await update.message.reply_text(messages.USAGE_SCRIPT_MISSING)
+        await update.message.reply_text(messages.AUTHSYNC_RETIRED)
+
+    async def _cmd_restart(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """DGN-997: /restart -- owner-only explicit bridge restart command.
+
+        Fills a missing command-line surface: DGN-994 wired a restart CTA
+        only inside the /authsync sync-ok reply (a button, not a command),
+        so the general-purpose "just restart" path had no slash entry at
+        all -- an agent ended up announcing a non-existent /restart to the
+        owner (DGN-997 incident).
+
+        Owner gate: same _check_access() every other command uses -- no new
+        permission logic. An explicit /restart typed by the owner IS the
+        explicit restart command (AGENT.md Self-restart: an owner trigger
+        skips the idle guard entirely, immediate, no confirmation menu),
+        the same convention DGN-994's CTA tap already uses, so this reuses
+        that exact call shape: --trigger user, no --resume-intent.
+
+        --resume-intent intentionally omitted: --resume-intent exists for a
+        caller that KNOWS the specific in-flight task it is cutting off
+        (e.g. an agent restarting itself mid-fix, session-side). This handler
+        is a bridge-process command entry point -- it has no visibility
+        into what the live SDK session is doing at the moment the owner
+        types /restart, and guessing would violate the "no hunting
+        chronically-open wip tickets" contract self_restart.sh already
+        documents for the omitted case. Omitting the flag is the correct
+        "no specific in-flight task asserted" signal (self_restart.sh's own
+        contract), not a gap -- the resumed session's DGN-226 post-restart
+        self-verification step covers anything actually cut off.
+
+        Progress/completion notice: self_restart.sh owns the completion push
+        on its own (default fallback copy when no --notice is passed, see
+        self_restart.sh DGN-687/834). dec-094 adds a synchronous immediate
+        ack (RESTART_ACK) right after the launch subprocess returns 0, so
+        /restart is not silent for the ~6s SIGTERM window before that
+        completion push lands -- distinct message, no duplicate notice.
+        """
+        if not await self._check_access(update):
             return
 
-        def _run() -> str:
-            # Pass the active locale so the script localizes its labels
-            # (ko/en) to match the bridge UI.
-            run_env = {**os.environ, "LOCALE": config.locale}
-            proc = subprocess.run(
-                [str(script)],
+        # Duplicate-launch latch (_restart_launch_started): a rapid double
+        # /restart must not double-fire the script. Window-based, not sticky,
+        # so an aborted restart self-heals (see RESTART_LATCH_S). DGN-1050:
+        # formerly shared with the /authsync sync-ok CTA callback (DGN-994);
+        # that path is retired, /restart is now the latch's only trigger --
+        # keep the shared-attribute shape in case another restart entry
+        # point ever returns.
+        now = time.monotonic()
+        started = getattr(self, "_restart_launch_started", None)
+        if started is not None and now - started < RESTART_LATCH_S:
+            return
+        self._restart_launch_started = now
+
+        script = PACKAGE_DIR / "self_restart.sh"
+        if not script.is_file() or not os.access(script, os.X_OK):
+            self._restart_launch_started = None
+            await update.message.reply_text(
+                messages.RESTART_ERROR.format(
+                    error=f"restart script missing/not executable: {script}"
+                )
+            )
+            return
+
+        def _run_restart() -> subprocess.CompletedProcess:
+            # Launcher detaches a worker and exits quickly; the worker
+            # (nohup'd, session-detached) survives the bridge SIGTERM and
+            # owns the restart-complete owner push -- no new copy needed
+            # here.
+            return subprocess.run(
+                [
+                    str(script),
+                    "--trigger", "user",
+                    "--reason", "owner /restart command",
+                ],
                 capture_output=True,
                 text=True,
-                timeout=12,
-                env=run_env,
+                timeout=30,
             )
-            out = proc.stdout or ""
-            if not out.strip():
-                out = (proc.stderr or "").strip() or "(no output)"
-            return out
 
         try:
-            output = await asyncio.to_thread(_run)
-        except subprocess.TimeoutExpired:
-            await update.message.reply_text(messages.USAGE_TIMEOUT)
-            return
+            result = await asyncio.to_thread(_run_restart)
         except Exception as e:
+            self._restart_launch_started = None
             await update.message.reply_text(
-                messages.USAGE_FAILED.format(error=str(e))
+                messages.RESTART_ERROR.format(error=str(e))
             )
             return
 
-        escaped = html.escape(output)
-        for part in split_text(escaped):
-            # DGN-891: balance guard (no-op here) + tag-stripped fallback so
-            # the plain degrade never shows escaped entities.
-            body = balance_telegram_html(f"<pre>{part}</pre>")
+        if result.returncode != 0:
+            self._restart_launch_started = None
+            detail = (result.stderr or result.stdout or "").strip()
+            await update.message.reply_text(
+                messages.RESTART_ERROR.format(
+                    error=detail or f"self_restart.sh exit {result.returncode}"
+                )
+            )
+            return
+        # Success: the detached worker takes over (SIGTERM in ~6s); the
+        # restart-complete push is owned by self_restart.sh. Latch stays
+        # armed for the window so a second /restart cannot double-fire
+        # mid-restart.
+        #
+        # dec-094 (형님 2026-08-21): immediate ack here so /restart is not
+        # silent for the ~6s until the process dies. This is sent
+        # synchronously, before this handler returns, so it lands well
+        # inside the SIGTERM window. Distinct from the completion push
+        # self_restart.sh sends after the worker finishes -- no duplicate.
+        await update.message.reply_text(messages.RESTART_ACK)
+
+    async def _cmd_btw(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """DGN-902: /btw -- fork the current session context for a side question.
+
+        Reads the current main session_id, creates an ephemeral SDK client with
+        fork_session=True so it inherits the main session history but writes to
+        a new isolated session. The response is sent as a Telegram reply-to the
+        /btw message, marked with the 💭 bubble prefix.
+
+        Reply-to threading: if the user replies to a 💭 bubble, that incoming
+        message is routed to the same fork session (keyed by the anchor
+        message_id), not to the main history.
+        """
+        if not await self._check_access(update):
+            return
+
+        message = update.message
+        user_id = update.effective_user.id
+        chat = update.effective_chat
+        chat_id = chat.id if chat else user_id
+
+        # Extract the question from command args (text after "/btw ").
+        args = context.args or []
+        question = " ".join(args).strip()
+        if not question:
+            await message.reply_text(messages.BTW_NO_QUESTION)
+            return
+
+        # Gate: require an active main session to fork from.
+        session = await session_manager.get_session(user_id)
+        main_session_id = self._effective_session_id(user_id, session)
+        if not main_session_id:
+            await message.reply_text(messages.BTW_NO_SESSION)
+            return
+
+        # Send an acknowledgement reply-to the /btw message immediately.
+        # We capture its message_id to anchor the fork state.
+        try:
+            thinking_msg = await message.reply_text(
+                messages.BTW_THINKING,
+                reply_parameters=ReplyParameters(message_id=message.message_id),
+            )
+        except Exception as e:
+            logger.error("btw thinking reply failed for user %s: %s", user_id, e)
+            await message.reply_text(messages.BTW_FORK_FAILED)
+            return
+
+        anchor_mid = thinking_msg.message_id
+
+        # Register the fork state BEFORE running the turn so reply-to routing
+        # is live as soon as the anchor bubble exists.
+        fork = btw_module.BtwForkState(
+            anchor_message_id=anchor_mid,
+            spawned_from_session_id=main_session_id,
+        )
+        self._btw_forks.register_fork(user_id, fork)
+
+        # Run the fork turn in an enqueued task so it does not block the bot's
+        # main handler loop. The turn is independent of the main session queue.
+        async def run_fork_task() -> None:
             try:
-                await update.message.reply_text(body, parse_mode="HTML")
-            except Exception:
-                await update.message.reply_text(html_to_plain_text(body))
+                response = await self._btw_forks.run_fork_turn(user_id, fork, question)
+            except asyncio.TimeoutError:
+                logger.warning("btw fork turn timed out for user %s", user_id)
+                response = messages.BTW_FORK_FAILED
+            except Exception as e:
+                logger.error("btw fork turn failed for user %s: %s", user_id, e)
+                response = messages.BTW_FORK_FAILED
+
+            if not response:
+                # DGN-953: this fallback used to be fully silent -- the user
+                # got BTW_FORK_FAILED with zero log trace. Cause signals are
+                # in the bridge.btw empty-turn diagnostic line logged by the
+                # fork turn itself.
+                logger.warning(
+                    "DGN-953: btw fork turn produced empty response for "
+                    "user %s; replying with BTW_FORK_FAILED",
+                    user_id,
+                )
+                response = messages.BTW_FORK_FAILED
+
+            # Prepend the 💭 marker.
+            marked = f"{messages.BTW_MARKER}\n\n{response}"
+
+            # DGN-920: format through the shared prose->HTML helper so markdown
+            # in the fork response renders (** -> <b>, code blocks, etc.) the
+            # same way the normal send path does (DGN-891 tag balancing included).
+            # Fail-soft: if formatting raises, fall back to the raw marked text
+            # so the answer is delivered even without formatting.
+            try:
+                formatted = balance_telegram_html(
+                    sanitize_message_for_telegram(marked, rail=RAIL_MODEL)
+                )
+                use_html = True
+            except Exception as fmt_err:
+                logger.warning(
+                    "btw formatting failed for user %s (falling back to raw): %s",
+                    user_id,
+                    fmt_err,
+                )
+                formatted = marked
+                use_html = False
+
+            # DGN-922 FIX 3: split long output so a >4096-char fork response
+            # never fails silently.  Mirror the main send path: split_text
+            # chunks at paragraph > line > hard-cut boundaries, then
+            # rebalance_html_chunks ensures every chunk is independently
+            # valid HTML (no tag straddling the split point).  Each chunk gets
+            # its own html_to_plain_text degrade fallback so a Telegram HTML
+            # rejection never stalls with the anchor bubble stuck on "생각 중...".
+            chunks: List[str] = split_text(formatted) if formatted else [formatted]
+            if use_html:
+                chunks = rebalance_html_chunks(chunks)
+            parse_mode_val = "HTML" if use_html else None
+
+            async def _send_chunk(text_chunk: str, *, reply_to_mid: int) -> Optional[int]:
+                """Send one chunk; returns the new message_id or None on total failure."""
+                parse_mode = parse_mode_val
+                try:
+                    sent = await self.application.bot.send_message(
+                        chat_id=chat_id,
+                        text=text_chunk,
+                        parse_mode=parse_mode,
+                        reply_parameters=ReplyParameters(message_id=reply_to_mid),
+                    )
+                    return sent.message_id
+                except Exception as html_err:
+                    if not use_html:
+                        logger.error(
+                            "btw chunk send failed for user %s: %s", user_id, html_err
+                        )
+                        return None
+                    # HTML rejected: degrade to plain text.
+                    try:
+                        sent = await self.application.bot.send_message(
+                            chat_id=chat_id,
+                            text=html_to_plain_text(text_chunk),
+                            parse_mode=None,
+                            reply_parameters=ReplyParameters(message_id=reply_to_mid),
+                        )
+                        return sent.message_id
+                    except Exception as plain_err:
+                        logger.error(
+                            "btw chunk plain-text fallback also failed for user %s: %s",
+                            user_id,
+                            plain_err,
+                        )
+                        return None
+
+            first_chunk = chunks[0]
+            rest_chunks = chunks[1:]
+
+            # Try to edit the thinking anchor to the first chunk.
+            # On edit failure, fall back to sending a fresh message so the
+            # anchor bubble is never left stuck on "생각 중...".
+            # Use a local mutable container for the anchor id so inner-function
+            # assignment does not create a Python "local before use" shadowing
+            # issue with the outer anchor_mid closure variable.
+            thread_anchor = [anchor_mid]  # [0] = current anchor message_id
+            try:
+                await self.application.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=thread_anchor[0],
+                    text=first_chunk,
+                    parse_mode=parse_mode_val,
+                )
+            except Exception as edit_err:
+                logger.warning(
+                    "btw edit failed for user %s (will send fresh reply): %s",
+                    user_id,
+                    edit_err,
+                )
+                # Edit failed: try HTML send, then plain-text degrade.
+                new_mid = await _send_chunk(first_chunk, reply_to_mid=message.message_id)
+                if new_mid is not None:
+                    # Re-register fork under the new anchor so reply routing works.
+                    fork.anchor_message_id = new_mid
+                    self._btw_forks.register_fork(user_id, fork)
+                    thread_anchor[0] = new_mid
+                else:
+                    # Both edit and send failed: anchor bubble stays; log and give up.
+                    logger.error(
+                        "btw: both edit and fresh send failed for user %s; "
+                        "anchor bubble may be stuck",
+                        user_id,
+                    )
+
+            # Send remaining chunks (if any) as follow-up replies to the anchor.
+            for extra_chunk in rest_chunks:
+                await _send_chunk(extra_chunk, reply_to_mid=thread_anchor[0])
+
+        # DGN-911/DGN-922: drain _user_pending_texts when the fork ends.
+        # FIX 4 moves fork tasks to _btw_fork_tasks (out of _user_run_tasks),
+        # so a new message no longer stalls behind a running fork.  The drain
+        # here is belt-and-braces: if a debounce expire moved items into
+        # _user_pending_texts just before the fork finished, the drain fires
+        # the merged follow-up immediately instead of waiting for idle.
+        async def _fork_task_with_drain() -> None:
+            try:
+                await run_fork_task()
+            finally:
+                await self._drain_pending_texts(user_id)
+
+        # DGN-922 FIX 4: fire the fork task in the SEPARATE btw fork set
+        # (not _user_run_tasks) so normal messages arriving while the fork
+        # runs are NOT forced into the debounce path.  _clear_user_queue
+        # still cancels fork tasks on /stop (see _track_btw_fork_task).
+        task = asyncio.create_task(_fork_task_with_drain())
+        self._track_btw_fork_task(user_id, task)
+
+    async def _maybe_route_btw_reply(
+        self,
+        user_id: int,
+        text: str,
+        message,
+        update,
+    ) -> bool:
+        """DGN-902: route a reply-to message into its fork session if applicable.
+
+        Returns True when the message was claimed by a btw fork (caller stops
+        further routing). Returns False when the message is not a reply to a
+        known fork bubble (caller proceeds with normal routing).
+
+        The check is: does this message have a reply_to_message whose message_id
+        is registered as a fork anchor for this user?
+        """
+        reply_to = getattr(message, "reply_to_message", None)
+        if reply_to is None:
+            return False
+        anchor_mid = getattr(reply_to, "message_id", None)
+        if anchor_mid is None:
+            return False
+
+        fork = self._btw_forks.lookup_fork(user_id, anchor_mid)
+        if fork is None:
+            return False
+
+        # Claimed by a btw fork. Route the question to the fork session.
+        chat = update.effective_chat
+        chat_id = chat.id if chat else user_id
+
+        async def run_fork_continuation() -> None:
+            try:
+                response = await self._btw_forks.run_fork_turn(user_id, fork, text)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "btw fork continuation timed out for user %s", user_id
+                )
+                response = messages.BTW_FORK_FAILED
+            except Exception as e:
+                logger.error(
+                    "btw fork continuation failed for user %s: %s", user_id, e
+                )
+                response = messages.BTW_FORK_FAILED
+
+            if not response:
+                # DGN-953: same observability gap as the first-turn fallback
+                # above -- log before silently swapping in BTW_FORK_FAILED.
+                logger.warning(
+                    "DGN-953: btw fork continuation produced empty response "
+                    "for user %s; replying with BTW_FORK_FAILED",
+                    user_id,
+                )
+                response = messages.BTW_FORK_FAILED
+
+            marked = f"{messages.BTW_MARKER}\n\n{response}"
+            # DGN-920: same shared formatting as the initial fork send path.
+            # Fail-soft: if formatting raises, send the raw marked text.
+            try:
+                formatted = balance_telegram_html(
+                    sanitize_message_for_telegram(marked, rail=RAIL_MODEL)
+                )
+                use_html = True
+            except Exception as fmt_err:
+                logger.warning(
+                    "btw continuation formatting failed for user %s (raw fallback): %s",
+                    user_id,
+                    fmt_err,
+                )
+                formatted = marked
+                use_html = False
+            # DGN-922 FIX 3 (continuation path): same split + plain-text degrade
+            # pattern as the initial fork send path.  A long continuation
+            # response must not be silently dropped just because a single
+            # send_message call exceeds Telegram's 4096-char limit.
+            cont_chunks: List[str] = split_text(formatted) if formatted else [formatted]
+            if use_html:
+                cont_chunks = rebalance_html_chunks(cont_chunks)
+            cont_parse_mode = "HTML" if use_html else None
+
+            reply_to_mid = message.message_id
+            for cont_chunk in cont_chunks:
+                try:
+                    sent = await self.application.bot.send_message(
+                        chat_id=chat_id,
+                        text=cont_chunk,
+                        parse_mode=cont_parse_mode,
+                        reply_parameters=ReplyParameters(message_id=reply_to_mid),
+                    )
+                    # Chain continuation chunks as replies to each other so the
+                    # thread stays readable.
+                    reply_to_mid = sent.message_id
+                except Exception as html_send_err:
+                    if not use_html:
+                        logger.error(
+                            "btw continuation send failed for user %s: %s",
+                            user_id,
+                            html_send_err,
+                        )
+                        continue
+                    # HTML rejected: degrade to plain text.
+                    try:
+                        sent = await self.application.bot.send_message(
+                            chat_id=chat_id,
+                            text=html_to_plain_text(cont_chunk),
+                            parse_mode=None,
+                            reply_parameters=ReplyParameters(message_id=reply_to_mid),
+                        )
+                        reply_to_mid = sent.message_id
+                    except Exception as cont_plain_err:
+                        logger.error(
+                            "btw continuation plain-text fallback failed for user %s: %s",
+                            user_id,
+                            cont_plain_err,
+                        )
+
+        # DGN-911/DGN-922 FIX 4: same drain-on-exit pattern as the initial
+        # fork task (see above).  Fork continuation is also tracked in the
+        # SEPARATE btw fork set, NOT _user_run_tasks, so it does not block
+        # the debounce/in-flight decision for normal messages.
+        async def _fork_continuation_with_drain() -> None:
+            try:
+                await run_fork_continuation()
+            finally:
+                await self._drain_pending_texts(user_id)
+
+        task = asyncio.create_task(_fork_continuation_with_drain())
+        self._track_btw_fork_task(user_id, task)
+        return True
 
     @staticmethod
     def _read_skill_frontmatter(skill_md: Path) -> Optional[tuple]:
@@ -1232,7 +2746,14 @@ class TelegramBot:
             elif stripped.startswith("description:"):
                 val = stripped[len("description:"):].strip()
                 if val in (">", ">-", "|", "|-", ">+", "|+", ""):
-                    # Folded/literal block: gather following more-indented lines.
+                    # YAML block-scalar indicator on the key line (e.g.
+                    # "description: >-"): the real text lives on the following
+                    # more-indented lines, NOT the indicator token.  Fold them
+                    # so callers get the actual description, never a literal
+                    # ">-" leak (DGN-618).  This parser is shared by
+                    # _collect_skills and any other frontmatter reader, so the
+                    # fold must stay correct even though /skills no longer
+                    # renders the description.
                     base_indent = len(line) - len(line.lstrip())
                     parts: List[str] = []
                     i += 1
@@ -1255,6 +2776,28 @@ class TelegramBot:
             name = skill_md.parent.name
         return (name, description or "")
 
+    @staticmethod
+    def _skill_roots() -> List[Path]:
+        """Skill install roots, workspace-first with HOME fallback.
+
+        DGN-929: single source of truth for skill/script lookup order.
+        Project skills live under PROJECT_ROOT/.claude/skills (standard
+        Dogany instance layout); ~/.claude/skills is the legacy/global
+        fallback. Shared by /skills listing and any skill-script lookup
+        (formerly also the retired /authsync, DGN-1050) -- do not
+        re-hardcode either root elsewhere.
+        """
+        return [PROJECT_ROOT / ".claude" / "skills", Path.home() / ".claude" / "skills"]
+
+    def _resolve_skill_script(self, skill_name: str, script_name: str) -> Optional[Path]:
+        """Resolve <skill_name>/<script_name> against _skill_roots() in order,
+        returning the first existing file. None if not found in either root."""
+        for root in self._skill_roots():
+            candidate = root / skill_name / script_name
+            if candidate.is_file():
+                return candidate
+        return None
+
     def _collect_skills(self, skills_dir: Path) -> List[tuple]:
         """(name, description) for every SKILL.md directly under skills_dir."""
         out: List[tuple] = []
@@ -1272,19 +2815,24 @@ class TelegramBot:
         if not await self._check_access(update):
             return
         # Read SKILL.md frontmatter directly -- no model call, no session, no
-        # stream teardown (RELIABILITY #4). Project skills live under
-        # PROJECT_ROOT/.claude/skills; global under ~/.claude/skills.
-        project_skills = self._collect_skills(PROJECT_ROOT / ".claude" / "skills")
-        global_skills = self._collect_skills(Path.home() / ".claude" / "skills")
+        # stream teardown (RELIABILITY #4). Lookup order per _skill_roots():
+        # PROJECT_ROOT/.claude/skills first (workspace), ~/.claude/skills (global) fallback.
+        project_root, global_root = self._skill_roots()
+        project_skills = self._collect_skills(project_root)
+        global_skills = self._collect_skills(global_root)
         lines: List[str] = []
 
         def _fmt(entries: List[tuple]) -> List[str]:
+            # DS list rule (DGN-376): top-level bullet "• ".  Show the localized
+            # display name only; fall back to "/name" when unmapped.  The long
+            # English SKILL.md description is intentionally NOT shown here
+            # (DGN-618): it was caveman-English, truncated mid-word, and an
+            # English wall for a Korean owner.
             rows = []
-            for name, desc in entries:
-                desc = (desc or "").strip()
-                if len(desc) > 120:
-                    desc = desc[:117] + "..."
-                rows.append(f"/{name}" + (f" - {desc}" if desc else ""))
+            for name, _desc in entries:
+                label = skill_display_name(name)
+                text = label if label != name else f"/{name}"
+                rows.append(f"• {text}")
             return rows
 
         if project_skills:
@@ -1352,15 +2900,24 @@ class TelegramBot:
                     force_options=response.has_options,
                     streamed=response.streamed,
                     draft_message_ids=response.draft_message_ids,
+                    classifier_injected=getattr(response, "options_classifier_injected", False),
+                    assembled=getattr(response, "turn_assembled", False),
                 )
             except Exception as e:
                 logger.error("Skill execution failed: %s", e, exc_info=True)
                 await message.reply_text(messages.PROCESSING_FAILED.format(error=_fmt_error(e)))
+            finally:
+                # DGN-911 FATAL fix: drain debounce buffer on every SDK turn
+                # completion so the "interrupted turn drains it" invariant holds
+                # for all turn types, not only _dispatch_text_turn and fastpath.
+                await self._drain_pending_texts(user_id)
 
         async def on_overflow() -> None:
             await message.reply_text(messages.QUEUE_BUSY)
 
-        await self._enqueue_user_task(user_id, run_task, on_overflow)
+        await self._enqueue_user_task(
+            user_id, run_task, on_overflow, chat_id=chat.id if chat else user_id
+        )
 
     # --- session listing (reads Claude conversation JSONL) ---
 
@@ -1409,43 +2966,6 @@ class TelegramBot:
                 break
         return results
 
-    def _get_recent_messages(self, session_id: str, limit: int = 5):
-        import json
-
-        filepath = self._conversations_dir / f"{session_id}.jsonl"
-        if not filepath.exists():
-            return []
-        out = []
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        d = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if d.get("type") not in ("user", "assistant"):
-                        continue
-                    msg = d.get("message", {})
-                    role = msg.get("role")
-                    if role not in ("user", "assistant"):
-                        continue
-                    content = msg.get("content", "")
-                    text = ""
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                text = block.get("text", "").strip()
-                                if text:
-                                    break
-                    elif isinstance(content, str):
-                        text = content.strip()
-                    if text:
-                        out.append({"role": role, "content": text})
-        except Exception as e:
-            logger.error("Error reading session messages: %s", e)
-            return []
-        return out[-limit:]
-
     # --- text / voice handlers ---
 
     async def _handle_text_message(
@@ -1478,30 +2998,65 @@ class TelegramBot:
             session.pop("resume_list", None)
             await session_manager.update_session(user_id, session)
 
-        await self._maybe_capture_outside_approval(user_id, text)
+        approval_pending = await self._maybe_capture_outside_approval(user_id, text)
 
-        # DGN-351: Telegram splits a long owner message at 4096 chars into
+        # DGN-351: Telegram splits a long pasted message at 4096 chars into
         # back-to-back updates. A boundary-length part opens a merge window in
         # the same chat; continuation parts are concatenated and dispatched as
         # ONE turn. Short messages skip this entirely (zero-delay unchanged).
-        chat_id = message.chat_id
-        if await self._maybe_buffer_split_part(chat_id, update, user_id, text):
+        # Placed BEFORE the btw/fast-path checks on purpose: the tail part of a
+        # split is often short and would otherwise be eaten by the fast-path
+        # prefilter, which would strand the buffered head. Both checks still run
+        # on the merged text in _dispatch_text_task below.
+        if await self._maybe_buffer_split_part(
+            message.chat_id, update, user_id, text
+        ):
             return
 
-        await self._dispatch_text_task(update, user_id, text)
+        await self._dispatch_text_task(
+            update, user_id, text, approval_pending=approval_pending
+        )
 
     async def _dispatch_text_task(
-        self, update: Update, user_id: int, text: str
+        self,
+        update: Update,
+        user_id: int,
+        text: str,
+        *,
+        approval_pending: bool = False,
     ) -> None:
+        """Route one (possibly split-merged) regular text message.
+
+        DGN-351 split-merge dispatches through here too, so the fork-reply and
+        fast-path checks see the MERGED text, never a half of it.
+        """
         message = update.message
 
-        async def run_task() -> None:
-            await self._process_user_message_text(update, user_id, text)
+        # DGN-902: reply-to routing for /btw fork continuations. If the
+        # incoming message is a reply to a known 💭 fork bubble, route it into
+        # that fork's isolated session instead of the main history. The check
+        # is intentionally before fast-path and coalescing -- a fork reply
+        # must never land in the main session queue.
+        if await self._maybe_route_btw_reply(user_id, text, message, update):
+            return
 
-        async def on_overflow() -> None:
-            await message.reply_text(messages.QUEUE_BUSY)
+        # DGN-801: deterministic fast-path. On opted-in instances a short
+        # numeric-looking message is offered to the domain handler BEFORE an
+        # SDK turn spawns; a claimed message is fully handled (or model-fallback
+        # dispatched) inside the fast-path task, so stop here. Default OFF:
+        # without FASTPATH_HANDLER this is a no-op boolean check.
+        # B4 (Option 2): skip fast-path entirely while an outside-approval
+        # prompt is live -- a bare numeric token ("1") would otherwise be
+        # double-consumed (approval grant AND fast-path set). The approval path
+        # already handled it; hand this turn to the normal SDK path.
+        if not approval_pending and await self._try_fastpath(user_id, text, update):
+            return
 
-        await self._enqueue_user_task(user_id, run_task, on_overflow)
+        # DGN-911: regular text goes through the default in-flight policy. If a
+        # turn is already running for this user, this message opens/extends the
+        # debounce window and then soft-interrupts into a new merged turn;
+        # explicit /queue keeps the DGN-616 merge-without-interrupt behavior.
+        await self._enqueue_text_task(user_id, text, self._message_ts(message), update)
 
     async def _maybe_buffer_split_part(
         self, chat_id: int, update: Update, user_id: int, text: str
@@ -1607,63 +3162,79 @@ class TelegramBot:
         user_id = update.effective_user.id
         voice = message.voice
 
-        async def run_task() -> None:
-            self._audio_dir.mkdir(parents=True, exist_ok=True)
-            cleanup_paths: List[Path] = []
-            try:
-                if voice.duration and voice.duration > config.max_voice_duration:
-                    await message.reply_text(
-                        messages.VOICE_TOO_LONG.format(seconds=config.max_voice_duration)
-                    )
-                    return
-                ext = self._voice_extension(getattr(voice, "mime_type", None))
-                source_path = self._audio_dir / f"{user_id}_{int(time.time() * 1000)}.{ext}"
-                cleanup_paths.append(source_path)
-                try:
-                    await self._download_file(voice.file_id, source_path)
-                except Exception as e:
-                    logger.error("Voice download failed for user %s: %s", user_id, e)
-                    await message.reply_text(messages.VOICE_DOWNLOAD_FAILED)
-                    return
-                try:
-                    audio_path = await self._audio_processor.prepare_for_whisper(
-                        source_path, cleanup_paths
-                    )
-                except Exception as e:
-                    logger.error("Voice conversion failed for user %s: %s", user_id, e)
-                    await message.reply_text(messages.VOICE_CONVERT_FAILED)
-                    return
-                if self._transcriber is None:
-                    self._transcriber = self._build_transcriber()
-                try:
-                    self._transcriber.ensure_available()
-                except RuntimeError as e:
-                    logger.error("Local whisper unavailable: %s", e)
-                    await message.reply_text(messages.VOICE_UNAVAILABLE)
-                    return
-                from bridge.voice import EmptyTranscriptionError, TranscriptionError
-
-                try:
-                    text = await self._transcriber.transcribe_audio(
-                        audio_path, duration_seconds=voice.duration
-                    )
-                except EmptyTranscriptionError:
-                    await message.reply_text(messages.VOICE_EMPTY)
-                    return
-                except TranscriptionError as e:
-                    logger.error("Transcription failed for user %s: %s", user_id, e)
-                    await message.reply_text(messages.VOICE_TRANSCRIBE_FAILED)
-                    return
-                await self._process_user_message_text(
-                    update, user_id, text, voice_input_preview=text
+        # DGN-616: transcribe the voice note here (download I/O is independent of
+        # the SDK turn and safe to run while a turn is in flight), then route the
+        # transcript through the coalescing path so it merges with any in-flight
+        # turn instead of dropping. Attachment-specific failures reply inline as
+        # before; a crash in the merged turn is still caught by the DGN-163 net
+        # inside _dispatch_text_turn (voice failure_message carried via update).
+        self._audio_dir.mkdir(parents=True, exist_ok=True)
+        cleanup_paths: List[Path] = []
+        try:
+            if voice.duration and voice.duration > config.max_voice_duration:
+                await message.reply_text(
+                    messages.VOICE_TOO_LONG.format(seconds=config.max_voice_duration)
                 )
-            finally:
-                await self._audio_processor.cleanup_audio_files(cleanup_paths)
+                return
+            ext = self._voice_extension(getattr(voice, "mime_type", None))
+            source_path = self._audio_dir / f"{user_id}_{int(time.time() * 1000)}.{ext}"
+            cleanup_paths.append(source_path)
+            try:
+                await self._download_file(voice.file_id, source_path)
+            except Exception as e:
+                logger.error("Voice download failed for user %s: %s", user_id, e)
+                await self._turn_death_notice(
+                    user_id,
+                    update.effective_chat.id if update.effective_chat else user_id,
+                    messages.TURN_FAILED_VOICE,
+                )
+                return
+            try:
+                audio_path = await self._audio_processor.prepare_for_whisper(
+                    source_path, cleanup_paths
+                )
+            except Exception as e:
+                logger.error("Voice conversion failed for user %s: %s", user_id, e)
+                await message.reply_text(messages.VOICE_CONVERT_FAILED)
+                return
+            if self._transcriber is None:
+                self._transcriber = self._build_transcriber()
+            try:
+                self._transcriber.ensure_available()
+            except RuntimeError as e:
+                logger.error("Local whisper unavailable: %s", e)
+                await message.reply_text(messages.VOICE_UNAVAILABLE)
+                return
+            from bridge.voice import EmptyTranscriptionError, TranscriptionError
 
-        async def on_overflow() -> None:
-            await message.reply_text(messages.QUEUE_BUSY)
-
-        await self._enqueue_user_task(user_id, run_task, on_overflow)
+            try:
+                text = await self._transcriber.transcribe_audio(
+                    audio_path, duration_seconds=voice.duration
+                )
+            except EmptyTranscriptionError:
+                await message.reply_text(messages.VOICE_EMPTY)
+                return
+            except TranscriptionError as e:
+                logger.error("Transcription failed for user %s: %s", user_id, e)
+                await message.reply_text(messages.VOICE_TRANSCRIBE_FAILED)
+                return
+            # Surface the transcript preview before enqueueing; the turn body no
+            # longer carries voice_input_preview since it may run merged later.
+            preview = str(text).strip()
+            if preview:
+                try:
+                    await message.reply_text(f"\U0001f399️ {preview}")
+                except Exception:
+                    pass
+            await self._enqueue_text_task(
+                user_id,
+                text,
+                self._message_ts(message),
+                update,
+                failure_message=messages.TURN_FAILED_VOICE,
+            )
+        finally:
+            await self._audio_processor.cleanup_audio_files(cleanup_paths)
 
     async def _handle_photo_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1678,12 +3249,18 @@ class TelegramBot:
         user_id = update.effective_user.id
         # Telegram sends a photo as ascending-resolution sizes; last = largest.
         photo = message.photo[-1]
-        caption = (message.caption or "").strip()
+        # DGN-941: a leading "/queue" caption token routes the photo turn
+        # through the coalescing path instead of the immediate (interrupting)
+        # dispatch. The token is stripped so it never reaches the prompt.
+        caption, coalesce = self._split_caption_queue(message.caption or "")
         mgid = message.media_group_id
 
         if not mgid:
-            # Single photo: dispatch immediately (legacy behavior).
-            await self._dispatch_photo_task(update, user_id, [photo.file_id], caption)
+            # Single photo: dispatch immediately (legacy behavior) unless the
+            # caption carried /queue, which coalesces instead of interrupting.
+            await self._dispatch_photo_task(
+                update, user_id, [photo.file_id], caption, coalesce=coalesce
+            )
             return
 
         # album. Buffer same-group photos and debounce-flush as one task.
@@ -1696,13 +3273,18 @@ class TelegramBot:
                     "message": message,
                     "file_ids": [],
                     "caption": "",
+                    "coalesce": False,
                     "timer": None,
                 }
                 self._media_groups[mgid] = group
             group["file_ids"].append(photo.file_id)
-            # Telegram puts the caption only on the first album item; keep first seen.
+            # Telegram puts the caption only on the first album item; keep first
+            # seen. DGN-941: the /queue token rides that same first-item caption,
+            # so latch the coalesce flag alongside the caption.
             if caption and not group["caption"]:
                 group["caption"] = caption
+            if coalesce:
+                group["coalesce"] = True
             if group["timer"] is not None:
                 group["timer"].cancel()
             group["timer"] = asyncio.create_task(self._flush_media_group_after(mgid))
@@ -1718,48 +3300,87 @@ class TelegramBot:
             group = self._media_groups.pop(mgid, None)
         if not group or not group["file_ids"]:
             return
-        await self._dispatch_photo_task(
-            group["update"], group["user_id"], group["file_ids"], group["caption"]
-        )
+        # DGN-163: this runs as a bare debounce task, so an exception escaping the
+        # dispatch would be swallowed by asyncio (silent album loss). Guard it and
+        # route to the safety-net notice. The per-download failures are handled
+        # inside the enqueued run_task; this catches the rarer pre-enqueue crash.
+        try:
+            await self._dispatch_photo_task(
+                group["update"],
+                group["user_id"],
+                group["file_ids"],
+                group["caption"],
+                coalesce=group.get("coalesce", False),
+            )
+        except Exception as e:
+            logger.error("Media-group dispatch failed for user %s: %s", group["user_id"], e)
+            upd = group["update"]
+            chat_id = upd.effective_chat.id if upd.effective_chat else group["user_id"]
+            await self._turn_death_notice(
+                group["user_id"], chat_id, messages.TURN_FAILED_PHOTO
+            )
 
     async def _dispatch_photo_task(
-        self, update: Update, user_id: int, file_ids: List[str], caption: str
+        self,
+        update: Update,
+        user_id: int,
+        file_ids: List[str],
+        caption: str,
+        *,
+        coalesce: bool = False,
     ) -> None:
         # download 1..N photos (single or album) and hand all paths to the
-        # multimodal brain in ONE task, so an album is read as a single message.
+        # multimodal brain in ONE turn, so an album is read as a single message.
+        # DGN-616: download I/O runs here (independent of the SDK turn) and the
+        # resulting prompt (path references + caption) routes through the
+        # coalescing path so a photo arriving mid-turn merges instead of dropping.
         message = update.message
-
-        async def run_task() -> None:
-            self._image_dir.mkdir(parents=True, exist_ok=True)
-            paths: List[Path] = []
-            for idx, fid in enumerate(file_ids):
-                dest = self._image_dir / f"{user_id}_{int(time.time() * 1000)}_{idx}.jpg"
-                try:
-                    await self._download_file(fid, dest)
-                except Exception as e:
-                    logger.error("Photo download failed for user %s: %s", user_id, e)
-                    continue
-                paths.append(dest)
-            if not paths:
-                await message.reply_text(messages.PHOTO_DOWNLOAD_FAILED)
-                return
-            if len(paths) == 1:
-                lines = [
-                    messages.PHOTO_PROMPT_SINGLE,
-                    messages.PHOTO_PROMPT_PATH.format(path=paths[0]),
-                ]
-            else:
-                lines = [messages.PHOTO_PROMPT_ALBUM.format(count=len(paths))]
-                for i, p in enumerate(paths, 1):
-                    lines.append(messages.PHOTO_PROMPT_ALBUM_PATH.format(index=i, path=p))
-            if caption:
-                lines.append(messages.USER_CAPTION.format(caption=caption))
-            await self._process_user_message_text(update, user_id, "\n".join(lines))
-
-        async def on_overflow() -> None:
-            await message.reply_text(messages.QUEUE_BUSY)
-
-        await self._enqueue_user_task(user_id, run_task, on_overflow)
+        self._image_dir.mkdir(parents=True, exist_ok=True)
+        paths: List[Path] = []
+        last_exc: Optional[Exception] = None
+        for idx, fid in enumerate(file_ids):
+            dest = self._image_dir / f"{user_id}_{int(time.time() * 1000)}_{idx}.jpg"
+            try:
+                await self._download_file(fid, dest)
+            except Exception as e:
+                # Per-photo miss in an album is tolerated (best-effort); the
+                # turn still proceeds with whatever downloaded. Only a total
+                # wipeout (no paths) is a turn-death, handled below.
+                logger.error("Photo download failed for user %s: %s", user_id, e)
+                last_exc = e
+                continue
+            paths.append(dest)
+        if not paths:
+            # DGN-082/163: every photo failed after retries -> emit the
+            # photo-specific notice. No silent loss.
+            logger.error(
+                "Photo download produced no paths for user %s: %s", user_id, last_exc
+            )
+            await self._turn_death_notice(
+                user_id,
+                update.effective_chat.id if update.effective_chat else user_id,
+                messages.TURN_FAILED_PHOTO,
+            )
+            return
+        if len(paths) == 1:
+            lines = [
+                messages.PHOTO_PROMPT_SINGLE,
+                messages.PHOTO_PROMPT_PATH.format(path=paths[0]),
+            ]
+        else:
+            lines = [messages.PHOTO_PROMPT_ALBUM.format(count=len(paths))]
+            for i, p in enumerate(paths, 1):
+                lines.append(messages.PHOTO_PROMPT_ALBUM_PATH.format(index=i, path=p))
+        if caption:
+            lines.append(messages.USER_CAPTION.format(caption=caption))
+        await self._enqueue_text_task(
+            user_id,
+            "\n".join(lines),
+            self._message_ts(message),
+            update,
+            failure_message=messages.TURN_FAILED_PHOTO,
+            coalesce=coalesce,
+        )
 
     async def _handle_document_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1772,31 +3393,41 @@ class TelegramBot:
             return
         user_id = update.effective_user.id
         doc = message.document
-        caption = (message.caption or "").strip()
+        # DGN-941: leading "/queue" caption token -> coalescing path (token
+        # stripped from the caption before it enters the prompt).
+        caption, coalesce = self._split_caption_queue(message.caption or "")
 
-        async def run_task() -> None:
-            self._inbox_dir.mkdir(parents=True, exist_ok=True)
-            # Preserve the original filename; prefix user+ts to avoid clashes.
-            safe_name = Path(doc.file_name).name if doc.file_name else "file"
-            dest = self._inbox_dir / f"{user_id}_{int(time.time() * 1000)}_{safe_name}"
-            try:
-                await self._download_file(doc.file_id, dest)
-            except Exception as e:
-                logger.error("Document download failed for user %s: %s", user_id, e)
-                await message.reply_text(messages.DOC_DOWNLOAD_FAILED)
-                return
-            lines = [
-                messages.DOC_PROMPT,
-                messages.DOC_PROMPT_PATH.format(path=dest),
-            ]
-            if caption:
-                lines.append(messages.USER_CAPTION.format(caption=caption))
-            await self._process_user_message_text(update, user_id, "\n".join(lines))
-
-        async def on_overflow() -> None:
-            await message.reply_text(messages.QUEUE_BUSY)
-
-        await self._enqueue_user_task(user_id, run_task, on_overflow)
+        # DGN-616: download the file here (independent of the SDK turn) then route
+        # the resulting prompt through the coalescing path so a doc arriving
+        # mid-turn merges instead of dropping.
+        self._inbox_dir.mkdir(parents=True, exist_ok=True)
+        # Preserve the original filename; prefix user+ts to avoid clashes.
+        safe_name = Path(doc.file_name).name if doc.file_name else "file"
+        dest = self._inbox_dir / f"{user_id}_{int(time.time() * 1000)}_{safe_name}"
+        try:
+            await self._download_file(doc.file_id, dest)
+        except Exception as e:
+            logger.error("Document download failed for user %s: %s", user_id, e)
+            await self._turn_death_notice(
+                user_id,
+                update.effective_chat.id if update.effective_chat else user_id,
+                messages.TURN_FAILED_DOCUMENT,
+            )
+            return
+        lines = [
+            messages.DOC_PROMPT,
+            messages.DOC_PROMPT_PATH.format(path=dest),
+        ]
+        if caption:
+            lines.append(messages.USER_CAPTION.format(caption=caption))
+        await self._enqueue_text_task(
+            user_id,
+            "\n".join(lines),
+            self._message_ts(message),
+            update,
+            failure_message=messages.TURN_FAILED_DOCUMENT,
+            coalesce=coalesce,
+        )
 
     @staticmethod
     def _voice_extension(mime_type: Optional[str]) -> str:
@@ -1819,11 +3450,14 @@ class TelegramBot:
         # file downloads need a longer read_timeout than the shared
         # request default (10s). When the Telegram API is briefly slow, a 10s
         # read_timeout drops inbound photos/documents/voice. 60s rides it out.
-        # add retry-with-exponential-backoff for transient errors
-        # (Telegram 5xx / connection reset / TLS blip). 3 attempts, 1s/2s backoff.
-        # Mirrors _send_guaranteed pattern. Callers' catch/notify logic unchanged.
+        # DGN-082: retry-with-exponential-backoff for transient errors
+        # (Telegram 5xx / connection reset / TLS blip). 3 attempts, 1s/3s/9s
+        # backoff (sleep after attempt 1 = 1s, after attempt 2 = 3s; the 9s slot
+        # is reserved should attempts grow). Mirrors _send_guaranteed. On final
+        # failure this raises -- the caller's enqueue safety net (DGN-163) then
+        # emits the media-specific turn-death notice, so no inbound is lost.
         _max_attempts = 3
-        _backoff_delays = [1.0, 2.0]  # sleep after attempt 1, attempt 2; none after 3
+        _backoff_delays = [1.0, 3.0, 9.0]
         last_exc: Exception
         for _attempt in range(1, _max_attempts + 1):
             try:
@@ -1936,12 +3570,33 @@ class TelegramBot:
                 await self._send_resume_notice(chat_id=chat.id, user_id=user_id, response=response)
                 return
             await self._save_session_id(user_id, response)
+            # DGN-686 MAJOR-1: a transient is_error result auto-retries ONCE
+            # here in the caller context (never inside the reader loop). Only
+            # if the single retry also fails do we surface the notice + button.
+            if getattr(response, "error_kind", None) == "transient":
+                logger.warning(
+                    "transient is_error for user %s -- auto-retrying once", user_id
+                )
+                # resume_caller re-runs an arbitrary message via process_message;
+                # feed it the ORIGINAL text for a single automatic retry.
+                response = await resume_caller(text)
+                await self._save_session_id(user_id, response)
+            # DGN-686: an is_error result offering a retry gets the LOCKED
+            # notice plus a [retry] button that re-runs the same user message.
+            if getattr(response, "retry_offer", False):
+                await self._send_retry_notice(
+                    chat_id=chat.id, user_id=user_id,
+                    notice=response.content, user_message=text,
+                )
+                return
             await self._reply_smart(
                 message,
                 response.content,
                 force_options=response.has_options,
                 streamed=response.streamed,
                 draft_message_ids=response.draft_message_ids,
+                classifier_injected=getattr(response, "options_classifier_injected", False),
+                assembled=getattr(response, "turn_assembled", False),
             )
         except asyncio.CancelledError:
             raise
@@ -2042,6 +3697,25 @@ class TelegramBot:
         )
         await self._send_guaranteed(chat_id, messages.TIMEOUT_TAP_NOTICE, reply_markup=kb)
 
+    async def _send_retry_notice(
+        self, *, chat_id: int, user_id: int, notice: str, user_message: str
+    ) -> None:
+        """DGN-686: deliver a failure notice with a [retry] button.
+
+        Stores the original user message under a one-shot token (same pattern
+        as pending_resume) so the retry callback can re-run it verbatim.
+        """
+        token = f"{int(time.time())}"
+        session = await session_manager.get_session(user_id)
+        session["pending_retry"] = {"token": token, "user_message": user_message}
+        await session_manager.update_session(user_id, session)
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(
+                messages.ERROR_RETRY_BUTTON, callback_data=f"retry:{token}"
+            )]]
+        )
+        await self._send_guaranteed(chat_id, notice, reply_markup=kb)
+
     # --- send logic ---
 
     def _reply_link_id(self, message) -> Optional[int]:
@@ -2076,19 +3750,46 @@ class TelegramBot:
         force_options: bool = False,
         streamed: bool = False,
         draft_message_ids: Optional[List[int]] = None,
+        classifier_injected: bool = False,
+        assembled: bool = False,
     ) -> None:
-        display, _ = strip_options_marker(content)
+        display, has_marker = strip_options_marker(content)
         display, _ = strip_send_markers(display)
         # DGN-376: link previews default OFF; a link_preview:: line opts in.
         display, preview = strip_link_preview_marker(display)
         # DGN-159: last-mile scrub of leaked tool-call markup on the non-streamed
         # / finalized send path (streamed drafts are scrubbed in strip_display_markers).
         display = strip_toolcall_markup(display)
+        # DGN-665: an AGENT-AUTHORED [[OPTIONS]] marker renders the choices as
+        # buttons only -- drop the consumed numbered run from the display body,
+        # but only when the run extracts (buttons will build). On extraction
+        # failure the list stays so the user is never left choice-less. A
+        # classifier-INJECTED marker (Haiku auto-button) renders buttons but
+        # keeps the body list per owner lock.
+        # DGN-992: a LABELED marker carries the button labels itself; the
+        # labels must be read from the ORIGINAL content because `display`
+        # already had the marker line stripped above.
+        authored_marker = has_marker and not classifier_injected
+        consumed_options: Optional[List[str]] = None
+        if force_options and authored_marker:
+            stripped_display, consumed_options = strip_consumed_options(
+                display, marker_labels=extract_marker_labels(content)
+            )
+            if consumed_options:
+                display = stripped_display
         # DGN-555: selective reply-linking of the final response body.
         reply_to = self._reply_link_id(message)
         has_code = "```" in display
+        # DGN-932: track whether at least one loud send occurred this turn so
+        # the button appendix can fall back to loud when it is the turn's only
+        # notification (turn-level 1-loud guarantee, M1 fix).
+        body_was_loud = False
         if not streamed:
-            await self._send_text_body(message, display, preview, reply_to=reply_to)
+            # DGN-665: a list-only body strips to whitespace -- skip the empty
+            # bubble; the SELECT_PROMPT + buttons message carries the turn.
+            if display.strip():
+                await self._send_text_body(message, display, preview, reply_to=reply_to)
+                body_was_loud = True
         elif has_code and (force_options or draft_message_ids):
             # DGN-085 (comment refreshed in DGN-376 v1.1, finding m4): when code
             # blocks coexist with [[OPTIONS]] buttons or streamed drafts, the
@@ -2104,6 +3805,27 @@ class TelegramBot:
                 except Exception as e:
                     logger.warning("Failed to delete streamed draft %s: %s", mid, e)
             await self._send_text_body(message, display, preview, reply_to=reply_to)
+            body_was_loud = True
+        elif consumed_options and draft_message_ids:
+            # DGN-665: the terminal AssistantMessage live-streams into drafts, so
+            # a normal decision-ask is streamed=True with the (unstripped) list
+            # baked into the draft. Delete the draft(s) and re-send the stripped
+            # body so the list shows only as buttons; skip the send when the body
+            # strips to whitespace-only (the SELECT_PROMPT+buttons carries it).
+            bot = message.get_bot()
+            chat_id = message.chat.id
+            for mid in draft_message_ids:
+                try:
+                    await bot.delete_message(chat_id, mid)
+                except Exception as e:
+                    logger.warning("Failed to delete streamed draft %s: %s", mid, e)
+            if display.strip():
+                await self._send_text_body(message, display, preview, reply_to=reply_to)
+                body_was_loud = True
+            else:
+                # Streamed draft was the loud carrier before the turn finalized;
+                # the draft notification already fired at create_draft() time.
+                body_was_loud = True
         elif draft_message_ids and display.strip():
             # DGN-376 v1.1 (M1): streamed prose-only reply. The final draft
             # bubble streamed as plain text; re-render it in place as HTML via
@@ -2116,7 +3838,8 @@ class TelegramBot:
             bot = message.get_bot()
             chat_id = message.chat.id
             if reply_to is not None or not await self._edit_streamed_prose_html(
-                bot, chat_id, display, preview, draft_message_ids
+                bot, chat_id, display, preview, draft_message_ids,
+                force_edit=assembled,
             ):
                 for mid in draft_message_ids:
                     try:
@@ -2124,7 +3847,12 @@ class TelegramBot:
                     except Exception as e:
                         logger.warning("Failed to delete streamed draft %s: %s", mid, e)
                 await self._send_text_body(message, display, preview, reply_to=reply_to)
-        await self._send_content_artifacts(message, content, force_options)
+            # In-place edit or re-send: draft already notified at creation.
+            body_was_loud = True
+        await self._send_content_artifacts(
+            message, content, force_options, options=consumed_options,
+            body_was_loud=body_was_loud,
+        )
 
     async def _send_text_body(
         self,
@@ -2139,40 +3867,33 @@ class TelegramBot:
         # DGN-555: only the FIRST sent part of the final body carries the reply
         # link; every subsequent part goes out plain.
         link_pending = reply_to is not None
-        for segment, is_code, lang in split_into_segments(content):
-            parts = [p for p in split_text(segment) if p.strip()]
-            if is_code:
-                rendered_parts = [code_segment_html(p, lang) for p in parts]
-            else:
-                # DGN-376: prose goes out as Telegram HTML; markdown the
-                # agents emit is converted, everything else is escaped so
-                # stray _ * [ ] < > never mangle the message.
-                rendered_parts = [markdown_to_telegram_html(p) for p in parts]
-            # DGN-891: a tag span can straddle a split_text boundary; close
-            # open tags at each chunk end and re-open them on the next chunk
-            # so every send is independently valid HTML (no-op when balanced).
-            rendered_parts = rebalance_html_chunks(rendered_parts)
-            for rendered in rendered_parts:
-                if link_pending:
-                    link_pending = False
-                    if await self._try_send_linked(message, rendered, lp, reply_to):
-                        continue
-                    # DGN-555: linked send rejected -> degrade to the plain
-                    # (unlinked) sends below; a reply link never fails a turn.
-                try:
-                    await message.reply_text(
-                        rendered,
-                        parse_mode="HTML",
-                        link_preview_options=lp,
-                    )
-                except Exception:
-                    # DGN-376 v1.1 (m1) + DGN-891: tag-STRIPPED readable
-                    # fallback (never raw markdown source, never leaked
-                    # tags); keeps the preview suppression of the send it
-                    # replaces.
-                    await message.reply_text(
-                        html_to_plain_text(rendered), link_preview_options=lp
-                    )
+        # DGN-1209: the reply body renders through the SAME segment-aware
+        # pipeline as every other rail (_render_prose_html_segments: fence
+        # split -> code_segment_html / markdown_to_telegram_html -> DGN-891
+        # rebalance), so the machine-line gate has ONE bot-side choke point.
+        # This is the model-turn reply -> rail=model (drop/strip registered
+        # machine lines; unregistered shapes only log, never alert).
+        for rendered in self._render_prose_html_segments(content, rail=RAIL_MODEL):
+            if link_pending:
+                link_pending = False
+                if await self._try_send_linked(message, rendered, lp, reply_to):
+                    continue
+                # DGN-555: linked send rejected -> degrade to the plain
+                # (unlinked) sends below; a reply link never fails a turn.
+            try:
+                await message.reply_text(
+                    rendered,
+                    parse_mode="HTML",
+                    link_preview_options=lp,
+                )
+            except Exception:
+                # DGN-376 v1.1 (m1) + DGN-891: tag-STRIPPED readable
+                # fallback (never raw markdown source, never leaked
+                # tags); keeps the preview suppression of the send it
+                # replaces.
+                await message.reply_text(
+                    html_to_plain_text(rendered), link_preview_options=lp
+                )
 
     async def _try_send_linked(self, message, rendered: str, lp, reply_to: int) -> bool:
         """DGN-555: attempt the reply-linked send of the first body part.
@@ -2202,6 +3923,7 @@ class TelegramBot:
         display: str,
         preview: bool,
         draft_message_ids: List[int],
+        force_edit: bool = False,
     ) -> bool:
         """DGN-376 v1.1 (M1): re-render a finalized streamed prose draft as HTML.
 
@@ -2212,6 +3934,13 @@ class TelegramBot:
         succeeded; False tells the caller to fall back to the existing
         delete-drafts + convert-resend path (multi-bubble replies, edit
         failures), which never drops the message.
+
+        force_edit (DGN-1253): on a turn-assembled body the live draft glued
+        every terminal segment verbatim, so the "plain draft already renders
+        exactly this text" assumption behind the no-op skip does not hold --
+        inter-segment dedup may have removed a restated paragraph, and the
+        segment boundary differs. The edit is then always attempted; an
+        actually-identical draft resolves via the "not modified" branch.
         """
         if len(draft_message_ids) != 1:
             return False
@@ -2220,10 +3949,21 @@ class TelegramBot:
         # DGN-891: balance guard -- no-op on balanced (or tag-free) output,
         # so the converted == display no-op check below is unaffected.
         converted = balance_telegram_html(markdown_to_telegram_html(display))
-        if converted == display and not preview:
+        if (
+            not force_edit
+            and converted == display
+            and not preview
+            and not contains_telegram_html(display)
+        ):
             # No markdown and nothing to escape: the plain draft already
             # renders exactly this text, so skip the no-op edit (Telegram
             # rejects it with "message is not modified").
+            # DGN-846: the skip must NOT fire when the text carries
+            # whitelisted Telegram HTML tags (converted == display because
+            # the tags pass through verbatim) -- the plain draft shows them
+            # as raw literal text, and only the parse_mode=HTML edit below
+            # makes them render (e.g. the version-check update notice's
+            # <blockquote expandable> fold).
             return True
         try:
             await bot.edit_message_text(
@@ -2253,34 +3993,151 @@ class TelegramBot:
             )
             return False
 
-    async def _send_content_artifacts(self, message, content: str, force_options: bool) -> None:
+    @staticmethod
+    def _artifact_chat_id(target) -> int:
+        """Resolve a send target (telegram message OR bare chat_id) to chat_id."""
+        chat = getattr(target, "chat", None)
+        chat_id = getattr(chat, "id", None)
+        return chat_id if chat_id is not None else target
+
+    async def _artifact_send(self, target, text: str, **kwargs) -> None:
+        """DGN-966: single send primitive for artifact messages.
+
+        target is either a telegram message (model-turn reply path ->
+        reply_text) or a bare chat_id int (fast-path / proactive ->
+        bot.send_message). Keeps the ONE shared artifact renderer below
+        target-polymorphic without duplicating render logic per path.
+        """
+        if hasattr(target, "reply_text"):
+            await target.reply_text(text, **kwargs)
+        else:
+            await self.application.bot.send_message(target, text, **kwargs)
+
+    async def _send_content_artifacts(
+        self,
+        target,
+        content: str,
+        force_options: bool,
+        options: Optional[List[str]] = None,
+        body_was_loud: bool = True,
+    ) -> None:
+        """DGN-966: the SHARED artifact-render tail (marker -> file / keyboard).
+
+        Every send path terminates here -- model turn (_reply_smart), fast-path
+        and proactive (_send_smart) -- so a content string produces the SAME
+        artifacts regardless of which path carried it. `target` is a telegram
+        message or a bare chat_id (see _artifact_send).
+        """
+        chat_id = self._artifact_chat_id(target)
         resolved = resolve_send_paths(content, PROJECT_ROOT)
         in_root, outside = split_paths_by_scope(resolved, PROJECT_ROOT)
-        await self._send_file_paths(message.chat.id, in_root)
+        await self._send_file_paths(chat_id, in_root)
         if outside:
-            await self._prompt_outside_file_confirmation(
-                message.chat.id, message.chat.id, outside
-            )
+            # DGN-966 verification round: the Allow/Deny confirm keyboard
+            # (_prompt_outside_file_confirmation) assumes a live turn to
+            # answer it. `target` is a real telegram message (reply_text)
+            # ONLY on the model-turn path, where the owner is mid-conversation
+            # right now. The bare-chat_id rail (_send_smart -- fast-path AND
+            # proactive/cron push) has no such live turn: a confirm button
+            # sent there either fires unattended or dies at the 20-min STALE
+            # gate (_check_access) with nobody around to tap it (measured:
+            # a cron push at an odd hour would leave a dead-end prompt AND
+            # never actually deliver the file). Never silently drop (that IS
+            # the DGN-966 defect class) -- log loud + a plain no-button
+            # notice on that rail instead.
+            if hasattr(target, "reply_text"):
+                await self._prompt_outside_file_confirmation(
+                    chat_id, chat_id, outside
+                )
+            else:
+                await self._notify_outside_file_omitted(chat_id, outside)
         if force_options:
             clean, has_marker = strip_options_marker(content)
             if has_marker:
-                options = extract_options(clean)
-                kb = build_option_keyboard(options)
+                # DGN-665: prefer the caller's consumed-run extraction so the
+                # body strip and the buttons always come from the same run;
+                # fall back to a local extraction when it was not computed
+                # (strip_consumed_options first -- DGN-992: labeled-marker
+                # labels win there -- then the plain extractor so a
+                # non-adjacent/failed run still renders its buttons).
+                button_options = options
+                if not button_options:
+                    _, button_options = strip_consumed_options(
+                        clean, marker_labels=extract_marker_labels(content)
+                    )
+                if not button_options:
+                    button_options = extract_options(clean)
+                kb = build_option_keyboard(button_options)
+                if not kb:
+                    # DGN-992 (fail-loud): a marker with ZERO buildable buttons
+                    # must never pass silently. The body is guaranteed intact
+                    # here -- the display strip only fires when options
+                    # extracted (which always builds a keyboard), so whatever
+                    # list/bullet text the author wrote is still readable and
+                    # the user can answer in text. Log the one-line WARNING so
+                    # the miss is visible in ops instead of evaporating.
+                    logger.warning(
+                        "[[OPTIONS]] marker present but no buttons could be "
+                        "built (no marker labels, no numbered run) -- body "
+                        "kept as text fallback (DGN-992)"
+                    )
                 if kb:
-                    await message.reply_text(messages.SELECT_PROMPT, reply_markup=kb)
+                    # DGN-932 mechanism B: the button appendix is silent by
+                    # default (class "options_prompt") -- the loud body
+                    # already carried the arrival signal, and a second alert
+                    # buries it under the buttons message.
+                    # Turn-level 1-loud guarantee: when no loud send preceded
+                    # this turn (list-only body, non-streamed, no drafts), the
+                    # buttons ARE the turn's only signal -- promote to loud.
+                    silent = (
+                        notify_silent("options_prompt")
+                        if body_was_loud
+                        else False
+                    )
+                    await self._artifact_send(
+                        target,
+                        messages.SELECT_PROMPT,
+                        reply_markup=kb,
+                        disable_notification=silent,
+                    )
+        elif has_options_marker(content):
+            # DGN-1021 (fail-loud HOIST): the DGN-992 fail-loud above sits
+            # inside `if force_options:` -- when an upstream gate misses the
+            # marker (the recognizer-drift defect class that killed labeled
+            # markers silently), the defense was skipped along with the
+            # buttons. This branch is the gate's own tripwire: an ARMABLE
+            # marker line reached the render seat with the gate off. Body is
+            # delivered intact either way; log-only, zero user-visible side
+            # effect, and marker-less messages never enter this branch.
+            logger.warning(
+                "[[OPTIONS]] marker present but options gate is OFF "
+                "(force_options=False) -- buttons skipped; upstream "
+                "recognizer drift? (DGN-1021)"
+            )
 
     async def _proactive_push(
-        self, chat_id: int, content: str, has_options: bool
+        self,
+        chat_id: int,
+        content: str,
+        has_options: bool,
+        classifier_injected: bool = False,
     ) -> None:
         """Deliver main-agent output that arrived with no pending request.
 
         Invoked by the bridge when the agent emits a turn (e.g. a background-task
         completion report) that the request-response path would otherwise drop.
         Reuses _send_smart so formatting and [[OPTIONS]] buttons behave the same
-        as a normal reply.
+        as a normal reply. DGN-665: classifier_injected forwards marker
+        provenance so a classifier-injected list keeps its body text.
         """
         try:
-            await self._send_smart(chat_id, content, force_options=has_options)
+            await self._send_smart(
+                chat_id,
+                content,
+                force_options=has_options,
+                classifier_injected=classifier_injected,
+                rail=RAIL_MODEL,
+            )
         except Exception as e:
             logger.error("Proactive push delivery failed for chat %s: %s", chat_id, e)
 
@@ -2294,6 +4151,10 @@ class TelegramBot:
         """
         # outage-recovered user notice disabled per owner request (2026-06-30):
         # too noisy on flaky networks. Recovery is still logged for visibility.
+        # DGN-851: the dormant notice copy (messages.OUTAGE_RECOVERED + the
+        # i18n outage_recovered entries) was removed as dead weight;
+        # re-enabling means restoring the i18n key (ko/en) and a real send
+        # here, behind a config knob.
         minutes = max(1, round(down_seconds / 60))
         logger.info("Outage recovered after ~%d min (user notice disabled)", minutes)
         return
@@ -2305,7 +4166,12 @@ class TelegramBot:
         force_options: bool = False,
         streamed: bool = False,
         draft_message_ids: Optional[List[int]] = None,
+        classifier_injected: bool = False,
+        rail: str = RAIL_UNKNOWN,
+        assembled: bool = False,
     ) -> None:
+        # DGN-1209: `rail` is the caller's declaration for the machine-line gate
+        # (never inferred). Threaded down to _render_prose_html_segments.
         # D2 (DGN-515): guard shutdown race -- application is set to None in
         # _graceful_shutdown; queued run_task closures may call this after that.
         if self.application is None:
@@ -2318,9 +4184,31 @@ class TelegramBot:
         # DGN-159: last-mile scrub of leaked tool-call markup (proactive / option /
         # resume send path); streamed drafts are scrubbed in strip_display_markers.
         display = strip_toolcall_markup(display)
+        # DGN-665: same as _reply_smart -- an AGENT-AUTHORED marker renders the
+        # choices as buttons only, so drop the consumed numbered run from the
+        # body when it extracts; on extraction failure the list stays. A
+        # classifier-injected marker keeps the body list.
+        # DGN-992: labeled-marker labels come from the ORIGINAL content (the
+        # marker line is already stripped from `display`).
+        authored_marker = has_marker and not classifier_injected
+        options: List[str] = []
+        if force_options and authored_marker:
+            stripped_display, options = strip_consumed_options(
+                display, marker_labels=extract_marker_labels(content)
+            )
+            if options:
+                display = stripped_display
         has_code = "```" in display
+        # DGN-932: track whether at least one loud send occurred this turn so
+        # the button appendix can fall back to loud when it is the turn's only
+        # notification (turn-level 1-loud guarantee, M1 fix).
+        body_was_loud = False
         if not streamed:
-            await self._send_text_body_chat(chat_id, display, preview)
+            # DGN-665: a list-only body strips to whitespace -- skip the empty
+            # bubble; the SELECT_PROMPT + buttons message carries the turn.
+            if display.strip():
+                await self._send_text_body_chat(chat_id, display, preview, rail=rail)
+                body_was_loud = True
         elif has_code and (force_options or draft_message_ids):
             # DGN-085: same backstop as _reply_smart -- code+options coexistence
             # forces clean re-send via HTML segments so code/tables render correctly.
@@ -2329,91 +4217,193 @@ class TelegramBot:
                     await bot.delete_message(chat_id, mid)
                 except Exception as e:
                     logger.warning("Failed to delete streamed draft %s: %s", mid, e)
-            await self._send_text_body_chat(chat_id, display, preview)
+            await self._send_text_body_chat(chat_id, display, preview, rail=rail)
+            body_was_loud = True
+        elif options and draft_message_ids:
+            # DGN-665: streamed decision-ask -- the draft baked in the unstripped
+            # list. Delete the draft(s) and re-send the stripped body so the list
+            # shows only as buttons; skip the send when the body is whitespace.
+            for mid in draft_message_ids:
+                try:
+                    await bot.delete_message(chat_id, mid)
+                except Exception as e:
+                    logger.warning("Failed to delete streamed draft %s: %s", mid, e)
+            if display.strip():
+                await self._send_text_body_chat(chat_id, display, preview, rail=rail)
+            # Streamed draft was the loud carrier; notification fired at
+            # create_draft() time.
+            body_was_loud = True
         elif draft_message_ids and display.strip():
             # DGN-376 v1.1 (M1): same streamed prose finalize as _reply_smart --
             # edit the single draft bubble to HTML in place; fall back to
             # delete + convert-resend so the message is never lost.
             if not await self._edit_streamed_prose_html(
-                bot, chat_id, display, preview, draft_message_ids
+                bot, chat_id, display, preview, draft_message_ids,
+                force_edit=assembled,
             ):
                 for mid in draft_message_ids:
                     try:
                         await bot.delete_message(chat_id, mid)
                     except Exception as e:
                         logger.warning("Failed to delete streamed draft %s: %s", mid, e)
-                await self._send_text_body_chat(chat_id, display, preview)
-        resolved = resolve_send_paths(content, PROJECT_ROOT)
-        in_root, _ = split_paths_by_scope(resolved, PROJECT_ROOT)
-        await self._send_file_paths(chat_id, in_root)
-        if force_options and has_marker:
-            options = extract_options(display)
-            kb = build_option_keyboard(options)
-            if kb:
-                await bot.send_message(chat_id, messages.SELECT_PROMPT, reply_markup=kb)
+                await self._send_text_body_chat(chat_id, display, preview, rail=rail)
+            # Draft was loud at creation; in-place edit inherits that.
+            body_was_loud = True
+        # DGN-966: the artifact tail (send_file paths, [[OPTIONS]] keyboard,
+        # [[IDRILL]] keyboard) is the SHARED renderer -- the same one the
+        # model-turn path uses -- so the fast-path (DGN-801) and proactive
+        # pushes render identical artifacts. Before this, _send_smart carried
+        # its own partial copy and silently swallowed the IDRILL keyboard.
+        await self._send_content_artifacts(
+            chat_id,
+            content,
+            force_options,
+            options=options or None,
+            body_was_loud=body_was_loud,
+        )
 
-    async def _send_text_body_chat(self, chat_id: int, content: str, preview: bool = False) -> None:
-        bot = self.application.bot
-        # DGN-376: preview=True (link_preview:: opt-in) restores Telegram's
-        # default preview; otherwise previews are suppressed.
-        lp = None if preview else LINK_PREVIEW_OFF
+    @staticmethod
+    def _render_prose_html_segments(content: str, rail: str = RAIL_UNKNOWN) -> List[str]:
+        """Render content into Telegram-HTML chunks via the segment-aware
+        pipeline: fenced code -> code_segment_html, prose (outside fences)
+        -> markdown_to_telegram_html. markdown_to_telegram_html's own
+        contract (formatting.py:950-954) forbids feeding it a raw code
+        fence, so the split MUST happen before either renderer runs.
+
+        Shared by _send_text_body / _send_text_body_chat (model-turn sends,
+        fast-path body) and _idrill_post_followup (idrill followup_cmd
+        STDOUT, DGN-1076) so every path honors the same contract and
+        renders identically.
+
+        DGN-1209: this is the bot-side CHOKE POINT for the machine-line gate
+        (the other is formatting.sanitize_message_for_telegram). The gate runs
+        on the raw pre-render text, before the fence split. `rail` is the
+        caller's declaration (RAIL_CONSUMER / RAIL_MODEL); an undeclared
+        caller gets RAIL_UNKNOWN and its alerts say so.
+        """
+        content = apply_machine_line_gate(content, rail)
+        rendered: List[str] = []
         for segment, is_code, lang in split_into_segments(content):
             parts = [p for p in split_text(segment) if p.strip()]
             if is_code:
-                rendered_parts = [code_segment_html(p, lang) for p in parts]
+                seg_parts = [code_segment_html(p, lang) for p in parts]
             else:
                 # DGN-376: prose goes out as Telegram HTML; markdown the
                 # agents emit is converted, everything else is escaped so
                 # stray _ * [ ] < > never mangle the message.
-                rendered_parts = [markdown_to_telegram_html(p) for p in parts]
+                seg_parts = [markdown_to_telegram_html(p) for p in parts]
             # DGN-891: a tag span can straddle a split_text boundary; close
             # open tags at each chunk end and re-open them on the next chunk
             # so every send is independently valid HTML (no-op when balanced).
-            rendered_parts = rebalance_html_chunks(rendered_parts)
-            for rendered in rendered_parts:
-                try:
-                    await bot.send_message(
-                        chat_id,
-                        rendered,
-                        parse_mode="HTML",
-                        link_preview_options=lp,
-                    )
-                except Exception:
-                    # DGN-376 v1.1 (m1) + DGN-891: tag-STRIPPED readable
-                    # fallback (never raw markdown source, never leaked
-                    # tags); keeps the preview suppression of the send it
-                    # replaces.
-                    await bot.send_message(
-                        chat_id, html_to_plain_text(rendered), link_preview_options=lp
-                    )
+            rendered.extend(rebalance_html_chunks(seg_parts))
+        return rendered
+
+    async def _send_text_body_chat(
+        self, chat_id: int, content: str, preview: bool = False, rail: str = RAIL_UNKNOWN
+    ) -> None:
+        bot = self.application.bot
+        # DGN-376: preview=True (link_preview:: opt-in) restores Telegram's
+        # default preview; otherwise previews are suppressed.
+        lp = None if preview else LINK_PREVIEW_OFF
+        for rendered in self._render_prose_html_segments(content, rail=rail):
+            try:
+                await bot.send_message(
+                    chat_id,
+                    rendered,
+                    parse_mode="HTML",
+                    link_preview_options=lp,
+                )
+            except Exception:
+                # DGN-376 v1.1 (m1) + DGN-891: tag-STRIPPED readable
+                # fallback (never raw markdown source, never leaked
+                # tags); keeps the preview suppression of the send it
+                # replaces.
+                await bot.send_message(
+                    chat_id, html_to_plain_text(rendered), link_preview_options=lp
+                )
 
     async def _send_file_paths(self, chat_id: int, paths: List[Path]) -> None:
         bot = self.application.bot
         for p in paths:
             is_image = p.suffix.lower() in IMAGE_EXTS
-            last_err = None
-            for attempt in range(2):  # initial try + one retry (transient network)
-                try:
-                    with open(p, "rb") as f:
-                        if is_image:
-                            await bot.send_photo(chat_id, photo=f)
+            send_path = p
+            as_document = not is_image
+            scaled_tmp: Optional[Path] = None
+            if is_image:
+                # DGN-649 fix A: sendPhoto rejects oversized dimensions
+                # (width+height > 10000 or ratio > 20) with an opaque
+                # BadRequest. Normalize BEFORE sending: a ratio-legal overflow
+                # is downscaled (Pillow, aspect preserved) and stays a photo;
+                # an illegal ratio -- or a failed/unavailable downscale --
+                # degrades to a document send, which has no dimension limit
+                # and preserves the original pixels. Unprobeable dimensions
+                # keep the prior photo-first behavior.
+                dims = probe_image_dimensions(p)
+                if dims is not None:
+                    verdict = photo_send_verdict(*dims)
+                    if verdict == "downscale":
+                        scaled_tmp = downscale_for_photo(p)
+                        if scaled_tmp is not None:
+                            send_path = scaled_tmp
                         else:
-                            await bot.send_document(chat_id, document=f)
-                    last_err = None
-                    break
-                except Exception as e:
-                    last_err = e
-                    logger.warning(
-                        "Failed to send file %s (attempt %d/2): %s", p, attempt + 1, e
-                    )
-                    if attempt == 0:
-                        await asyncio.sleep(1.5)
+                            as_document = True
+                    elif verdict == "document":
+                        as_document = True
+                    if as_document or scaled_tmp is not None:
+                        logger.info(
+                            "Oversized image %s (%dx%d): sending as %s",
+                            p, dims[0], dims[1],
+                            "document" if as_document else "downscaled photo",
+                        )
+            last_err = None
+            try:
+                for attempt in range(2):  # initial try + one retry
+                    try:
+                        with open(send_path, "rb") as f:
+                            if as_document:
+                                await bot.send_document(chat_id, document=f)
+                            else:
+                                await bot.send_photo(chat_id, photo=f)
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        kind = classify_send_error(e)
+                        logger.warning(
+                            "Failed to send file %s (attempt %d/2, %s): %s",
+                            send_path, attempt + 1, kind, e,
+                        )
+                        if attempt == 0:
+                            if kind == "dimensions" and not as_document:
+                                # DGN-649: probe missed the overflow (unknown
+                                # format etc.) -- retry once as document with
+                                # the original file, no backoff needed.
+                                as_document = True
+                                send_path = p
+                            else:
+                                await asyncio.sleep(1.5)
+            finally:
+                if scaled_tmp is not None:
+                    try:
+                        scaled_tmp.unlink()
+                    except OSError:
+                        pass
             if last_err is not None:
                 # Do not let a file silently vanish -- notify the user.
+                # DGN-649 fix B: state the real reason, not always "network".
+                kind = classify_send_error(last_err)
+                if kind == "dimensions":
+                    failure_msg = messages.SEND_FILE_FAILED_DIMENSIONS
+                elif kind == "too_large":
+                    failure_msg = messages.SEND_FILE_FAILED_TOO_LARGE
+                elif kind == "network":
+                    failure_msg = messages.SEND_FILE_FAILED
+                else:
+                    failure_msg = messages.SEND_FILE_FAILED_API
                 try:
                     await bot.send_message(
                         chat_id,
-                        messages.SEND_FILE_FAILED.format(filename=p.name),
+                        failure_msg.format(filename=p.name),
                     )
                 except Exception as notify_err:
                     logger.warning(
@@ -2436,12 +4426,48 @@ class TelegramBot:
             chat_id, messages.EXTERNAL_FILE_PROMPT, reply_markup=kb
         )
 
+    async def _notify_outside_file_omitted(
+        self, chat_id: int, paths: List[Path]
+    ) -> None:
+        """DGN-966 verification round: non-interactive-rail counterpart to
+        _prompt_outside_file_confirmation. No live turn exists to answer an
+        Allow/Deny tap here (see call site comment), so the file is withheld
+        with NO button and no session-state write (nothing pending to expire
+        or leak into a later unrelated turn) -- but never silent: a loud log
+        line plus a plain owner-visible chat notice, so the omission is
+        findable rather than swallowed.
+        """
+        logger.warning(
+            "outside-root send_file omitted on non-interactive rail "
+            "(chat %s, no live turn to confirm): %s",
+            chat_id, [str(p) for p in paths],
+        )
+        listing = "\n".join(f"- {p}" for p in paths)
+        try:
+            await self.application.bot.send_message(
+                chat_id,
+                f"{messages.EXTERNAL_FILE_OMITTED_NONINTERACTIVE}\n{listing}",
+            )
+        except Exception as e:
+            logger.warning(
+                "outside-root omission notice send failed (chat %s): %s",
+                chat_id, e,
+            )
+
     # --- callbacks ---
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await self._check_access(update):
-            return
+        # DGN-922 FIX 2: cdn:done: callbacks must bypass the 20-min stale gate.
+        # Countdowns can run up to MAX_SECONDS=24h; a completion button tapped
+        # after 20 min would silently die without this exemption.  Peek at the
+        # raw callback_data here (before _check_access) to select the right
+        # gate; all other prefixes still go through the normal stale check.
         query = update.callback_query
+        cdn_done_tap = bool(
+            query and query.data and query.data.startswith(CDN_DONE_PREFIX)
+        )
+        if not await self._check_access(update, skip_stale=cdn_done_tap):
+            return
         # D1 (DGN-515): spinner-dismiss failure must never kill the handler.
         # Telegram API blips (ConnectTimeout, QueryExpired) are non-fatal here.
         try:
@@ -2479,7 +4505,26 @@ class TelegramBot:
             return
 
         if data.startswith("opt:"):
-            choice = data.split(":", 1)[1]
+            # DGN-665: recover the full "N. label" from the tapped button's own
+            # text -- callback_data is number-only when the label overflowed
+            # Telegram's 64-byte limit (Korean labels). Resolve BEFORE the edit,
+            # which drops the keyboard, so both the confirmation and the agent
+            # user_message carry the full label.
+            reply_markup = getattr(query.message, "reply_markup", None)
+            inline_keyboard = getattr(reply_markup, "inline_keyboard", None)
+            choice = resolve_choice(data, inline_keyboard)
+            # DGN-665: a keyboard was present but no button matched -> resolve_choice
+            # fell back to the bare number. Warn to diagnose stale/duplicate-tap
+            # cases (no warning when the keyboard is simply absent).
+            if inline_keyboard and choice == (data.split(":", 1)[1] if ":" in data else data):
+                if not any(
+                    getattr(btn, "callback_data", None) == data
+                    for row in inline_keyboard for btn in row
+                ):
+                    logger.warning(
+                        "opt callback %r matched no button in the keyboard "
+                        "(stale or duplicate tap); using bare fallback %r", data, choice
+                    )
             await query.edit_message_text(messages.SELECTED.format(choice=choice))
             await self._maybe_capture_outside_approval(user_id, choice)
             chat_id = chat.id
@@ -2517,24 +4562,66 @@ class TelegramBot:
                         force_options=response.has_options,
                         streamed=response.streamed,
                         draft_message_ids=response.draft_message_ids,
+                        classifier_injected=getattr(response, "options_classifier_injected", False),
+                        rail=RAIL_MODEL,
+                        assembled=getattr(response, "turn_assembled", False),
                     )
                 except Exception as e:
                     logger.error("Option reply failed: %s", e, exc_info=True)
                     await app.bot.send_message(chat_id, messages.PROCESSING_FAILED.format(error=_fmt_error(e)))
+                finally:
+                    # DGN-911 FATAL fix: drain debounce buffer on every SDK turn
+                    # completion (options callback turn is a full SDK turn).
+                    await self._drain_pending_texts(user_id)
 
             async def on_overflow() -> None:
                 await app.bot.send_message(chat_id, messages.QUEUE_BUSY)
 
-            await self._enqueue_user_task(user_id, run_task, on_overflow)
+            await self._enqueue_user_task(
+                user_id, run_task, on_overflow, chat_id=chat_id
+            )
             return
 
         if data.startswith("resume:"):
             await self._handle_resume_callback(update, query, user_id, chat)
             return
 
+        if data.startswith("retry:"):
+            await self._handle_retry_callback(update, query, user_id, chat)
+            return
+
+
+        if data.startswith(CDN_DONE_PREFIX):
+            # DGN-915: countdown completion-affordance tap. Remove the inline
+            # keyboard from the done message so the affordance clears cleanly.
+            # query.answer() already called above (spinner dismiss).
+            # Stale tap (message gone / session ended): Telegram returns an
+            # error; swallowed fail-soft -- the button is already unreachable.
+            # TODO(DGN-915): no next-step trigger exists in the bridge yet.
+            # Removing dead-air (dead button) is the sole win here. A future
+            # agent-coordinated step can wire a proactive model-turn from this
+            # branch when the domain sequence machinery is in place.
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception as e:
+                logger.warning("cdn:done keyboard clear failed (ignored): %s", e)
+            return
+
+        # DGN-1050: the DGN-994 "authsync:restart" CTA branch is retired with
+        # /authsync itself. A tap on a leftover CTA button in old chat history
+        # falls through all branches below and no-ops (query already answered
+        # above; the 20-min stale gate drops most of them before that).
+
         if data.startswith("model:"):
             model_name = data.split(":", 1)[1]
             session = await session_manager.get_session(user_id)
+            label = _MODEL_LABELS.get(model_name, model_name)
+            # DGN-192: same-model tap is a no-op switch -- keep the session.
+            if model_name == self._get_real_model(session):
+                await query.edit_message_text(
+                    messages.MODEL_ALREADY_ACTIVE.format(label=label)
+                )
+                return
             session["model"] = model_name
             session["session_id"] = None
             session["new_session"] = True
@@ -2542,13 +4629,16 @@ class TelegramBot:
             # DGN-162: a user-initiated switch becomes the new last-session model.
             model_state.persist_model(model_name, _known_models())
             self._runtime_active_sessions.discard(user_id)
-            label = _MODEL_LABELS.get(model_name, model_name)
             await query.edit_message_text(
                 messages.MODEL_SWITCHED.format(label=label)
-                + "\n"
-                + messages.MODEL_SWITCH_WARNING
             )
             return
+
+    # DGN-1050: _handle_authsync_restart_callback (DGN-994 /authsync sync-ok
+    # restart CTA) removed with the retired /authsync sync path. The restart
+    # launch machinery it shared with /restart (self_restart.sh --trigger
+    # user + the _restart_launch_started latch) lives on in _cmd_restart.
+
 
     async def _handle_resume_callback(self, update, query, user_id, chat) -> None:
         app = self.application
@@ -2616,15 +4706,97 @@ class TelegramBot:
                     force_options=response.has_options,
                     streamed=response.streamed,
                     draft_message_ids=response.draft_message_ids,
+                    classifier_injected=getattr(response, "options_classifier_injected", False),
+                    rail=RAIL_MODEL,
+                    assembled=getattr(response, "turn_assembled", False),
                 )
             except Exception as e:
                 logger.error("Resume continuation failed: %s", e, exc_info=True)
                 await app.bot.send_message(chat_id, messages.RESUME_FAILED.format(error=_fmt_error(e)))
+            finally:
+                # DGN-911 FATAL fix: drain debounce buffer on every SDK turn
+                # completion (resume continuation is a full SDK turn).
+                await self._drain_pending_texts(user_id)
 
         async def on_overflow() -> None:
             await app.bot.send_message(chat_id, messages.QUEUE_BUSY)
 
-        await self._enqueue_user_task(user_id, run_task, on_overflow)
+        await self._enqueue_user_task(
+            user_id, run_task, on_overflow, chat_id=chat_id
+        )
+
+    async def _handle_retry_callback(self, update, query, user_id, chat) -> None:
+        """DGN-686: [retry] button -- re-run the stored user message verbatim.
+
+        One-shot token (pending_retry); expired/mismatched taps degrade to a
+        notice. On a repeated is_error the retry notice + button is offered
+        again (bounded only by the user's taps).
+        """
+        app = self.application
+        token = query.data.split(":", 1)[1]
+        session = await session_manager.get_session(user_id)
+        pending = session.get("pending_retry")
+        if not pending or pending.get("token") != token:
+            await query.edit_message_text(messages.ERROR_RETRY_EXPIRED)
+            return
+        user_message = pending.get("user_message", "")
+        session.pop("pending_retry", None)
+        await session_manager.update_session(user_id, session)
+        await query.edit_message_text(messages.ERROR_RETRYING)
+        chat_id = chat.id
+
+        async def run_task() -> None:
+            sess = await session_manager.get_session(user_id)
+            try:
+                await app.bot.send_chat_action(chat_id, action="typing")
+            except Exception:
+                pass
+            try:
+                response = await sdk_bridge.process_message(
+                    user_message=user_message,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    session_id=self._effective_session_id(user_id, sess),
+                    model=sess.get("model"),
+                    permission_callback=self._permission_callback,
+                    typing_callback=lambda: app.bot.send_chat_action(chat_id, action="typing"),
+                    bot=app.bot,
+                    proactive_push=self._proactive_push,
+                )
+                await self._save_session_id(user_id, response)
+                if getattr(response, "retry_offer", False):
+                    await self._send_retry_notice(
+                        chat_id=chat_id, user_id=user_id,
+                        notice=response.content, user_message=user_message,
+                    )
+                    return
+                await self._send_smart(
+                    chat_id,
+                    response.content,
+                    force_options=response.has_options,
+                    streamed=response.streamed,
+                    draft_message_ids=response.draft_message_ids,
+                    classifier_injected=getattr(response, "options_classifier_injected", False),
+                    rail=RAIL_MODEL,
+                    assembled=getattr(response, "turn_assembled", False),
+                )
+            except Exception as e:
+                # DGN-686 MINOR-2: never leak the English detail to the user;
+                # log it, show the fixed ko failure notice.
+                logger.error("Retry run failed: %s", e, exc_info=True)
+                await app.bot.send_message(chat_id, messages.ERROR_GENERIC_RETRY)
+            finally:
+                # DGN-911 FATAL fix: drain debounce buffer on every SDK turn
+                # completion (retry turn is a full SDK turn).
+                await self._drain_pending_texts(user_id)
+
+        async def on_overflow() -> None:
+            await app.bot.send_message(chat_id, messages.QUEUE_BUSY)
+
+        await self._enqueue_user_task(
+            user_id, run_task, on_overflow, chat_id=chat_id
+        )
+
 
 
 bot = TelegramBot()

@@ -256,15 +256,17 @@ def test_italic_single_word_converts():
     assert md2html("a _one_ b") == "a <i>one</i> b"
 
 
-def test_italic_multi_word_stays_literal():
-    # A multi-word span is NOT italic -- it stays literal text (word-only rule).
-    assert md2html("a *two words* b") == "a *two words* b"
+def test_italic_multi_word_is_demoted_to_bold():
+    # DGN-1169: a multi-word star span is never italic -- it is demoted to
+    # BOLD, so the word-only italic rule survives and the raw asterisks stop
+    # reaching the screen. Underscore is deliberately NOT demoted.
+    assert md2html("a *two words* b") == "a <b>two words</b> b"
     assert md2html("a _two words_ b") == "a _two words_ b"
 
 
-def test_italic_multi_word_literal_is_escaped():
-    # Left literal, its inner HTML specials are still escaped.
-    assert md2html("*a & b*") == "*a &amp; b*"
+def test_italic_multi_word_content_is_escaped():
+    # Demoted to bold, its inner HTML specials are still escaped.
+    assert md2html("*a & b*") == "<b>a &amp; b</b>"
 
 
 def test_single_word_italic_never_emits_bold():

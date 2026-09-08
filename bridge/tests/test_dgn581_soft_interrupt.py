@@ -375,6 +375,10 @@ class TestCmdStopWiring(unittest.TestCase):
             mock_sdk.interrupt = AsyncMock(return_value=interrupt_result)
         mock_sdk.stop = AsyncMock(return_value=stop_result)
         mock_sdk.cancel_user_streaming = AsyncMock(return_value=False)
+        # DGN-1015: real sdk_bridge.pop_interrupt_killed() returns [] when no
+        # background subagent died -- a bare MagicMock() default (truthy,
+        # empty-iterable) would falsely trip the new kill-notice append.
+        mock_sdk.pop_interrupt_killed = MagicMock(return_value=[])
         return mock_sdk
 
     def test_stop_soft_success_keeps_session(self):
@@ -385,10 +389,12 @@ class TestCmdStopWiring(unittest.TestCase):
                 bot = TelegramBot()
                 update = self._make_update()
                 await bot._cmd_stop(update, None)
-            mock_sdk.interrupt.assert_awaited_once_with(USER_ID)
+            # DGN-1016: /stop tags its interrupt origin for log attribution.
+            mock_sdk.interrupt.assert_awaited_once_with(USER_ID, trigger="stop")
             # Soft success: NO hard teardown of any kind.
             mock_sdk.stop.assert_not_awaited()
             mock_sdk.cancel_user_streaming.assert_not_awaited()
+            # DGN-991 (2026-09-03): soft success is the bare one-sentence copy.
             update.message.reply_text.assert_awaited_once_with(
                 messages.STOP_INTERRUPTED
             )
@@ -417,7 +423,9 @@ class TestCmdStopWiring(unittest.TestCase):
                 update = self._make_update()
                 await bot._cmd_stop(update, None)
             mock_sdk.stop.assert_awaited_once_with(USER_ID)
-            update.message.reply_text.assert_awaited_once_with(messages.STOP_PAUSED)
+            # DGN-991 stopgap B: a real teardown (stream killed) reports the
+            # honest forced copy, not the "session intact" claim.
+            update.message.reply_text.assert_awaited_once_with(messages.STOP_FORCED)
 
         self._run(scenario())
 
@@ -433,8 +441,9 @@ class TestCmdStopWiring(unittest.TestCase):
                 update = self._make_update()
                 await bot._cmd_stop(update, None)
             # Never a silent no-op: the hard teardown ran and was reported.
+            # DGN-991 stopgap B: teardown that killed the stream -> forced copy.
             mock_sdk.stop.assert_awaited_once_with(USER_ID)
-            update.message.reply_text.assert_awaited_once_with(messages.STOP_PAUSED)
+            update.message.reply_text.assert_awaited_once_with(messages.STOP_FORCED)
 
         self._run(scenario())
 
