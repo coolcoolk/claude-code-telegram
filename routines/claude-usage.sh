@@ -3,11 +3,14 @@
 # Default: live rate-limit only (short). With --full: also the cache report.
 #
 # Cross-platform (macOS + Linux). The live section needs the Claude Code OAuth
-# credential, which is resolved from the first available source:
+# credential, which is resolved from the first source that can serve one:
 #   1. Plain file       (~/.claude/.credentials.json -- written by `claude login`)
 #   2. macOS Keychain   (service "Claude Code-credentials", via `security`)
 #   3. libsecret        (secret-tool lookup, best-effort Linux fallback)
 # All three yield the same JSON shape: {"claudeAiOauth":{"accessToken":"..."}}.
+# The FILE is stale by design (the CLI only rotates the Keychain after a runtime
+# refresh) -- an expired file next to a valid Keychain entry is normal and
+# produces no message at all.
 #
 # Dependencies: bash, curl, python3 (stdlib only). No jq required.
 #
@@ -17,7 +20,7 @@
 # The bridge passes LOCALE=<ko|en> in the environment so labels match the UI.
 
 set -euo pipefail
-# NOTE: set -x is FORBIDDEN (would expose the token in logs)
+# NOTE: set -x is FORBIDDEN (would expose token in logs)
 
 # --- arg parse: default live-only, --full appends the cache snapshot report,
 # --json prints the raw /api/oauth/usage response body and exits (machine
@@ -31,19 +34,61 @@ for _arg in "$@"; do
   esac
 done
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# workspace root = one level up from routines/
+WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
+: "${WORKSPACE}"  # suppress unused var warning if -u strict
+
 CACHE_FILE="${HOME}/.claude/stats-cache.json"
 
 # ============================================================
 # SECTION 1: LIVE RATE-LIMIT (from Anthropic API)
 # ============================================================
 
+_live_token=""
 _live_err=""
 _access_token=""
 
-# _extract_token <json_string> -> prints accessToken to stdout.
-# Exits 2 if token is absent, 3 if token is expired, 1 on parse error.
-# Never echoes the token value in errors.
-_extract_token() {
+# _read_creds_file <path> -> prints accessToken to stdout; exits nonzero if
+# the file is missing, unreadable, the token is absent, or the token is
+# expired (expiresAt in the past). Never echoes the token value in errors.
+_read_creds_file() {
+  local _f="$1"
+  [[ -f "$_f" && -r "$_f" ]] || return 1
+  python3 -c "
+import json, sys
+from datetime import datetime, timezone
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        d = json.load(f)
+    oauth = d.get('claudeAiOauth', {})
+    t = oauth.get('accessToken', '')
+    if not t:
+        sys.exit(2)
+    exp = oauth.get('expiresAt', '')
+    if exp:
+        try:
+            # expiresAt is epoch-milliseconds (integer) or an ISO string
+            if isinstance(exp, (int, float)):
+                exp_dt = datetime.fromtimestamp(exp / 1000.0, tz=timezone.utc)
+            else:
+                exp_dt = datetime.fromisoformat(str(exp).replace('Z', '+00:00'))
+            if exp_dt <= datetime.now(timezone.utc):
+                sys.exit(3)  # expired
+        except Exception:
+            pass  # unparseable expiry: treat as non-expired (best effort)
+    print(t, end='')
+except Exception:
+    sys.exit(1)
+" "$_f"
+}
+
+# _read_keychain -> prints accessToken to stdout; exits nonzero if the
+# Keychain entry is absent, empty, unparseable, or expired.
+_read_keychain() {
+  local _raw
+  _raw=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || return 1
+  [[ -n "$_raw" ]] || return 1
   python3 -c "
 import json, sys
 from datetime import datetime, timezone
@@ -64,51 +109,145 @@ try:
             if exp_dt <= datetime.now(timezone.utc):
                 sys.exit(3)  # expired
         except Exception:
-            pass  # unparseable expiry: treat as non-expired (best effort)
+            pass
     print(t, end='')
 except Exception:
     sys.exit(1)
-" <<< "$1"
+" <<< "$_raw"
 }
 
-# Expiry-aware token selection: try each credential source in order; skip any
-# source whose token is expired (exit 3) and fall through to the next.
-# Cross-platform: file -> macOS Keychain -> libsecret (Linux fallback).
-_live_token=""
-_f="${HOME}/.claude/.credentials.json"
+# _read_libsecret -> prints accessToken to stdout; exits nonzero when the
+# libsecret entry is absent, empty, unparseable, or expired. Same JSON shape as
+# the other two stores, so it reuses _read_keychain's parse by piping through
+# the same interpreter contract.
+_read_libsecret() {
+  local _raw
+  _raw=$(secret-tool lookup service "Claude Code-credentials" 2>/dev/null) || return 1
+  [[ -n "$_raw" ]] || return 1
+  python3 -c "
+import json, sys
+from datetime import datetime, timezone
+try:
+    d = json.loads(sys.stdin.read())
+    oauth = d.get('claudeAiOauth', {})
+    t = oauth.get('accessToken', '')
+    if not t:
+        sys.exit(2)
+    exp = oauth.get('expiresAt', '')
+    if exp:
+        try:
+            if isinstance(exp, (int, float)):
+                exp_dt = datetime.fromtimestamp(exp / 1000.0, tz=timezone.utc)
+            else:
+                exp_dt = datetime.fromisoformat(str(exp).replace('Z', '+00:00'))
+            if exp_dt <= datetime.now(timezone.utc):
+                sys.exit(3)  # expired
+        except Exception:
+            pass
+    print(t, end='')
+except Exception:
+    sys.exit(1)
+" <<< "$_raw"
+}
 
-# 1) Plain credentials file
-if [[ -f "$_f" && -s "$_f" ]]; then
-  _live_token=$(cat "$_f")
-  if _access_token=$(_extract_token "$_live_token"); then
-    : # valid -- use it
-  elif [[ $? -eq 3 ]]; then
-    _live_token=""  # expired -- fall through to next source
-    _access_token=""
+# _refresh_token_state -> prints "valid" / "expired" / "unknown" for the
+# refresh token backing whichever store still has one. The Keychain is
+# checked first -- it's the copy the CLI actually rotates (DGN-1050) -- and
+# falls back to the file. Never echoes the raw JSON or any token value.
+_refresh_token_state() {
+  local _raw=""
+  _raw=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) || _raw=""
+  if [[ -z "$_raw" && -f "$_creds_file" && -r "$_creds_file" ]]; then
+    _raw=$(cat "$_creds_file" 2>/dev/null) || _raw=""
+  fi
+  [[ -n "$_raw" ]] || { echo "unknown"; return; }
+  python3 -c "
+import json, sys
+from datetime import datetime, timezone
+try:
+    d = json.loads(sys.stdin.read())
+    exp = d.get('claudeAiOauth', {}).get('refreshTokenExpiresAt', '')
+    if not exp:
+        print('unknown'); sys.exit(0)
+    exp_dt = (datetime.fromtimestamp(exp / 1000.0, tz=timezone.utc)
+              if isinstance(exp, (int, float))
+              else datetime.fromisoformat(str(exp).replace('Z', '+00:00')))
+    print('expired' if exp_dt <= datetime.now(timezone.utc) else 'valid')
+except Exception:
+    print('unknown')
+" <<< "$_raw"
+}
+
+_file_state_desc() {
+  case "$_file_rc" in
+    3) echo "expired (normal -- the file is stale by design, the CLI only rotates the Keychain)" ;;
+    2) echo "present, accessToken field empty" ;;
+    0) echo "valid" ;;
+    *) echo "missing/unreadable" ;;
+  esac
+}
+
+# Expiry-aware token selection: try credentials file first; fall through to
+# Keychain if the file token is absent or expired.
+#
+# IMPORTANT: the Claude CLI only ever rewrites the macOS Keychain after a
+# runtime token rotation -- it never rewrites ~/.claude/.credentials.json
+# (measured: the two stores diverge, and only the Keychain is refreshed). An
+# expired FILE next to a valid Keychain entry is therefore the normal steady
+# state, not a fault, and is never reported below. Only a Keychain that
+# itself cannot serve a token is diagnosed -- and even then, an expired
+# Keychain access token is routinely self-healing as long as the refresh
+# token behind it is still valid.
+_creds_file="${HOME}/.claude/.credentials.json"
+_file_rc=0
+_live_calm=0
+if _access_token=$(_read_creds_file "$_creds_file"); then
+  : # file token is valid -- use it (rare; the file is normally stale)
+else
+  _file_rc=$?
+  # Fall through to Keychain
+  if _access_token=$(_read_keychain); then
+    : # Keychain token is valid -- the expected steady state
   else
-    _live_token=""
+    _kc_rc=$?
+    case "$_kc_rc" in
+      3)
+        # Keychain access token expired. Whether this self-heals depends
+        # entirely on the refresh token, not the access token.
+        case "$(_refresh_token_state)" in
+          valid)
+            _live_calm=1
+            _live_err="credentials.json: $(_file_state_desc); Keychain access token expired but its refresh token is still valid -- waiting for the CLI's automatic refresh. No action needed."
+            ;;
+          expired)
+            _live_err="RE-LOGIN REQUIRED: credentials.json: $(_file_state_desc); Keychain access token AND refresh token are both expired -- automatic renewal is no longer possible. Run: claude auth login"
+            ;;
+          *)
+            _live_err="credentials.json: $(_file_state_desc); Keychain access token expired and refresh-token validity could not be determined. Run: claude auth login"
+            ;;
+        esac
+        ;;
+      1)
+        _live_err="credentials.json: $(_file_state_desc); Keychain lookup returned no \"Claude Code-credentials\" entry (absent, or Keychain unavailable on this platform) -- not an expiry. Run: claude auth login"
+        ;;
+      *)
+        _live_err="credentials.json: $(_file_state_desc); Keychain entry present but malformed (no accessToken field). Run: claude auth login"
+        ;;
+    esac
+  fi
+fi
+
+# 3) libsecret / secret-tool -- best-effort Linux fallback. It runs LAST so the
+# macOS diagnosis above is untouched; a token found here clears the message the
+# absent-Keychain branch just wrote (on Linux `security` is simply not there,
+# which is not a fault).
+if [[ -z "${_access_token:-}" ]] && command -v secret-tool >/dev/null 2>&1; then
+  if _access_token=$(_read_libsecret); then
+    _live_err=""
+    _live_calm=0
+  else
     _access_token=""
   fi
-fi
-
-# 2) macOS Keychain (fallback when file is absent or expired)
-if [[ -z "$_access_token" ]] && command -v security >/dev/null 2>&1; then
-  if _live_token=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null) \
-     && [[ -n "$_live_token" ]]; then
-    _access_token=$(_extract_token "$_live_token") || _access_token=""
-  fi
-fi
-
-# 3) libsecret / secret-tool (best-effort Linux fallback)
-if [[ -z "$_access_token" ]] && command -v secret-tool >/dev/null 2>&1; then
-  if _live_token=$(secret-tool lookup service "Claude Code-credentials" 2>/dev/null) \
-     && [[ -n "$_live_token" ]]; then
-    _access_token=$(_extract_token "$_live_token") || _access_token=""
-  fi
-fi
-
-if [[ -z "$_access_token" ]]; then
-  _live_err="No Claude Code credentials found (checked ~/.claude/.credentials.json, macOS Keychain, secret-tool)"
 fi
 
 if [[ -z "$_live_err" && -z "${_access_token:-}" ]]; then
@@ -116,11 +255,23 @@ if [[ -z "$_live_err" && -z "${_access_token:-}" ]]; then
 fi
 
 if [[ -z "$_live_err" ]]; then
-  # curl with timeout=10s; -sS = silent but show errors; token in header only
+  # curl with timeout=10s; -sS = silent but show errors.
+  #
+  # The Authorization header is fed through `--config -` (stdin) rather than
+  # `-H`: an argument vector is world-readable while the process lives
+  # (/proc/<pid>/cmdline on Linux, `ps -ww` for the same user on macOS), so
+  # `-H "Authorization: Bearer $tok"` publishes the token to every local
+  # process for the length of the request. stdin is not in the argv, and curl
+  # applies a --config header exactly like -H. Quoted form on purpose: curl's
+  # UNQUOTED config values stop at the first ':' and the header never leaves
+  # (measured -- unquoted returns 401/429, quoted returns 200), so the two
+  # escapes below keep the quoting honest for any token charset.
   _resp_body=""
   _resp_code=""
-  if ! _curl_out=$(curl -sS --max-time 10 \
-      -H "Authorization: Bearer ${_access_token}" \
+  _tok_cfg="${_access_token//\\/\\\\}"
+  _tok_cfg="${_tok_cfg//\"/\\\"}"
+  if ! _curl_out=$(printf 'header = "Authorization: Bearer %s"\n' "$_tok_cfg" \
+      | curl -sS --max-time 10 --config - \
       -H "anthropic-version: 2023-06-01" \
       -w "\n__HTTP_STATUS__:%{http_code}" \
       "https://api.anthropic.com/api/oauth/usage" 2>&1); then
@@ -137,8 +288,9 @@ fi
 # --json: emit the raw usage JSON for machine consumers and stop (DGN-546).
 if [[ "$JSON_OUT" == "1" ]]; then
   _access_token=""  # clear from memory before any output
+  _tok_cfg=""
   if [[ -n "$_live_err" ]]; then
-    echo "[claude-usage] live lookup failed (${_live_err})" >&2
+    echo "[claude-usage] live lookup unavailable (${_live_err})" >&2
     exit 1
   fi
   printf '%s\n' "$_resp_body"
@@ -247,10 +399,15 @@ print("─" * 27)
 PYEOF2
   rm -f "$_resp_file"
   _access_token=""  # clear from memory after use
+  _tok_cfg=""
 else
-  echo "=================================================="
-  echo "  [Live Rate-Limit] live lookup failed (${_live_err})"
-  echo "=================================================="
+  if [[ "$_live_calm" == "1" ]]; then
+    echo "[Live Rate-Limit] ${_live_err}"
+  else
+    echo "=================================================="
+    echo "  [Live Rate-Limit] ${_live_err}"
+    echo "=================================================="
+  fi
   _access_token=""
   exit 1
 fi

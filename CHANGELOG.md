@@ -4,6 +4,31 @@ All notable changes to this project are documented here.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] - 2026-09-09
+
+### `/usage` is back
+
+2.0.0 removed `/usage`. That was a mistake on our side, not a product decision:
+the command works, and the reporting script it needs (`routines/claude-usage.sh`)
+was in the box the whole time -- it just was not wired up when the bridge started
+being generated instead of hand-copied. It is wired up again.
+
+- **`/usage`** -- your current Claude rate-limit windows (5-hour, weekly, and the
+  per-model weekly cap) with the reset time for each, read live from your own
+  Claude Code login. It is back in the command menu and in `/help`.
+- The script it runs is `routines/claude-usage.sh`, already in this repo. It is
+  also usable on its own: `routines/claude-usage.sh` for the short report,
+  `--full` to add the local stats cache summary, `--json` for the raw response.
+- Credentials are read from whichever store your Claude CLI actually uses --
+  `~/.claude/.credentials.json`, the macOS Keychain, or libsecret on Linux -- and
+  are sent to Anthropic only, in the request header. Nothing is written anywhere
+  and no token is ever printed, including in the failure messages.
+- If you are not logged in, `/usage` now says which store it checked and what to
+  do about it, instead of failing blankly.
+
+Nothing else changed in this release. `/history` is still gone -- the chat itself
+is the transcript.
+
 ## [2.0.0] - 2026-09-09
 
 The bridge is no longer maintained by hand-copying fixes from a private tree
