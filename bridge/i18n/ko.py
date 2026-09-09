@@ -155,6 +155,11 @@ STRINGS = {
     # new bridge terminal-closes the restart instead. Copy OWNER-APPROVED
     # 2026-08-22 09:12 (DGN-1240/DGN-1249 U1).
     "restart_backstop_notice": "재시작 완료",
+    # --- Usage report (/usage -> routines/claude-usage.sh) ---
+    # DGN-1362: public as of OSS 2.0.1 -- the script ships at the instance root.
+    "usage_script_missing": "사용량 스크립트를 찾을 수 없습니다 (routines/claude-usage.sh).",
+    "usage_timeout": "사용량 조회가 시간 내에 끝나지 않았습니다. 잠시 후 다시 시도해 주세요.",
+    "usage_failed": "사용량 조회 실패: {error}",
     # --- Transient countdown (DGN-594; UI redesign DGN-780; free-form DGN-780b) ---
     # Icon + draining bar carry the "remaining" meaning; no word. The icon is a
     # placeholder (default hourglass/check resolved in bridge/countdown.py; a

@@ -48,5 +48,12 @@
 # There IS a machine reading this: the publish gate refuses to land a tree
 # whose own `__version__` disagrees with the version being published, because
 # a published tree that misreports its version cannot be fixed after the fact.
-__oss_base__ = "2.0.0"
+#
+# DGN-1362 (OSS 2.0.1): 2.0.0 shipped without `/usage` -- not a product call, a
+# side effect of the routine it runs living outside the generator's --canon
+# root. Restoring the command is user-visible behaviour on an already-published
+# surface, so the emission needs its own number. PATCH, not MINOR: 2.0.0's own
+# changelog announced the removal as a breaking change, and this reverses that
+# announcement rather than adding anything new.
+__oss_base__ = "2.0.1"
 __version__ = __oss_base__

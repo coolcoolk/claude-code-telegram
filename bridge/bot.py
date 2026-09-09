@@ -151,6 +151,9 @@ COMMAND_MENU_SPEC = [
     ("new",      lambda: messages.CMD_DESC_NEW),
     ("stop",     lambda: messages.CMD_DESC_STOP),
     ("btw",      lambda: messages.CMD_DESC_BTW),
+    # DGN-1362: /usage ships. routines/claude-usage.sh sits at the instance
+    # root on BOTH sides of the fork (OSS 2.0.1), so the row is public.
+    ("usage",    lambda: messages.CMD_DESC_USAGE),
     ("queue",    lambda: messages.CMD_DESC_QUEUE),
     ("model",    lambda: messages.CMD_DESC_MODEL),
     ("skills",   lambda: messages.CMD_DESC_SKILLS),
@@ -956,6 +959,7 @@ class TelegramBot:
         app.add_handler(CommandHandler("stop", self._cmd_stop))
         app.add_handler(CommandHandler("queue", self._cmd_queue))
         app.add_handler(CommandHandler("skills", self._cmd_skills))
+        app.add_handler(CommandHandler("usage", self._cmd_usage))
         # DGN-1050: /authsync is RETIRED (see _cmd_authsync). The handler
         # stays registered (off-menu) so a typed /authsync gets the
         # retirement notice instead of falling through to the catch-all
@@ -2235,6 +2239,56 @@ class TelegramBot:
         lines.append(messages.HELP_TEXT_FOOTER)
         await update.message.reply_text("\n".join(lines))
 
+    async def _cmd_usage(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Run routines/claude-usage.sh and reply with its report.
+
+        No model call / no session: run the script directly (like /skills),
+        capture stdout, HTML-escape it, and wrap it in <pre> so the ASCII bars
+        and tables keep their alignment in Telegram. Long reports are split.
+        """
+        if not await self._check_access(update):
+            return
+        script = PROJECT_ROOT / "routines" / "claude-usage.sh"
+        if not script.is_file():
+            await update.message.reply_text(messages.USAGE_SCRIPT_MISSING)
+            return
+
+        def _run() -> str:
+            # Pass the active locale so the script localizes its labels
+            # (ko/en) to match the bridge UI.
+            run_env = {**os.environ, "LOCALE": config.locale}
+            proc = subprocess.run(
+                [str(script)],
+                capture_output=True,
+                text=True,
+                timeout=12,
+                env=run_env,
+            )
+            out = proc.stdout or ""
+            if not out.strip():
+                out = (proc.stderr or "").strip() or "(no output)"
+            return out
+
+        try:
+            output = await asyncio.to_thread(_run)
+        except subprocess.TimeoutExpired:
+            await update.message.reply_text(messages.USAGE_TIMEOUT)
+            return
+        except Exception as e:
+            await update.message.reply_text(
+                messages.USAGE_FAILED.format(error=str(e))
+            )
+            return
+
+        escaped = html.escape(output)
+        for part in split_text(escaped):
+            # DGN-891: balance guard (no-op here) + tag-stripped fallback so
+            # the plain degrade never shows escaped entities.
+            body = balance_telegram_html(f"<pre>{part}</pre>")
+            try:
+                await update.message.reply_text(body, parse_mode="HTML")
+            except Exception:
+                await update.message.reply_text(html_to_plain_text(body))
 
 
     async def _cmd_authsync(

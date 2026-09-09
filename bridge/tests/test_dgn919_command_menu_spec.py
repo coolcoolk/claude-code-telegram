@@ -47,6 +47,7 @@ EXPECTED_SPEC = [
     "new",
     "stop",
     "btw",
+    "usage",
     "queue",
     "model",
     "skills",
@@ -65,7 +66,7 @@ class TestCommandMenuSpec(unittest.TestCase):
     """COMMAND_MENU_SPEC structure and content."""
 
     def test_spec_has_exactly_eleven_entries(self):
-        self.assertEqual(len(COMMAND_MENU_SPEC), 9)
+        self.assertEqual(len(COMMAND_MENU_SPEC), 10)
 
     def test_spec_order_matches_locked_list(self):
         names = [cmd for cmd, _ in COMMAND_MENU_SPEC]
@@ -120,7 +121,7 @@ class TestBotCommandMenuOrder(unittest.TestCase):
 
     def test_menu_has_exactly_eleven_entries(self):
         commands = self._run_set_bot_commands()
-        self.assertEqual(len(commands), 9)
+        self.assertEqual(len(commands), 10)
 
     def test_menu_descriptions_match_spec(self):
         commands = self._run_set_bot_commands()

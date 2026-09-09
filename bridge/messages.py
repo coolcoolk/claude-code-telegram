@@ -109,6 +109,12 @@ RESTART_ACK = t("restart_ack")
 # marker unclaimed + worker pid dead). Copy status: 미확정 (형님 확인 대기).
 RESTART_BACKSTOP_NOTICE = t("restart_backstop_notice")
 
+# --- Usage report (/usage -> routines/claude-usage.sh) ---
+# DGN-1362: public as of OSS 2.0.1 -- /usage and its script both ship.
+USAGE_SCRIPT_MISSING = t("usage_script_missing")
+USAGE_TIMEOUT = t("usage_timeout")
+USAGE_FAILED = t("usage_failed")
+
 
 # --- Transient countdown (DGN-594) ---
 COUNTDOWN_BODY = t("countdown_body")
