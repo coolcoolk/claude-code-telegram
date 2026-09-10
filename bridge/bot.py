@@ -112,7 +112,7 @@ from bridge.permissions import (
     extract_protected_paths,
     outside_path_deny_message,
 )
-from bridge.sdk_bridge import ChatResponse, PROJECT_ROOT, sdk_bridge
+from bridge.sdk_bridge import ChatResponse, PROJECT_ROOT, TYPING_INTERVAL, sdk_bridge
 from bridge.session import session_manager
 from bridge.dashboard import DashboardSync
 from bridge.countdown import CDN_DONE_PREFIX, CountdownDriver
@@ -311,6 +311,13 @@ class TelegramBot:
         # _user_pending_texts: (text, arrival_ts, update).
         self._debounce_texts: Dict[int, List[tuple]] = {}
         self._debounce_timers: Dict[int, asyncio.Task] = {}
+        # DGN-1385: per-user typing-indicator refresh while a message sits
+        # buffered (debounce or /queue) waiting for the in-flight turn to end.
+        # Telegram's typing status expires after ~5s; this task re-sends it
+        # every TYPING_INTERVAL (sdk_bridge) so the sender sees "received" for
+        # the whole wait, not just an instant. One task per user -- cancelled
+        # the moment the buffer drains or is discarded.
+        self._typing_refresh_tasks: Dict[int, asyncio.Task] = {}
         # DGN-1016: monotonic timestamp of the FIRST auto-interrupt deferral
         # of the current in-flight wait (set when a debounce expiry skips the
         # interrupt because live background tasks exist). Cleared whenever the
@@ -1351,6 +1358,63 @@ class TelegramBot:
         self._debounce_texts.pop(user_id, None)
         # DGN-1016: a stop also ends any deferred-interrupt wait.
         self._interrupt_deferred_since.pop(user_id, None)
+        # DGN-1385: a discarded buffer no longer needs its typing indicator.
+        self._cancel_typing_refresh(user_id)
+
+    async def _start_typing_refresh(self, user_id: int, update) -> None:
+        """DGN-1385: signal receipt of a message buffered behind an in-flight turn.
+
+        The buffer paths in _enqueue_text_task otherwise send no feedback at
+        all while a message waits (max BRIDGE_INFLIGHT_DEBOUNCE_S, or far
+        longer if the in-flight turn itself is still running) -- indistinguishable
+        from the message being silently dropped (owner-observed, DGN-1385).
+        Sends one immediate typing action, then reuses an already-running
+        refresh loop for this user (a burst of messages shares one loop) or
+        starts exactly one new task to keep the indicator alive past its ~5s
+        Telegram expiry until the buffer drains.
+        """
+        chat = update.effective_chat
+        if chat is None:
+            return
+        try:
+            await chat.send_action(action="typing")
+        except Exception as e:
+            logger.debug("DGN-1385 typing send failed for user %s: %s", user_id, e)
+        existing = self._typing_refresh_tasks.get(user_id)
+        if existing and not existing.done():
+            return
+        self._typing_refresh_tasks[user_id] = asyncio.create_task(
+            self._typing_refresh_loop(user_id, chat)
+        )
+
+    async def _typing_refresh_loop(self, user_id: int, chat) -> None:
+        """DGN-1385: keep re-sending typing while a message sits buffered.
+
+        Telegram's typing status expires after ~5s; owner decision
+        2026-09-10 21:30 was to stay honest about a long wait rather than let
+        the indicator go dark and imply the message was dropped. Runs until
+        cancelled by _cancel_typing_refresh (drain, /stop, or coalesce-cap
+        discard) -- never self-terminates.
+        """
+        try:
+            while True:
+                await asyncio.sleep(TYPING_INTERVAL)
+                try:
+                    await chat.send_action(action="typing")
+                except Exception as e:
+                    # A flaky Telegram call (429/network) must never kill the
+                    # refresh loop or the turn it is decorating.
+                    logger.debug(
+                        "DGN-1385 typing refresh failed for user %s: %s", user_id, e
+                    )
+        except asyncio.CancelledError:
+            raise
+
+    def _cancel_typing_refresh(self, user_id: int) -> None:
+        """DGN-1385: stop the typing-refresh loop -- its buffer wait is over."""
+        task = self._typing_refresh_tasks.pop(user_id, None)
+        if task and not task.done():
+            task.cancel()
 
     @staticmethod
     def _bundle_texts(items: List[tuple]) -> str:
@@ -1410,6 +1474,8 @@ class TelegramBot:
                         await self._notify_coalesce_cap(user_id, update)
                         return
                     buf.append((text, ts, update))
+                    # DGN-1385: /queue lands here silently otherwise -- signal receipt.
+                    await self._start_typing_refresh(user_id, update)
                     return
                 # DGN-911 default: buffer + (re)arm the debounce window.
                 buf = self._debounce_texts.setdefault(user_id, [])
@@ -1419,6 +1485,10 @@ class TelegramBot:
                     return
                 buf.append((text, ts, update))
                 self._reset_inflight_debounce(user_id)
+                # DGN-1385: buffered messages get no other feedback until the
+                # debounce window (or the in-flight turn itself) ends -- signal
+                # receipt now instead of leaving the sender guessing.
+                await self._start_typing_refresh(user_id, update)
                 return
         # Idle: dispatch immediately. The done-callback drains any messages that
         # arrive while this turn runs.
@@ -1716,6 +1786,8 @@ class TelegramBot:
             self._interrupt_deferred_since.pop(user_id, None)
         if timer and not timer.done():
             timer.cancel()
+        # DGN-1385: the wait these buffers signaled is over -- stop refreshing.
+        self._cancel_typing_refresh(user_id)
         if debounced:
             # Stable chronological merge across the two buffers; entries
             # without a timestamp keep their relative position (sort key
