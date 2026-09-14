@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [2.0.2] - 2026-09-14
+
+### The agent no longer leaks its own next turn into your chat
+
+Sometimes a reply arrived with an extra tail glued onto the end of it -- a
+fragment the agent had written for the *next* turn, not for you: a role label
+with text run directly onto it, mid-sentence, after the real answer had already
+finished. You never asked for it and it was never meant to be sent.
+
+- The outbound sanitizer now detects that shape and cuts it before the message
+  leaves. The real answer is untouched; only the glued-on tail goes.
+- Detection is conservative by design. It fires on the specific shape that was
+  actually measured leaking, and a grammatical-particle check keeps it off
+  ordinary text that merely resembles it -- dropping a word of your content is
+  worse than leaving a stray fragment, so the cut is narrow on purpose.
+- Known limit: the anchor needs the label and the text to be run together with
+  no space between them. A leak that lands with a space after the label does
+  not match this rule yet.
+- When a strip happens, it is logged (with the label and how many characters
+  were removed) so the behaviour is auditable rather than silent.
+
+Nothing else changed in this release.
+
 ## [2.0.1] - 2026-09-09
 
 ### `/usage` is back
