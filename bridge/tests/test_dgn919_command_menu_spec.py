@@ -19,9 +19,16 @@ Locked list history:
     ... resume, restart, health, help (still 11 commands: authsync's slot
     is replaced by restart's, one-for-one). Flagged for owner
     reconfirmation -- not a re-run of D1 itself.
+  - 2026-09-12: owner pulled /health off the command surface entirely
+    (DGN-1435 -- the "확인 필요" report was unreliable: retired agents and
+    one-shot reminders counted as loss, raw English machine keys and plist
+    paths leaked into user-facing text). bot.py no longer registers /health
+    or lists it in COMMAND_MENU_SPEC -- back to the 10-command DGN-919 lock
+    until a rewrite re-adds it. The DGN-986 D1 history above is kept for the
+    rewrite to consult, not as a currently-true count.
 
 Asserts that:
-  1. COMMAND_MENU_SPEC contains exactly the 11 locked commands in the right order.
+  1. COMMAND_MENU_SPEC contains exactly the 10 locked commands in the right order.
   2. _set_bot_commands builds its BotCommand list from COMMAND_MENU_SPEC (same order).
   3. The generated /help body lists the same commands in the same order.
   4. Hidden commands (start, claim, usageretry) are NOT in COMMAND_MENU_SPEC.
@@ -53,6 +60,8 @@ EXPECTED_SPEC = [
     "skills",
     "resume",
     "restart",
+    # health pulled off the command surface (DGN-1435, 2026-09-12) -- not
+    # carried here until the rewrite re-adds it; see module docstring.
     "help",
 ]
 
@@ -65,7 +74,10 @@ FORBIDDEN_COMMANDS = {"kill"}
 class TestCommandMenuSpec(unittest.TestCase):
     """COMMAND_MENU_SPEC structure and content."""
 
-    def test_spec_has_exactly_eleven_entries(self):
+    def test_spec_has_exactly_ten_entries(self):
+        # DGN-986 D1 had raised this to 11 (+ /health); DGN-1435 (2026-09-12)
+        # pulled /health back off the surface, so canonical and public build
+        # now agree at 10 again -- see module docstring.
         self.assertEqual(len(COMMAND_MENU_SPEC), 10)
 
     def test_spec_order_matches_locked_list(self):
@@ -75,6 +87,10 @@ class TestCommandMenuSpec(unittest.TestCase):
                          f"  got:      {names}\n"
                          f"  expected: {EXPECTED_SPEC}")
 
+    # test_health_sits_immediately_before_help retired here (DGN-1435,
+    # 2026-09-12): /health no longer sits in COMMAND_MENU_SPEC at all, in
+    # either build. help-is-last stays covered by
+    # test_spec_order_matches_locked_list.
 
     def test_hidden_commands_not_in_spec(self):
         names = {cmd for cmd, _ in COMMAND_MENU_SPEC}
@@ -119,8 +135,10 @@ class TestBotCommandMenuOrder(unittest.TestCase):
                          f"  menu: {menu_names}\n"
                          f"  spec: {spec_names}")
 
-    def test_menu_has_exactly_eleven_entries(self):
+    def test_menu_has_exactly_ten_entries(self):
         commands = self._run_set_bot_commands()
+        # DGN-1435 (2026-09-12): /health pulled off the surface -- see
+        # module docstring and test_spec_has_exactly_ten_entries.
         self.assertEqual(len(commands), 10)
 
     def test_menu_descriptions_match_spec(self):

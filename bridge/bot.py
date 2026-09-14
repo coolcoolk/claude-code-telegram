@@ -101,6 +101,7 @@ from bridge.options import (
     extract_marker_labels,
     extract_options,
     has_options_marker,
+    is_number_handle,
     resolve_choice,
     strip_consumed_options,
     strip_options_marker,
@@ -164,6 +165,21 @@ COMMAND_MENU_SPEC = [
 ]
 
 STALE_MESSAGE_SECONDS = 20 * 60
+# ^ NO recorded rationale. A 2026-09-10 census (bot.py history, bridge/*.md,
+# CHANGELOG, releases/, worklog tickets, the OSS mirror) found the constant
+# with zero explanatory comment in every tree it exists in, and no ticket that
+# introduced or justified it -- only downstream code that ASSUMES it
+# (DGN-841 / DGN-922 / DGN-966 / DGN-1050 comments below). What it actually
+# protects today is narrow: process first boot already drops every queued
+# update Telegram-side (start_polling drop_pending_updates=first_boot), so
+# this gate only covers updates replayed on an IN-PROCESS polling
+# re-establish (network loss / laptop sleep-wake).
+# It is a poor fit for CALLBACK updates: a notification button is normally
+# tapped hours later (measured 2026-09-10: 5 h 57 m), and the age it measures
+# is the NOTIFICATION's, not the tap's. Whether callbacks should keep this
+# number, get their own, or be exempt entirely is an open product decision
+# (DGN-841's third checkbox). What did NOT wait for that decision: a drop is
+# no longer SILENT -- see _announce_stale_drop below.
 # DGN-616: cap on concurrent turns per user for the CONTROL path only
 # (/stop, /new, /model, opt: and resume: callbacks route through
 # _enqueue_user_task). Regular messages (text/voice/photo/document) are
@@ -1043,6 +1059,12 @@ class TelegramBot:
             if msg and msg.date:
                 age = (datetime.now(timezone.utc) - msg.date).total_seconds()
                 if age > STALE_MESSAGE_SECONDS:
+                    # The drop used to be TOTALLY silent: no log line, and for a
+                    # callback no query.answer() either, so the owner's tap did
+                    # nothing at all on screen and left no server-side trace
+                    # (measured 2026-09-10, health-observer opt: button tapped
+                    # ~6 h after the notification). Announce before returning.
+                    await self._announce_stale_drop(update, age)
                     return False
         user = update.effective_user
         if not user:
@@ -1079,6 +1101,104 @@ class TelegramBot:
             return False
         self._note_incoming_message(update.message)
         return True
+
+    def _is_owner_user(self, user) -> bool:
+        """True when `user` is the established owner under the current mode.
+
+        Read-only twin of the ownership branch in _check_access, extracted so a
+        pre-gate path can ask "may I say anything to this sender at all?"
+        without duplicating (or weakening) the decision. Both born-locked modes
+        answer False on purpose:
+          MODE_CLAIM      -- an unclaimed bot must never reveal that it exists.
+          MODE_LOCKED_OUT -- anomalous recovery state, deny all, stay silent.
+        """
+        if user is None:
+            return False
+        mode, owner_id = ownership.resolve_owner(
+            config.allowed_user_ids, config.bot_data_dir
+        )
+        if mode == ownership.MODE_AUTHORITATIVE:
+            return user.id in config.allowed_user_ids
+        if mode == ownership.MODE_OWNER_LOCK:
+            return user.id == owner_id
+        return False
+
+    # Cap for a button label quoted back inside the expiry alert. Telegram's
+    # answerCallbackQuery text limit is 200 chars; the wording around the label
+    # already spends ~60, so the quote gets a conservative slice of the rest.
+    _STALE_ALERT_LABEL_MAX = 90
+    # Numbered-option button text is "N. label" (build_option_keyboard prepends
+    # the number); the number is keyboard bookkeeping, not part of what the
+    # owner would type, so it is stripped before quoting.
+    _OPT_NUMBER_PREFIX_RE = re.compile(r"^\s*\d+\s*[.)]\s*")
+
+    def _stale_callback_alert_text(self, query) -> str:
+        """Wording for the expired-tap alert; quotes the button label if usable.
+
+        The label IS the sentence the tap would have sent (options.resolve_choice
+        -> process_message(user_message=...)), so quoting it back gives the owner
+        a re-issue path that needs no knowledge of the bridge: type that.
+        Degrades to the label-free wording whenever the label cannot be
+        recovered (keyboard gone / no match) or is a number handle (DGN-881).
+        """
+        data = getattr(query, "data", None)
+        message = getattr(query, "message", None)
+        markup = getattr(message, "reply_markup", None)
+        keyboard = getattr(markup, "inline_keyboard", None)
+        if not data or not keyboard:
+            return messages.STALE_CALLBACK_EXPIRED_NOLABEL
+        label = resolve_choice(data, keyboard)
+        label = self._OPT_NUMBER_PREFIX_RE.sub("", label or "").strip()
+        if not label or is_number_handle(label):
+            return messages.STALE_CALLBACK_EXPIRED_NOLABEL
+        if len(label) > self._STALE_ALERT_LABEL_MAX:
+            label = label[: self._STALE_ALERT_LABEL_MAX - 1].rstrip() + "…"
+        return messages.STALE_CALLBACK_EXPIRED.format(choice=label)
+
+    async def _announce_stale_drop(self, update: Update, age: float) -> None:
+        """Make a STALE-gate drop observable instead of silent.
+
+        Two effects, deliberately asymmetric:
+
+        LOG (always, every dropped update). The drop was previously invisible
+        on the server too -- DGN-841 confirmed the cause in 2026-08 and the
+        2026-09-10 recurrence still had to be reconstructed from ABSENT
+        evidence because not one line was written. Callbacks log at WARNING (a
+        tap is a deliberate owner act that just died); plain messages log at
+        INFO (a polling re-establish can replay a burst of them, and that burst
+        is normal, not a defect).
+
+        ALERT (callbacks only, owner only). Answering the query is the only way
+        the tap stops being a no-op on the owner's screen. It is also an API
+        call made BEFORE the ownership branch of _check_access, so it is gated
+        on _is_owner_user: a stranger's stale tap still gets total silence and
+        cannot probe for the bot's existence. Fail-soft throughout -- an alert
+        that cannot be delivered must never turn a drop into an exception.
+        """
+        query = update.callback_query
+        user = update.effective_user
+        chat = update.effective_chat
+        if query is None:
+            logger.info(
+                "STALE drop: message from user %s in chat %s, age %.0fs > %ds",
+                getattr(user, "id", None), getattr(chat, "id", None),
+                age, STALE_MESSAGE_SECONDS,
+            )
+            return
+        logger.warning(
+            "STALE drop: callback %r from user %s in chat %s, age %.0fs > %ds "
+            "-- button tap not executed",
+            getattr(query, "data", None), getattr(user, "id", None),
+            getattr(chat, "id", None), age, STALE_MESSAGE_SECONDS,
+        )
+        if not self._is_owner_user(user):
+            return
+        try:
+            await query.answer(
+                self._stale_callback_alert_text(query), show_alert=True
+            )
+        except Exception as e:
+            logger.warning("STALE drop alert failed (ignored): %s", e)
 
     def _note_incoming_message(self, message) -> None:
         """DGN-555: record the newest accepted incoming user message_id per chat.
@@ -1379,7 +1499,7 @@ class TelegramBot:
         try:
             await chat.send_action(action="typing")
         except Exception as e:
-            logger.debug("DGN-1385 typing send failed for user %s: %s", user_id, e)
+            logger.debug("typing send failed for user %s: %s", user_id, e)
         existing = self._typing_refresh_tasks.get(user_id)
         if existing and not existing.done():
             return
@@ -1405,7 +1525,7 @@ class TelegramBot:
                     # A flaky Telegram call (429/network) must never kill the
                     # refresh loop or the turn it is decorating.
                     logger.debug(
-                        "DGN-1385 typing refresh failed for user %s: %s", user_id, e
+                        "typing refresh failed for user %s: %s", user_id, e
                     )
         except asyncio.CancelledError:
             raise

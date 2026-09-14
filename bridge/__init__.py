@@ -40,10 +40,12 @@
 # trailed the pin -- the OSS release this vendored tree was copied FROM. From
 # the generated line on it LEADS the pin: the public tree is no longer copied
 # in, it is emitted, and this is the version that emission publishes. The pin
-# below still records where the vendored tree last came from (OSS 1.1.0,
-# c4bd9df1) and is deliberately NOT moved by this bump -- moving it would
-# claim a provenance that does not exist yet. It re-anchors to the 2.0.0
-# release commit after that commit exists, i.e. after the owner pushes.
+# below was deliberately NOT moved by that bump (it would have claimed a
+# provenance that did not exist yet); it re-anchors once the release commit
+# exists. That happened on 2026-09-09: 2.0.0 and 2.0.1 were both published,
+# and a447c62f re-anchored `- Pinned commit:` in UPSTREAM.md to 09c20541
+# (OSS 2.0.1) -- but left THIS line on the old c4bd9df1, which broke the
+# lockstep test the two lines exist for. Re-anchored here to match.
 #
 # There IS a machine reading this: the publish gate refuses to land a tree
 # whose own `__version__` disagrees with the version being published, because
@@ -55,5 +57,10 @@
 # surface, so the emission needs its own number. PATCH, not MINOR: 2.0.0's own
 # changelog announced the removal as a breaking change, and this reverses that
 # announcement rather than adding anything new.
-__oss_base__ = "2.0.1"
+# DGN-1400 (OSS 2.0.2): the outbound sanitizer now strips a self-authored
+# next-turn tail glued onto a message. PATCH: it removes text the owner never
+# meant to send, and adds no surface. Landed canonically 2026-09-14 (the fix
+# had lived only in the public clone, which the generated line makes a dead
+# end). Owner approval for the cut: 형님 2026-09-14 21:01.
+__oss_base__ = "2.0.2"
 __version__ = __oss_base__

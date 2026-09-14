@@ -279,10 +279,44 @@ def _overflows_to_handle(label: str) -> bool:
     return _label_width(label) > _BUTTON_LABEL_MAX_WIDTH
 
 
+# DGN-1242: numbered-line prefix for label-block dedup. Wider than
+# _OPTION_RE on purpose ("1 . x" spacing variants) but anchored the same way;
+# a number without list punctuation ("1번 안") never matches, so labels that
+# merely START with a digit are not mistaken for numbered list lines.
+_NUM_PREFIX_RE = re.compile(r"^(\d+)\s*[.、)）]\s*(.+)$")
+
+
+def _line_equals_label(line: str, label: str, position: int) -> bool:
+    """True when a body line restates `label` verbatim, bare or numbered.
+
+    DGN-1242: the duplicate list the author writes above a labeled marker
+    carries "N. " prefixes while marker labels do not, so exact equality
+    alone never fires. A numbered line matches ONLY when its number equals
+    the label's 1-based `position` -- lines 2..3 of a LARGER unrelated list
+    can then never satisfy a full-block match (the DGN-984 hijack shape:
+    deleting a mid-list slice would orphan the rest of that list).
+    """
+    stripped = line.strip()
+    if stripped == label:
+        return True
+    m = _NUM_PREFIX_RE.match(stripped)
+    return bool(m) and int(m.group(1)) == position and m.group(2).strip() == label
+
+
 def _strip_verbatim_label_block(clean: str, labels: List[str]) -> str:
-    """Remove the LAST contiguous line block whose stripped lines equal
-    `labels` exactly (DGN-992 rev2: bare-marker trailing labels consumed by
-    the buttons must not stay in the display as a duplicate list).
+    """Remove EVERY contiguous line block that restates `labels` in full
+    (DGN-992 rev2: bare-marker trailing labels consumed by the buttons must
+    not stay in the display as a duplicate list; DGN-1242: a numbered
+    restatement "1. label" is the same duplicate and is matched via
+    _line_equals_label -- position-locked, so only a whole 1..N run whose
+    text equals the label set exactly, in order, ever matches).
+
+    All-blocks removal (DGN-1242): the incident shape can carry the same
+    duplicate twice (numbered list in the body AND bare trailing labels
+    under the marker); removing only the last match would leave a triple
+    exposure half-fixed. Each removed block is independently a full
+    verbatim restatement, so this widens nothing -- a partial or reordered
+    match still never strips (DGN-984 no-hijack invariant).
 
     Blocks inside fenced code are never touched (DGN-085 class). When no
     exact match exists the text is returned unchanged -- removal is an
@@ -299,12 +333,26 @@ def _strip_verbatim_label_block(clean: str, labels: List[str]) -> str:
         offset = end + 1
         fenced.append(any(s <= start and end <= e for s, e in spans))
     n = len(labels)
-    for i in range(len(lines) - n, -1, -1):
-        if any(fenced[i + k] for k in range(n)):
-            continue
-        if all(lines[i + k].strip() == labels[k] for k in range(n)):
+    removed = False
+    i = len(lines) - n
+    while i >= 0:
+        if not any(fenced[i + k] for k in range(n)) and all(
+            _line_equals_label(lines[i + k], labels[k], k + 1) for k in range(n)
+        ):
             del lines[i:i + n]
-            return "\n".join(lines).rstrip()
+            del fenced[i:i + n]
+            # Seam collapse: the removed block usually sat between blank
+            # separator lines; keep exactly one so the display never shows
+            # a double blank where the duplicate list used to be.
+            if 0 < i < len(lines) and not lines[i - 1].strip() and not lines[i].strip():
+                del lines[i]
+                del fenced[i]
+            removed = True
+            i -= n
+        else:
+            i -= 1
+    if removed:
+        return "\n".join(lines).rstrip()
     return clean
 
 
@@ -365,7 +413,6 @@ def strip_consumed_options(
             _overflows_to_handle(f"{i}. {opt}")
             for i, opt in enumerate(marker_labels, 1)
         )
-        stripped_any = False
         if run:
             run_labels = [label.strip() for _, label, _ in run]
             line_indices = [idx for _, _, idx in run]
@@ -379,15 +426,17 @@ def strip_consumed_options(
                 clean = "\n".join(
                     ln for i, ln in enumerate(lines) if i not in drop
                 ).rstrip()
-                stripped_any = True
-        if not stripped_any and not overflow:
+        if not overflow:
             # DGN-992 rev2: bare-marker TRAILING labels remain in the body
             # after the marker line is stripped (they came from the lines
             # under the marker) -- the buttons consumed them, so remove the
             # matching block to avoid a duplicate display. Same mechanism
-            # also removes a verbatim (unnumbered) restatement of labeled-
-            # marker labels. Only an EXACT contiguous match is touched; a
-            # non-matching body always survives intact (fail-safe).
+            # also removes any verbatim restatement of the marker labels,
+            # bare or "N. "-numbered (DGN-1242), and runs even after the
+            # run-strip above so no second duplicate survives. Only an
+            # EXACT full-block match is touched (numbered lines position-
+            # locked); a non-matching body always survives intact
+            # (fail-safe, DGN-984 no-hijack).
             clean = _strip_verbatim_label_block(clean, marker_labels)
         return clean, marker_labels
     if not run:
@@ -478,6 +527,30 @@ def _label_width(text: str) -> float:
 def _number_handle_label(number: int) -> str:
     """Localized number-handle button text (ko "N번" / en "No.N", DGN-881)."""
     return t("option_number_handle").format(n=number)
+
+
+def is_number_handle(text: str) -> bool:
+    """True when `text` is a degraded number-handle label, not a real sentence.
+
+    Same authority as _number_handle_label -- the pattern is derived from the
+    live i18n template, so a catalog edit cannot silently desync it. Callers
+    that QUOTE a button label back to the user need this: telling the owner to
+    retype "3번" / "No.3" is useless (the full label lives in the message body
+    on the overflow path, DGN-881), so they degrade to a label-free wording.
+    A bare number is treated as a handle too -- resolve_choice's keyboard-absent
+    fallback returns exactly that.
+    """
+    if not text:
+        return True
+    stripped = text.strip()
+    if stripped.isdigit():
+        return True
+    template = t("option_number_handle")
+    pattern = "".join(
+        r"\d+" if part == "{n}" else re.escape(part)
+        for part in re.split(r"(\{n\})", template)
+    )
+    return re.fullmatch(pattern, stripped) is not None
 
 
 def _shorten_button_label(label: str) -> str:

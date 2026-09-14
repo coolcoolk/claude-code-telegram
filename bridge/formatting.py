@@ -1554,6 +1554,91 @@ def html_to_plain_text(html_text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
+# --- DGN-1400: leaked next-turn tail -----------------------------------------
+#
+# The model sometimes does not stop at its own last sentence: it keeps going
+# and writes the NEXT turn -- a chat-transcript role label (user/assistant/
+# human, or a misspelling of one) glued onto the tail of the message, followed
+# by that other speaker's line. Two confirmed origins (injected background
+# context copied into the body; genuinely invented text with no prior
+# occurrence in the session) -- this strip does not care which, it only
+# recognizes the SHAPE of the artifact, so it catches both.
+#
+# Anchor: the label must sit at the start of a line (or the very start of the
+# message) and be glued -- zero whitespace -- directly onto Hangul. In a
+# Korean-language conversation that glue is the strongest signal available:
+# "user확인해봤어?" is never legitimate orthography, while "user asked" is an
+# ordinary English sentence. Stated limitation, not an oversight: a leak glued
+# onto Latin text ("userdid you check?") has no equally safe discriminator
+# ("username", "userland" are words) and is NOT detected; covering another
+# script needs its own false-positive filter, the way _KOREAN_PARTICLES below
+# covers Korean grammar.
+_LEAK_TAIL_LABELS = ("assistant", "human", "usre", "uset", "user", "usr")
+_LEAK_TAIL_RE = re.compile(
+    r"(?:\A|\n+)[ \t]*(" + "|".join(_LEAK_TAIL_LABELS) + r")(?=[가-힣])",
+    re.IGNORECASE,
+)
+
+# Korean case/topic particles attach to their host word with NO space (normal
+# Korean orthography, not a sign of a leak) -- Korean technical prose keeps
+# English terms untranslated, so "user는 이렇게 설정합니다" is a legitimate
+# sentence. When the Hangul run right behind the label is exactly one of these
+# particles, the match is discarded as ordinary grammar rather than a leaked
+# turn.
+_KOREAN_PARTICLES = (
+    "에서는", "로부터", "으로는", "이라도", "이지만",
+    "에서", "부터", "까지", "처럼", "보다", "라도", "조차", "마저",
+    "밖에", "이나", "마다", "커녕", "한테", "에게",
+    "는", "은", "이", "가", "을", "를", "의", "도", "만", "나",
+    "에", "로", "와", "과", "뿐",
+)
+_HANGUL_RUN_RE = re.compile(r"[가-힣]+")
+
+
+def strip_leaked_turn_tail(text: str) -> str:
+    """DGN-1400: drop a self-authored next-turn tail glued onto the message.
+
+    Only ever removes a TAIL, from the last valid label match through the end
+    of the message -- never the middle. A code fence (and inline `code`) is a
+    hard exclusion zone: fenced content is never scanned (reuses
+    _split_fenced_blocks, the module's one fence walk), and a match sitting
+    inside an inline-code span (odd backtick count before it) is discarded.
+    If stripping would leave nothing behind, the original text is returned
+    untouched -- an empty send is a worse failure than a leaked tail.
+    """
+    if not text:
+        return text
+    lower = text.lower()
+    if not any(label in lower for label in _LEAK_TAIL_LABELS):
+        return text
+    chunks = list(_split_fenced_blocks(text))
+    if not chunks or chunks[-1][1]:
+        # Nothing outside a fence, or the message ends inside/right after a
+        # fenced code block -- fenced content is never touched.
+        return text
+    tail_chunk = chunks[-1][0]
+    match = None
+    for candidate in _LEAK_TAIL_RE.finditer(tail_chunk):
+        hangul = _HANGUL_RUN_RE.match(tail_chunk, candidate.end(1))
+        if hangul is not None and hangul.group(0) in _KOREAN_PARTICLES:
+            continue
+        if tail_chunk.count("`", 0, candidate.start()) % 2:
+            continue  # inside an open inline-code span -- excluded
+        match = candidate  # keep scanning: last valid match wins (smallest cut)
+    if match is None:
+        return text
+    kept_len = len(text) - len(tail_chunk) + match.start()
+    stripped = text[:kept_len]
+    if not stripped.strip():
+        return text
+    logger.warning(
+        "stripped leaked next-turn tail (label=%r, %d chars removed)",
+        match.group(1),
+        len(text) - kept_len,
+    )
+    return stripped
+
+
 def sanitize_message_for_telegram(text: str, rail: str = RAIL_UNKNOWN) -> str:
     """DGN-822: sanitize a WHOLE message to Telegram-safe HTML (single entry).
 
@@ -1577,6 +1662,7 @@ def sanitize_message_for_telegram(text: str, rail: str = RAIL_UNKNOWN) -> str:
     text = apply_machine_line_gate(text, rail)
     if not text:
         return text
+    text = strip_leaked_turn_tail(text)
     rendered: List[str] = []
     for segment, is_code, lang in split_into_segments(text):
         if is_code:

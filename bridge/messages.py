@@ -18,6 +18,10 @@ from bridge.i18n import t
 # --- Access control ---
 NO_PERMISSION = t("no_permission")
 NO_PERMISSION_CALLBACK = t("no_permission_callback")
+# Shown as a Telegram alert when the STALE gate drops an owner's button tap.
+# DRAFT wording pending owner approval -- see the catalog comment.
+STALE_CALLBACK_EXPIRED = t("stale_callback_expired")
+STALE_CALLBACK_EXPIRED_NOLABEL = t("stale_callback_expired_nolabel")
 
 # --- Born-locked ownership / claim flow (see bridge/ownership.py) ---
 CLAIM_SUCCESS = t("claim_success")

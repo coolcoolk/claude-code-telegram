@@ -145,6 +145,28 @@ notify_lang() {
   if [ "$DOGANY_LANG" = "ko" ]; then notify "$1"; else notify "$2"; fi
 }
 
+# DRAFT owner-facing copy -- WORDING PENDING OWNER CONFIRMATION (UX gate).
+# Do not treat this wording as final; a test pins this marker to the strings.
+#
+# Owner-actionable recovery steps, appended to each notice this watchdog sends
+# from a state it cannot recover by itself. WHY they exist: the previous copy
+# ended in "ask me and I will walk you through it", which offers a channel
+# that is broken by definition -- with the bridge down, the owner's message
+# cannot reach the agent to be answered (owner ruling 2026-09-11). A notice
+# about an unrecoverable state must therefore name an action he can take
+# WITHOUT the agent. Shape follows the approved 2026-08-16 watchdog copy: the
+# message, then the recovery line on its own line.
+#
+# ORDER IS SIMPLEST FIRST, per the owner's own sequencing. Step 1 needs only
+# the phone he is already holding and works in the common case where the bot
+# process is alive but wedged (the chat command is registered owner-only in
+# bridge/bot.py, DGN-997). Step 2 needs no agent at all: the local launcher
+# (scripts/dogany) asks the service manager directly. No privileged command is
+# offered at this level -- the one that exists is per-incident and appears
+# only where it is the actual fix (handle_busdown), never first.
+RECOVERY_STEPS_KO='복구 1: 채팅에 /restart 를 보내 주세요.'
+RECOVERY_STEPS_EN='Recover 1: send /restart in the chat.'
+
 # True when a captured systemctl stderr indicates the systemd user bus is
 # unreachable (the #10205 /run/user shadowing landmine, or a dead user
 # manager). Distinct from an unknown/unregistered unit.
@@ -164,7 +186,21 @@ handle_busdown() {
   log "decision: user bus unreachable -- cannot restart; manual recovery: sudo systemctl restart user@${uid}"
   if [ "$DRY_RUN" = "0" ] && [ ! -f "$BUSDOWN_MARKER" ]; then
     touch "$BUSDOWN_MARKER"
-    notify "bridge watchdog: systemd user bus is down; cannot auto-restart. Recover with: sudo systemctl restart user@${uid} (or, in Windows PowerShell, wsl --shutdown then reopen Ubuntu)."
+    # DRAFT owner-facing copy -- WORDING PENDING OWNER CONFIRMATION (UX gate).
+    # Do not treat this wording as final; a test pins this marker to the
+    # strings. This call site uses notify_lang -- the ko/en helper that
+    # already lived in this file and that only two of five call sites used.
+    # The two shared steps come first (RECOVERY_STEPS_*); the privileged
+    # session restart is appended LAST and only here, because a dead user bus
+    # is the one state in which neither shared step can work -- the chat
+    # command needs a live bot and the launcher's service call needs the bus.
+    notify_lang \
+      "⚠️ 지금은 제가 스스로 다시 일어설 수 없는 상태예요.
+${RECOVERY_STEPS_KO}
+복구 3: 그래도 안 되면 관리자 권한으로 사용자 세션을 다시 시작해 주세요: sudo systemctl restart user@${uid}" \
+      "⚠️ I cannot bring myself back up right now.
+${RECOVERY_STEPS_EN}
+Recover 3: if it is still down, restart the user session as admin: sudo systemctl restart user@${uid}"
   fi
 }
 
@@ -344,7 +380,15 @@ if [ "$recent" -ge "$RATE_MAX" ]; then
   log "decision: rate limited ($recent restarts in last ${RATE_WINDOW_S}s), not restarting"
   if [ "$DRY_RUN" = "0" ] && [ ! -f "$RATELIMIT_MARKER" ]; then
     touch "$RATELIMIT_MARKER"
-    notify "bridge watchdog: restart rate limit hit, heartbeat still stalled. Manual check needed."
+    # DRAFT owner-facing copy -- WORDING PENDING OWNER CONFIRMATION (UX gate).
+    # Do not treat this wording as final. Was English-only through notify()
+    # and named the component plus its rate-limit mechanism; now it says what
+    # the owner can act on, in his language, through notify_lang.
+    notify_lang \
+      "⚠️ 여러 번 되살려 봤는데도 계속 멈춰 있어요.
+${RECOVERY_STEPS_KO}" \
+      "⚠️ I keep stalling even after several restarts.
+${RECOVERY_STEPS_EN}"
   fi
   exit 0
 fi
@@ -369,9 +413,12 @@ if [ "$RECOVER" = "1" ]; then
     log "recovery: bootstrap succeeded for $LABEL"
     record_attempt
     rm -f "$STRIKE" "$RATELIMIT_MARKER" "$RECOVER_FAILS" "$RECOVERFAIL_MARKER"
+    # DRAFT owner-facing copy -- WORDING PENDING OWNER CONFIRMATION (UX gate).
+    # Do not treat this wording as final. The component name and the
+    # registration mechanism are gone from both legs; the outcome stays.
     notify_lang \
-      "⚙️ 브릿지 자동복구: 서비스 등록이 사라져 있었는데 다시 등록하고 재시작했습니다." \
-      "bridge watchdog: service registration had vanished; auto re-registered and restarted."
+      "잠깐 내려가 있었는데 자동으로 되살렸어요. 지금은 정상이에요." \
+      "I had gone down; I brought myself back automatically. Back up now."
     exit 0
   fi
   # Bootstrap failed: teardown after a bootout is async, so a transient EIO
@@ -386,10 +433,15 @@ if [ "$RECOVER" = "1" ]; then
   log "recovery: bootstrap failed for $LABEL (consecutive failure $fails), leaving for next cycle"
   if [ "$fails" -ge "$RECOVER_FAIL_NOTIFY_N" ] && [ ! -f "$RECOVERFAIL_MARKER" ]; then
     touch "$RECOVERFAIL_MARKER"
+    # DRAFT owner-facing copy -- WORDING PENDING OWNER CONFIRMATION (UX gate).
+    # Do not treat this wording as final. The recovery SHELL COMMAND is gone
+    # from the owner text (it is on the log line below, for the maintainer);
+    # the attempt count is a plain quantity, not an identifier, so it stays.
     recover_cmd="launchctl bootstrap gui/$(id -u) \"$RECOVER_PLIST\""
+    log "decision: manual recovery command for this incident: $recover_cmd"
     notify_lang \
-      "$(printf '⚙️ 브릿지 경고: 서비스 등록이 사라졌고 자동 재등록이 계속 실패합니다(%s회). 수동 복구가 필요합니다.\n복구: %s' "$fails" "$recover_cmd")" \
-      "$(printf 'bridge watchdog: auto re-registration keeps failing (%s attempts). Manual recovery needed.\nRecover: %s' "$fails" "$recover_cmd")"
+      "$(printf '⚠️ 자동 복구를 %s번 시도했는데 계속 실패하고 있어요.\n%s' "$fails" "$RECOVERY_STEPS_KO")" \
+      "$(printf '⚠️ Automatic recovery has failed %s times in a row.\n%s' "$fails" "$RECOVERY_STEPS_EN")"
   fi
   record_attempt
   exit 0
@@ -419,5 +471,10 @@ fi
 record_attempt
 rm -f "$STRIKE" "$RATELIMIT_MARKER"
 
-notify "bridge watchdog: polling heartbeat stalled; service restarted."
+# DRAFT owner-facing copy -- WORDING PENDING OWNER CONFIRMATION (UX gate).
+# Do not treat this wording as final. Was English-only through notify() and
+# named the component and its heartbeat mechanism.
+notify_lang \
+  "잠깐 멈춰 있었는데 자동으로 되살렸어요. 지금은 정상이에요." \
+  "I had stalled for a moment and restarted myself automatically. Back up now."
 exit 0

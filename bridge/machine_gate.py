@@ -318,6 +318,99 @@ def apply_machine_line_gate(text: str, rail: str = RAIL_UNKNOWN) -> str:
 
 
 # --------------------------------------------------------------------------
+# execution-identifier detector (BLOCKING -- the one detector here that may
+# refuse a send, unlike _MACHINE_SHAPE_RE above which only ever alerts)
+#
+# THE DEFECT. A detached routine pushed this to the owner's phone verbatim:
+#     dispatch completed: <job-label> (runid dsp-20260911-110101-1006)
+# Three controls existed and all three missed it. _MACHINE_SHAPE_RE only
+# matches a line STARTING with an ALL-CAPS token, and that line starts
+# lowercase (the cron failure alert starts with "["); the JARGON detector
+# in the host's output gate is commented out (disabled after measured
+# false positives on bilingual prose) and was detect-only even when live;
+# the output gate runs as a Stop-hook on the last assistant message, and a
+# detached shell script pushing text produces no assistant message at all.
+#
+# WHY THIS ONE MAY BLOCK. It makes no judgment about register or tone. It
+# matches IDENTIFIER SHAPES that carry no meaning for a human reader -- a
+# run id, a commit hash, an absolute filesystem path, an exit code / pid.
+# There is no owner-facing sentence in which one of those is the useful
+# part, so a hit is a defect in the CALLER's copy, not an opinion about it.
+#
+# PRECISION RULES (false-positive zero first -- the JARGON detector was
+# disabled for exactly this, and a heuristic that fires on bilingual prose
+# gets disabled again):
+#   * URLs are removed before matching: a console deep link is legitimate
+#     owner-facing text and carries `//host/path` (same exclusion as
+#     sdk_bridge._locale_register_prose).
+#   * a path needs TWO OR MORE segments, so the owner-facing slash commands
+#     ("/health", "/usageretry <label>") never match.
+#   * a hex token needs BOTH a hex letter AND a digit, so a plain decimal
+#     count ("1234567") and an all-hex-letter English word ("effaced") are
+#     not read as commit hashes. Cost: a short hash that happens to be all
+#     digits or all letters is missed (~4% of 7-char hashes). Recall is
+#     bought by fixing the caller's string; this rail is the backstop.
+#   * exit / rc / pid need the ENGLISH machine token next to the number:
+#     approved Korean copy (the host's health report) prints the exit code
+#     under a Korean label inside a collapsed technical fold and must keep
+#     passing -- a bare-number rule would have blocked approved copy.
+# Code fences are NOT an exemption: a path inside a fence is still on the
+# owner's screen. Kinds below are stable strings -- the refusal message at
+# the choke point prints them.
+
+IDENT_RUN_ID = "run-id"
+IDENT_COMMIT_HASH = "commit-hash"
+IDENT_ABS_PATH = "absolute-path"
+IDENT_PROCESS = "process-detail"
+
+_IDENT_URL_RE = re.compile(r"https?://\S+")
+# `dsp-20260911-110101-1006`: lowercase prefix + a 6+ digit group + optional
+# further digit groups. A ticket id (DGN-1209, uppercase + 4 digits) and a
+# date (2026-09-11, no prefix) do not match.
+_IDENT_RUN_ID_RE = re.compile(r"\b[a-z]{2,8}-\d{6,}(?:-\d{2,})*\b")
+_IDENT_HEX_RE = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{7,40}(?![0-9A-Za-z])")
+_IDENT_HEX_LETTER_RE = re.compile(r"[a-f]")
+_IDENT_HEX_DIGIT_RE = re.compile(r"[0-9]")
+_IDENT_ABS_PATH_RE = re.compile(
+    r"(?<![\w~])(?:~(?:/[A-Za-z0-9._-]+)+|(?:/[A-Za-z0-9._-]+){2,})/?"
+)
+_IDENT_PROCESS_RE = re.compile(
+    r"\b(?:exit[ _-]?code|exit|rc|pid|ppid|pgid)[ \t]*[=:][ \t]*-?\d+"
+    r"|\b(?:exit|pid|ppid|pgid)[ \t]+-?\d+\b",
+    re.IGNORECASE,
+)
+
+
+def find_execution_identifiers(text: str) -> Tuple[Tuple[str, str], ...]:
+    """Pure detector: ((kind, matched sample), ...) in first-appearance order.
+
+    Empty tuple = clean. No I/O, no logging, never raises on any str input --
+    the caller decides what refusal means (routines/push.sh refuses the send).
+    """
+    if not text:
+        return ()
+    scored = _IDENT_URL_RE.sub(" ", text)
+    hits: List[Tuple[str, str]] = []
+
+    def _add(kind: str, sample: str) -> None:
+        pair = (kind, sample)
+        if pair not in hits:
+            hits.append(pair)
+
+    for m in _IDENT_RUN_ID_RE.finditer(scored):
+        _add(IDENT_RUN_ID, m.group(0))
+    for m in _IDENT_HEX_RE.finditer(scored):
+        token = m.group(0)
+        if _IDENT_HEX_LETTER_RE.search(token) and _IDENT_HEX_DIGIT_RE.search(token):
+            _add(IDENT_COMMIT_HASH, token)
+    for m in _IDENT_ABS_PATH_RE.finditer(scored):
+        _add(IDENT_ABS_PATH, m.group(0))
+    for m in _IDENT_PROCESS_RE.finditer(scored):
+        _add(IDENT_PROCESS, m.group(0))
+    return tuple(hits)
+
+
+# --------------------------------------------------------------------------
 # dedup ledger: durable (rail, token, day) markers
 # --------------------------------------------------------------------------
 

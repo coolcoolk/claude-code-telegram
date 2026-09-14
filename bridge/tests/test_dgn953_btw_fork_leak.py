@@ -6,11 +6,16 @@ client, and bot.py's run_fork_task swallowed the error -- the forked CLI
 subprocess (claude --fork-session) stayed alive as a permanent orphan
 (measured: 2 zombies ~640MB RAM), one new zombie per retry.
 
-Phase-1b: on the timeout (and general exception) paths of
-_run_first_turn / _run_continuation_turn, the fork client is quietly
-disconnected and the fork is deregistered from BtwForkManager BEFORE the
-original failure re-raises. Happy-path lifecycle (client reuse across
-continuation turns) is unchanged.
+Phase-1b: a failing turn quietly disconnects the fork client and deregisters
+the fork from BtwForkManager BEFORE the original failure re-raises.
+Happy-path lifecycle (client reuse across continuation turns) is unchanged.
+
+DGN-1343 moved the reap OUT of the individual failure branches inside
+_run_first_turn / _run_continuation_turn and into the single gate every turn
+passes through, run_fork_turn. These cases therefore drive run_fork_turn (the
+entry point bot.py actually calls) instead of the private turn bodies -- same
+scenarios, same assertions, exercised on the shipped path. Orphan-absence
+against a REAL child process lives in test_dgn1343_btw_orphan_reap.
 
 Covers:
   (a) timeout -> fork client disconnect is called;
@@ -144,7 +149,7 @@ class TestFirstTurnLeakReap(unittest.IsolatedAsyncioTestCase):
         with patch.object(BtwForkManager, "_make_fork_client", return_value=client), \
              _FAST_TIMEOUT:
             with self.assertRaises(asyncio.TimeoutError):
-                await mgr._run_first_turn(1, fork, "q")
+                await mgr.run_fork_turn(1, fork, "q")
         self.assertEqual(client.disconnect_calls, 1)
         self.assertIsNone(fork.client)
         self.assertIsNone(mgr.lookup_fork(1, fork.anchor_message_id))
@@ -158,7 +163,7 @@ class TestFirstTurnLeakReap(unittest.IsolatedAsyncioTestCase):
         with patch.object(BtwForkManager, "_make_fork_client", return_value=client), \
              _FAST_TIMEOUT:
             with self.assertRaises(asyncio.TimeoutError):
-                await mgr._run_first_turn(1, fork, "q")
+                await mgr.run_fork_turn(1, fork, "q")
         self.assertEqual(client.disconnect_calls, 1)
         self.assertIsNone(mgr.lookup_fork(1, fork.anchor_message_id))
 
@@ -169,7 +174,7 @@ class TestFirstTurnLeakReap(unittest.IsolatedAsyncioTestCase):
         client = _QueryFailClient([])
         with patch.object(BtwForkManager, "_make_fork_client", return_value=client):
             with self.assertRaises(RuntimeError):
-                await mgr._run_first_turn(1, fork, "q")
+                await mgr.run_fork_turn(1, fork, "q")
         self.assertEqual(client.disconnect_calls, 1)
         self.assertIsNone(fork.client)
         self.assertIsNone(mgr.lookup_fork(1, fork.anchor_message_id))
@@ -182,7 +187,7 @@ class TestFirstTurnLeakReap(unittest.IsolatedAsyncioTestCase):
         client = _ConnectFailClient([])
         with patch.object(BtwForkManager, "_make_fork_client", return_value=client):
             with self.assertRaises(RuntimeError):
-                await mgr._run_first_turn(1, fork, "q")
+                await mgr.run_fork_turn(1, fork, "q")
         self.assertEqual(client.disconnect_calls, 1)
         self.assertIsNone(mgr.lookup_fork(1, fork.anchor_message_id))
 
@@ -200,7 +205,7 @@ class TestContinuationTurnLeakReap(unittest.IsolatedAsyncioTestCase):
         fork.client = client
         with _FAST_TIMEOUT:
             with self.assertRaises(asyncio.TimeoutError):
-                await mgr._run_continuation_turn(1, fork, "follow-up")
+                await mgr.run_fork_turn(1, fork, "follow-up")
         self.assertEqual(client.disconnect_calls, 1)
         self.assertIsNone(fork.client)
         self.assertIsNone(mgr.lookup_fork(1, fork.anchor_message_id))
@@ -211,7 +216,7 @@ class TestContinuationTurnLeakReap(unittest.IsolatedAsyncioTestCase):
         fork = _registered(mgr, initialized=True, fork_session_id="fsid")
         fork.client = client
         with self.assertRaises(RuntimeError):
-            await mgr._run_continuation_turn(1, fork, "follow-up")
+            await mgr.run_fork_turn(1, fork, "follow-up")
         self.assertEqual(client.disconnect_calls, 1)
         self.assertIsNone(mgr.lookup_fork(1, fork.anchor_message_id))
 
@@ -221,7 +226,7 @@ class TestContinuationTurnLeakReap(unittest.IsolatedAsyncioTestCase):
         fork = _registered(mgr, initialized=True, fork_session_id="fsid")
         self.assertIsNone(fork.client)
         with self.assertRaises(RuntimeError):
-            await mgr._run_continuation_turn(1, fork, "follow-up")
+            await mgr.run_fork_turn(1, fork, "follow-up")
         self.assertIsNone(mgr.lookup_fork(1, fork.anchor_message_id))
 
 
@@ -274,7 +279,7 @@ class TestHappyPathUnchanged(unittest.IsolatedAsyncioTestCase):
             _mk_result("fork-sid"),
         ])
         with patch.object(BtwForkManager, "_make_fork_client", return_value=client):
-            result = await mgr._run_first_turn(1, fork, "q")
+            result = await mgr.run_fork_turn(1, fork, "q")
         self.assertEqual(result, "hello world")
         self.assertIs(fork.client, client)
         self.assertEqual(client.disconnect_calls, 0)
@@ -304,20 +309,32 @@ class TestHappyPathUnchanged(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.disconnect_calls, 0)
         self.assertIs(mgr.lookup_fork(1, fork.anchor_message_id), fork)
 
-    async def test_empty_but_successful_turn_not_reaped(self):
-        """An EMPTY (but non-raising) turn is a UX issue, not a failure path:
-        the fork must stay registered with its client (bot.py falls back to
-        BTW_FORK_FAILED text; the session remains continuable)."""
+
+# ---------------------------------------------------------------------------
+# Empty turn: DGN-1343 moved this out of the happy path
+# ---------------------------------------------------------------------------
+
+class TestEmptyTurnReap(unittest.IsolatedAsyncioTestCase):
+
+    async def test_empty_turn_is_reaped(self):
+        """DGN-1343 REVERSES this case. It used to assert the opposite -- that
+        an empty (non-raising) turn is "a UX issue, not a failure path" and so
+        keeps its client and registration. Live evidence falsified that reading:
+        the bridge sends BTW_FORK_FAILED and stops reading the fork, but the
+        fork's CLI child does NOT stop -- it kept working on its own for
+        minutes afterwards with full write access and wrote to a real ledger,
+        entirely invisible to the user, who only saw "failed". An empty turn is
+        a failure path; the turn's diagnostic WARNING is still emitted."""
         mgr = BtwForkManager()
         fork = _registered(mgr)
         client = _FakeClient([_mk_result("fork-sid")])
         with patch.object(BtwForkManager, "_make_fork_client", return_value=client), \
              self.assertLogs("bridge.btw", level="WARNING"):
-            result = await mgr._run_first_turn(1, fork, "q")
+            result = await mgr.run_fork_turn(1, fork, "q")
         self.assertEqual(result, "")
-        self.assertIs(fork.client, client)
-        self.assertEqual(client.disconnect_calls, 0)
-        self.assertIs(mgr.lookup_fork(1, fork.anchor_message_id), fork)
+        self.assertIsNone(fork.client)
+        self.assertEqual(client.disconnect_calls, 1)
+        self.assertIsNone(mgr.lookup_fork(1, fork.anchor_message_id))
 
 
 if __name__ == "__main__":

@@ -13,6 +13,15 @@ STRINGS = {
         "Please contact the admin for access."
     ),
     "no_permission_callback": "No permission to use this feature",
+    # Expired-button tap toast (makes the STALE gate visible).
+    # Confirmed -- owner approval 2026-09-10 07:42.
+    # The contract narrowed to (1) alone: that an old button stops working and
+    # the request has to be typed is an affordance a reader learns after a
+    # couple of encounters, and re-explaining it on every tap costs more than
+    # it saves. Both keys carry the same value, so the label branch no longer
+    # changes the wording (call sites unchanged).
+    "stale_callback_expired": "Button expired",
+    "stale_callback_expired_nolabel": "Button expired",
     # --- Born-locked ownership / claim flow ---
     "claim_success": "You are now the owner of this bot.",
     "claim_code_log": (
