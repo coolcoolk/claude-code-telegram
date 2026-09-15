@@ -710,6 +710,18 @@ def contains_telegram_html(text: str) -> bool:
 
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _MD_LINK_RE = re.compile(r"\[([^\[\]\n]+)\]\(((?:https?|tg)://[^\s()]+)\)")
+# DGN-1486: Telegram's automatic @mention entity parser absorbs a non-ASCII
+# alphanumeric (Hangul, CJK, ...) glued directly onto the username as part of
+# the username itself, so "@BotFather<hangul>" is read as one invalid
+# (non-ASCII) username and NO mention entity is produced -- the tap is dead.
+# A space, comma, period or hyphen after the name is untouched: the automatic
+# parser already handles that shape correctly. Only the glued shape is
+# promoted to an explicit anchor. Username grammar is Telegram's own
+# (5-32 chars, [A-Za-z][A-Za-z0-9_]{4,31}). Left boundary rejects a preceding
+# username/URL-path/email character so `a@b.co` and `t.me/@x` are left alone.
+_MENTION_GLUED_RE = re.compile(
+    r"(?<![A-Za-z0-9_@./-])@([A-Za-z][A-Za-z0-9_]{4,31})(?=[^\W\x00-\x7F])"
+)
 _MD_BOLD_STAR_RE = re.compile(
     r"(?<![A-Za-z0-9*])\*\*(?![\s*])([^\n]+?)(?<![\s*])\*\*(?![A-Za-z0-9*])"
 )
@@ -1261,6 +1273,15 @@ def markdown_to_telegram_html(text: str) -> str:
         lambda m: _stash(
             '<a href="{}">{}</a>'.format(m.group(2).replace('"', "&quot;"), m.group(1))
         ),
+        text,
+    )
+    # DGN-1486: promote a bare @mention to an explicit anchor ONLY when glued
+    #    to a following non-ASCII alnum (see _MENTION_GLUED_RE above) -- the
+    #    one shape where the automatic Telegram entity parser fails. Stashed
+    #    whole, same as the markdown links above, so the emphasis passes below
+    #    never see the "@"/href characters.
+    text = _MENTION_GLUED_RE.sub(
+        lambda m: _stash('<a href="https://t.me/{0}">@{0}</a>'.format(m.group(1))),
         text,
     )
     # DGN-1252: dash egress normalization (em dash / ` -- ` -> `:`). Runs after
