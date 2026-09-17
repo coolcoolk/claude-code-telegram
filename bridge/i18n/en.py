@@ -241,9 +241,9 @@ STRINGS = {
         "if you need it."
     ),
     # --- Timeout / resume ---
-    "timeout_paused": (
-        "Paused after {timeout} seconds. Tap the button below to continue."
-    ),
+    # DGN-1523: "timeout_paused" removed -- messages.TIMEOUT_PAUSED now
+    # reuses "still_working" (see bridge/messages.py) so the timeout content
+    # never claims a button that only _send_resume_notice can actually build.
     "timeout_no_resume": (
         "Work stopped on timeout, but no session was found to resume. "
         "Please send your request again."

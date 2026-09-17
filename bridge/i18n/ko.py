@@ -234,10 +234,9 @@ STRINGS = {
         "발송 경로라서 보내지 않았습니다. 필요하시면 채팅으로 다시 요청해주세요."
     ),
     # --- Timeout / resume ---
-    "timeout_paused": (
-        "{timeout}초가 지나 한 번 끊었습니다. 이어서 진행하려면 아래 버튼을 "
-        "누르세요."
-    ),
+    # DGN-1523: "timeout_paused" removed -- messages.TIMEOUT_PAUSED now
+    # reuses "still_working" (see bridge/messages.py) so the timeout content
+    # never claims a button that only _send_resume_notice can actually build.
     "timeout_no_resume": (
         "타임아웃으로 작업이 멈췄는데, 이어갈 세션을 찾지 못했습니다. 요청을 다시 "
         "보내주세요."

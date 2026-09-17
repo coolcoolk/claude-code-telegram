@@ -170,7 +170,13 @@ EXTERNAL_FILE_CONFIRMED = t("external_file_confirmed")
 EXTERNAL_FILE_OMITTED_NONINTERACTIVE = t("external_file_omitted_noninteractive")
 
 # --- Timeout / resume (A4) ---
-TIMEOUT_PAUSED = t("timeout_paused")
+# DGN-1523: the content a timed-out ChatResponse carries cannot itself know
+# whether a resume button will follow -- only bot.py._send_resume_notice
+# knows that, and it builds TIMEOUT_TAP_NOTICE fresh alongside the actual
+# button. So this reuses the still_working catalog entry (one source) rather
+# than its own template: a second, independently-worded string here could
+# describe a button that _send_resume_notice never ends up sending.
+TIMEOUT_PAUSED = t("still_working")
 TIMEOUT_NO_RESUME = t("timeout_no_resume")
 TAP_TO_CONTINUE = t("tap_to_continue")
 TIMEOUT_TAP_NOTICE = t("timeout_tap_notice")

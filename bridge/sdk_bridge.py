@@ -2820,7 +2820,7 @@ class SdkBridge:
             logger.warning("Query timed out for user %s after %ss", user_id, PROCESS_TIMEOUT)
             resume_sid, partial = await self.handle_timeout_preserve(user_id)
             return ChatResponse(
-                content=messages.TIMEOUT_PAUSED.format(timeout=PROCESS_TIMEOUT),
+                content=messages.TIMEOUT_PAUSED,
                 success=False,
                 error="timeout",
                 session_id=resume_sid,
