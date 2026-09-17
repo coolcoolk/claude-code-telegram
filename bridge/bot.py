@@ -3139,7 +3139,14 @@ class TelegramBot:
                     bot=app.bot,
                     proactive_push=self._proactive_push,
                 )
-                await self._save_session_id(user_id, response)
+                resume_caller = self._make_resume_caller(
+                    user_id=user_id, chat_id=chat.id, app=app
+                )
+                response = await self._finish_turn(
+                    user_id=user_id, chat_id=chat.id, response=response, resume_caller=resume_caller
+                )
+                if response is None:
+                    return
                 await self._reply_smart(
                     message,
                     response.content,
@@ -3795,27 +3802,12 @@ class TelegramBot:
                 proactive_push=self._proactive_push,
             )
 
-            async def resume_caller(cont: str) -> ChatResponse:
-                sess = await session_manager.get_session(user_id)
-                return await sdk_bridge.process_message(
-                    user_message=cont,
-                    user_id=user_id,
-                    chat_id=chat.id,
-                    session_id=self._effective_session_id(user_id, sess),
-                    model=sess.get("model"),
-                    permission_callback=self._permission_callback,
-                    typing_callback=lambda: message.chat.send_action(action="typing"),
-                    bot=app.bot,
-                    proactive_push=self._proactive_push,
-                )
-
-            response = await self._auto_resume_loop(
+            resume_caller = self._make_resume_caller(user_id=user_id, chat_id=chat.id, app=app)
+            response = await self._finish_turn(
                 user_id=user_id, chat_id=chat.id, response=response, resume_caller=resume_caller
             )
-            if getattr(response, "timed_out", False):
-                await self._send_resume_notice(chat_id=chat.id, user_id=user_id, response=response)
+            if response is None:
                 return
-            await self._save_session_id(user_id, response)
             # DGN-686 MAJOR-1: a transient is_error result auto-retries ONCE
             # here in the caller context (never inside the reader loop). Only
             # if the single retry also fails do we surface the notice + button.
@@ -3942,6 +3934,57 @@ class TelegramBot:
             [[InlineKeyboardButton(messages.TAP_TO_CONTINUE, callback_data=f"resume:{token}")]]
         )
         await self._send_guaranteed(chat_id, messages.TIMEOUT_TAP_NOTICE, reply_markup=kb)
+
+    def _make_resume_caller(
+        self, *, user_id: int, chat_id: int, app
+    ) -> Callable[[str], Awaitable[ChatResponse]]:
+        """Build the continuation closure _auto_resume_loop drives.
+
+        Shared by every SDK-turn call site so a resume attempt always looks
+        the same regardless of which turn kind timed out.
+        """
+
+        async def resume_caller(cont: str) -> ChatResponse:
+            sess = await session_manager.get_session(user_id)
+            return await sdk_bridge.process_message(
+                user_message=cont,
+                user_id=user_id,
+                chat_id=chat_id,
+                session_id=self._effective_session_id(user_id, sess),
+                model=sess.get("model"),
+                permission_callback=self._permission_callback,
+                typing_callback=lambda: app.bot.send_chat_action(chat_id, action="typing"),
+                bot=app.bot,
+                proactive_push=self._proactive_push,
+            )
+
+        return resume_caller
+
+    async def _finish_turn(
+        self,
+        *,
+        user_id: int,
+        chat_id: int,
+        response: ChatResponse,
+        resume_caller: Callable[[str], Awaitable[ChatResponse]],
+    ) -> Optional[ChatResponse]:
+        """DGN-1554: the ONE seam every SDK-turn call site routes its response
+        through. Runs auto-resume while the turn is timed out; if it comes
+        back still timed out (AUTO_RESUME off, or resumes exhausted), sends
+        the tap-to-continue notice and returns None -- the caller must stop.
+        Otherwise persists the session id and hands back the live response.
+
+        A sixth call site that calls this instead of hand-checking
+        `timed_out` cannot forget the timeout branch, because it never sees it.
+        """
+        response = await self._auto_resume_loop(
+            user_id=user_id, chat_id=chat_id, response=response, resume_caller=resume_caller
+        )
+        if getattr(response, "timed_out", False):
+            await self._send_resume_notice(chat_id=chat_id, user_id=user_id, response=response)
+            return None
+        await self._save_session_id(user_id, response)
+        return response
 
     async def _send_retry_notice(
         self, *, chat_id: int, user_id: int, notice: str, user_message: str
@@ -4801,7 +4844,14 @@ class TelegramBot:
                         bot=app.bot,
                         proactive_push=self._proactive_push,
                     )
-                    await self._save_session_id(user_id, response)
+                    resume_caller = self._make_resume_caller(
+                        user_id=user_id, chat_id=chat_id, app=app
+                    )
+                    response = await self._finish_turn(
+                        user_id=user_id, chat_id=chat_id, response=response, resume_caller=resume_caller
+                    )
+                    if response is None:
+                        return
                     await self._send_smart(
                         chat_id,
                         response.content,
@@ -4925,27 +4975,12 @@ class TelegramBot:
                     proactive_push=self._proactive_push,
                 )
 
-                async def resume_caller(cont: str) -> ChatResponse:
-                    s = await session_manager.get_session(user_id)
-                    return await sdk_bridge.process_message(
-                        user_message=cont,
-                        user_id=user_id,
-                        chat_id=chat_id,
-                        session_id=self._effective_session_id(user_id, s),
-                        model=s.get("model"),
-                        permission_callback=self._permission_callback,
-                        typing_callback=lambda: app.bot.send_chat_action(chat_id, action="typing"),
-                        bot=app.bot,
-                        proactive_push=self._proactive_push,
-                    )
-
-                response = await self._auto_resume_loop(
+                resume_caller = self._make_resume_caller(user_id=user_id, chat_id=chat_id, app=app)
+                response = await self._finish_turn(
                     user_id=user_id, chat_id=chat_id, response=response, resume_caller=resume_caller
                 )
-                if getattr(response, "timed_out", False):
-                    await self._send_resume_notice(chat_id=chat_id, user_id=user_id, response=response)
+                if response is None:
                     return
-                await self._save_session_id(user_id, response)
                 await self._send_smart(
                     chat_id,
                     response.content,
@@ -5009,7 +5044,14 @@ class TelegramBot:
                     bot=app.bot,
                     proactive_push=self._proactive_push,
                 )
-                await self._save_session_id(user_id, response)
+                resume_caller = self._make_resume_caller(
+                    user_id=user_id, chat_id=chat_id, app=app
+                )
+                response = await self._finish_turn(
+                    user_id=user_id, chat_id=chat_id, response=response, resume_caller=resume_caller
+                )
+                if response is None:
+                    return
                 if getattr(response, "retry_offer", False):
                     await self._send_retry_notice(
                         chat_id=chat_id, user_id=user_id,
