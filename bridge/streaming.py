@@ -10,7 +10,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 from telegram import Bot, LinkPreviewOptions
 from telegram.error import BadRequest, RetryAfter, TelegramError
@@ -264,6 +264,16 @@ class StreamingMessageHandler:
         # "drafts[-1] is the active editable bubble" invariant honest so nothing
         # is silently dropped when an overflow lands exactly on the limit. (#1)
         self._need_new_draft = False
+        # DGN-1651: where the assistant message currently being streamed starts
+        # inside accumulated_text, and the (start, end) span of the last
+        # TERMINAL message's text on the live surface. Maintained by
+        # begin_message() / _track_segment(); both go None the moment an
+        # overflow re-bases accumulated_text, because the offsets then no
+        # longer describe what is on screen (retraction is skipped and the
+        # pre-DGN-1651 behaviour stands).
+        self._segment_start: Optional[int] = 0
+        self._segment_terminal = False
+        self._terminal_span: Optional[Tuple[int, int]] = None
 
     async def _retry_with_backoff(self, operation, max_retries: int = 3):
         for attempt in range(max_retries):
@@ -321,6 +331,10 @@ class StreamingMessageHandler:
         # draft that keeps streaming.
         chunks = split_text(strip_display_markers(text)) if text else [""]
         if len(chunks) > 1:
+            # DGN-1651: the leading chunks leave as standing bubbles this
+            # handler never edits again -- the live offsets stop describing
+            # the screen.
+            self._invalidate_segment()
             await self._send_extra_chunks(chunks[:-1])
         content = chunks[-1] or "..."
         # DGN-969: DISPLAY-only de-mark -- draft.text below still stores the
@@ -405,6 +419,9 @@ class StreamingMessageHandler:
         # (the SDK delivers a long reply as ONE block) is fully drained here
         # instead of dropping everything past the first split. (RELIABILITY #1)
         while len(self.accumulated_text) >= _OVERFLOW_LIMIT:
+            # DGN-1651: every iteration seals a bubble and re-bases the
+            # accumulator -- the live offsets no longer describe the screen.
+            self._invalidate_segment()
             current = self.drafts[-1]
             split_point = self._find_split_boundary(self.accumulated_text)
             if split_point <= 0:
@@ -430,9 +447,88 @@ class StreamingMessageHandler:
             self.accumulated_text = self.drafts[-1].text
         return True
 
+    def _invalidate_segment(self) -> None:
+        """DGN-1651: forget the live segment offsets.
+
+        Called from every path that RE-BASES accumulated_text (overflow drain,
+        sealed-at-the-limit restart, a create_draft that peeled finalized
+        bubbles off the front). The offsets then describe text that is no
+        longer where they say it is -- and part of it may already sit in a
+        bubble this handler can no longer rewrite -- so retraction is disabled
+        for the rest of the turn and the pre-DGN-1651 behaviour stands. Never
+        loses text: retraction is an optimisation of what the live bubble
+        shows, never the carrier of the final body.
+        """
+        self._segment_start = None
+        self._terminal_span = None
+
+    def _track_segment(self) -> None:
+        """DGN-1651: keep the live TERMINAL segment's span in sync.
+
+        Runs after every accepted chunk. Only a terminal message's text is
+        tracked -- interim narration (inline mode) is a progress record, never
+        superseded by a later answer, and must stay on screen.
+        """
+        if not self._segment_terminal or self._segment_start is None:
+            return
+        if self._segment_start > len(self.accumulated_text):
+            self._invalidate_segment()
+            return
+        self._terminal_span = (self._segment_start, len(self.accumulated_text))
+
+    def begin_message(self, terminal: bool, retract: bool = False) -> bool:
+        """DGN-1651: open an assistant-message boundary on the live surface.
+
+        A Stop-hook block lets the model keep the turn and emit a SECOND
+        terminal message. The first one already streamed into this handler,
+        and the DGN-1253 turn assembly re-delivers it (deduped) as part of the
+        final body -- so the live copy is a SUPERSEDED answer, not narration.
+        Left alone it is either glued to by the regeneration (fold/suppress:
+        the bubble shows the answer twice) or sealed as a standing duplicate
+        bubble (inline, seal_segment below).
+
+        retract=True cuts exactly the recorded span of the previous terminal
+        message back out of accumulated_text, so the regeneration REWRITES the
+        same bubble instead. Nothing is deleted and nothing is re-sent: the
+        bubble's own text is left untouched until the replacement arrives, so
+        a regeneration that produces no text at all still leaves the original
+        answer standing. Text arriving between the two terminal messages
+        (inline narration) sits outside the span and survives.
+
+        Returns True when a span was actually retracted.
+        """
+        retracted = False
+        if terminal and retract and self._terminal_span is not None:
+            start, end = self._terminal_span
+            if 0 <= start <= end <= len(self.accumulated_text):
+                head = self.accumulated_text[:start]
+                tail = self.accumulated_text[end:]
+                # The glue newline of the retracted block sits AT `start`
+                # (it was prepended to the chunk), so it goes with the span.
+                # When the segment started the surface, the survivor's own
+                # glue newline is now leading -- strip it.
+                self.accumulated_text = head + tail if head else tail.lstrip("\n")
+                if self.drafts:
+                    # The bubble still shows the superseded text: let the very
+                    # next chunk re-render it instead of waiting for the
+                    # char/interval threshold (the replacement can be SHORTER
+                    # than what is on screen, which never meets min_chars).
+                    self.drafts[-1].last_update_time = 0.0
+                retracted = True
+            self._terminal_span = None
+        self._segment_start = len(self.accumulated_text)
+        self._segment_terminal = terminal
+        return retracted
+
     async def update_if_needed(self, new_chunk: str) -> bool:
         if self._finalized:
             return False
+        try:
+            return await self._append_chunk(new_chunk)
+        finally:
+            self._track_segment()
+
+    async def _append_chunk(self, new_chunk: str) -> bool:
         # Each call carries one COMPLETE TextBlock (no partial deltas are fed
         # here), so a call boundary is a block boundary. Blocks from separate
         # assistant messages (e.g. either side of a tool call) are distinct
@@ -450,6 +546,9 @@ class StreamingMessageHandler:
             # Previous bubble was sealed at the limit with no leftover; start the
             # tail as a brand-new bubble so this text is never lost.
             self._need_new_draft = False
+            # DGN-1651: the part of this segment already sealed at the limit
+            # is out of reach -- give up the offsets (see _invalidate_segment).
+            self._invalidate_segment()
             self.accumulated_text = new_chunk
             if len(self.accumulated_text) < _OVERFLOW_LIMIT:
                 await self.create_draft(self.accumulated_text)
@@ -540,6 +639,11 @@ class StreamingMessageHandler:
         self.drafts.clear()
         self.accumulated_text = ""
         self._need_new_draft = False
+        # DGN-1651: the sealed bubbles are standing messages now; the live
+        # surface is empty, so the message being opened starts at 0 and no
+        # earlier terminal span is retractable.
+        self._segment_start = 0
+        self._terminal_span = None
 
     async def finalize_all(self) -> bool:
         if self._finalized:

@@ -1561,6 +1561,47 @@ class SdkBridge:
                     is_terminal = stop_reason == "end_turn" and not has_server_tool
                     interim_mode = _effective_interim_mode()
                     live_stream = interim_mode == "inline" or is_terminal
+                    # DGN-1651: a Stop-hook block lets the model keep the turn
+                    # and emit a SECOND terminal message. The first one already
+                    # streamed onto the owner's screen, and the DGN-1253 turn
+                    # assembly re-delivers it -- deduped against this one via
+                    # _subtract_paras -- as part of the final body. The live
+                    # copy is therefore a SUPERSEDED answer, not narration:
+                    # retract it from the live surface so the regeneration
+                    # rewrites the same bubble, instead of gluing onto it
+                    # (fold/suppress: the bubble showed the answer twice) or
+                    # getting sealed beside it as a standing duplicate (inline,
+                    # the seal below). Only fires when this message actually
+                    # carries replacement text -- a text-less continuation
+                    # leaves the original answer on screen untouched. NO new
+                    # dedup is introduced here: the retraction is an exact
+                    # span cut, and _subtract_paras stays the one judgment of
+                    # what the final body says.
+                    superseding = bool(
+                        is_terminal
+                        and req.final_segments
+                        and any(
+                            isinstance(b, TextBlock) and b.text.strip()
+                            for b in msg.content
+                        )
+                    )
+                    retracted = False
+                    if req.streaming_handler is not None:
+                        try:
+                            retracted = req.streaming_handler.begin_message(
+                                is_terminal, retract=superseding
+                            )
+                        except Exception as e:
+                            logger.error("Segment boundary failed: %s", e)
+                    if retracted:
+                        logger.info(
+                            "DGN-1651: retracted the superseded terminal segment "
+                            "for user %s (segment %d, mode=%s) -- the Stop-hook "
+                            "regeneration rewrites the live bubble",
+                            user_id,
+                            len(req.final_segments),
+                            interim_mode,
+                        )
                     # DGN-947: inline glue teardown. In inline mode the interim
                     # narration streamed into req.streaming_handler's drafts;
                     # the terminal answer is about to stream into the SAME
@@ -1569,11 +1610,20 @@ class SdkBridge:
                     # the finalize consumers see "drafts == final-answer only".
                     # Fold mode is untouched (its narration rides fold bubbles,
                     # not drafts). Never raises into the reader loop.
+                    # DGN-1651: skipped when the retraction above emptied the
+                    # live surface -- there is no narration left to seal, only
+                    # the bubble holding the superseded answer, and sealing it
+                    # would make that duplicate permanent. The regeneration
+                    # rewrites it in place instead.
                     if (
                         interim_mode == "inline"
                         and is_terminal
                         and req.streaming_handler is not None
                         and req.streaming_handler.drafts
+                        and not (
+                            retracted
+                            and not req.streaming_handler.accumulated_text.strip()
+                        )
                     ):
                         try:
                             await req.streaming_handler.seal_segment()
