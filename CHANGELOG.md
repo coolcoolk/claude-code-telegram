@@ -4,6 +4,44 @@ All notable changes to this project are documented here.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-10-06
+
+Minor release: everything the bridge gained since 2.0.2, generated from the
+canonical source for the first time (this tree is now produced, not hand-edited).
+
+### Buttons and choices
+- Option buttons sit under the message they belong to; a tap appends the chosen
+  label to that message instead of sending a separate prompt. A single button
+  carries no number.
+- Tapping an expired button explains how long buttons last and asks you to type
+  the request in the chat.
+- Tapping the same option twice is ignored quietly instead of showing a
+  processing error.
+
+### Answers you might have missed
+- An answer written in the middle of a long task is delivered as its own message
+  instead of disappearing into the folded progress log.
+- An answer held back by a blocking stop check is no longer delivered twice.
+- Short working notes in another language than yours are kept off your chat.
+
+### Stopping and timeouts
+- `/stop` answers in one sentence; when work is stopped for you (interrupt or
+  time limit), the stopped background jobs are listed by name.
+- Every path that runs a turn -- messages, commands, button taps, retries --
+  tries to resume after a timeout.
+- A request is never left hanging when a turn closes.
+
+### Models and login
+- `/model` shows the model that is answering, with its real version; a restart
+  notice names the model when it changed.
+- The machine's Claude CLI is used when no explicit path is configured.
+- When the Claude login expires, the bot says how to log in again instead of
+  passing on the raw CLI error.
+
+### Smaller fixes
+- An @mention followed directly by non-ASCII text stays tappable.
+- A first-run install with no allowed users configured no longer crashes at boot.
+
 ## [2.0.2] - 2026-09-14
 
 ### The agent no longer leaks its own next turn into your chat
