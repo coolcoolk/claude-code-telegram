@@ -22,7 +22,8 @@ Sections:
   D  wiring                      -- every rail declares into the gate (R1..R4)
   E  emitter helper              -- sigil wire format == bridge constant
   F  copy / marker registration  -- i18n keys present, sigil is a known marker
-  G  bot-side reader             -- owner notice sent once, marker after success
+  G  bot-side reader             -- query-time ledger regardless of steward;
+                                    no chat delivery or session injection
 
 The COUNTER-EXAMPLE test (set-table:2771 direct print bypass) pins the
 detector as a permanent component: delete the heuristic and it fails.
@@ -33,6 +34,7 @@ Pure-function tests use no fixtures/env beyond conftest's pins (grill F:
 
 import asyncio
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -440,16 +442,23 @@ def _extract_push_hop():
     return m.group(1).replace('\\"', '"').replace("\\\\n", "\\n")
 
 
-def _run_hop(body: str, root: Path, gated_file: Path = None):
+def _run_hop(body: str, root: Path, gated_file: Path = None,
+             alerts_file: Path = None, extra_env: dict = None):
     code = _extract_push_hop()
     argv = [sys.executable, "-c", code, str(TEMPLATE_DIR), str(root)]
     if gated_file is not None:
         argv.append(str(gated_file))
+    if alerts_file is not None:
+        assert gated_file is not None, "alerts spool is argv[4]; gated file is argv[3]"
+        argv.append(str(alerts_file))
+    env = {"PROJECT_ROOT": str(root), "PATH": "/usr/bin:/bin", "TELEGRAM_BOT_TOKEN": "test:token",
+           "BRIDGE_MACHINE_LINE_GATE": "1"}
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         argv,
         input=body.encode("utf-8"), capture_output=True, timeout=30,
-        env={"PROJECT_ROOT": str(root), "PATH": "/usr/bin:/bin", "TELEGRAM_BOT_TOKEN": "test:token",
-             "BRIDGE_MACHINE_LINE_GATE": "1"},
+        env=env,
     )
 
 
@@ -486,20 +495,41 @@ def test_r3_push_hop_machine_only_exits_3_so_raw_fallback_is_skipped(tmp_path):
 
 
 @requires_push
-def test_r3_push_hop_unregistered_shape_appends_notice_once_per_day(tmp_path):
+def test_r3_push_hop_unregistered_shape_spools_alert_once_per_day(tmp_path):
+    """DGN-1589/DGN-1591: the alert is NEVER appended to the recipient's
+    body (that put English internals on end-user screens). Fresh hits go to
+    the argv[4] spool file for the shell-side diagnostic logging; dedup per
+    (rail, token, day) still holds."""
     (tmp_path / ".telegram_bot").mkdir()
     body = "루틴 결과입니다\nBRAND_NEW_SIGNAL k=v\n"
-    p1 = _run_hop(body, tmp_path)
+    gated = tmp_path / "gated.txt"
+    spool1 = tmp_path / "alerts1.txt"
+    p1 = _run_hop(body, tmp_path, gated, spool1)
     assert p1.returncode == 0, p1.stderr.decode()
     out1 = p1.stdout.decode()
     assert "BRAND_NEW_SIGNAL k=v" in out1                    # passed through
-    assert "BRAND_NEW_SIGNAL" in out1.split("\n\n")[-1]     # notice trailer names it
-    assert out1.count("BRAND_NEW_SIGNAL") >= 2
+    assert out1.count("BRAND_NEW_SIGNAL") == 1               # no trailer on the body
+    assert spool1.read_text(encoding="utf-8").strip() == "consumer\tBRAND_NEW_SIGNAL"
     markers = list((tmp_path / ".telegram_bot" / "machine-line-alerts").iterdir())
     assert len(markers) == 1 and markers[0].name.startswith("consumer.BRAND_NEW_SIGNAL.")
-    p2 = _run_hop(body, tmp_path)
+    spool2 = tmp_path / "alerts2.txt"
+    p2 = _run_hop(body, tmp_path, gated, spool2)
     out2 = p2.stdout.decode()
-    assert out2.count("BRAND_NEW_SIGNAL") == 1               # dedup'd: no trailer
+    assert out2.count("BRAND_NEW_SIGNAL") == 1               # still passes
+    assert not spool2.exists()                               # dedup'd: nothing spooled
+
+
+
+
+@requires_push
+def test_push_sh_spooled_alerts_have_no_delivery_route():
+    src = PUSH_SH.read_text(encoding="utf-8")
+    start = src.index('if [[ -s "$_ALERT_HITS_FILE"')
+    end = src.index('rm -f "$_ALERT_HITS_FILE"', start)
+    route = src[start:end]
+    assert "ledger only" in route
+    assert "push.sh" not in route and "STEWARD_ENV_FILE" not in route
+    assert "session-inbox" not in route
 
 
 # --- source-level wiring lint (same predicates as git-hooks/pre-push) ---
@@ -602,7 +632,8 @@ def test_sigil_is_a_recognized_colon_marker():
 
 
 # ===========================================================================
-# G. bot-side reader -- owner notice once, durable marker AFTER send success
+# G. bot-side reader -- DGN-1756: durable query-time diagnostics, with or
+# without a steward. No chat send and no session-inbox injection.
 # ===========================================================================
 
 def _reader_bot(tmp_path):
@@ -615,52 +646,74 @@ def _reader_bot(tmp_path):
     return bot
 
 
-def test_reader_sends_owner_notice_once_and_marks_after_success(tmp_path):
+def _instance(tmp_path, steward_env: str = None):
+    """Sandbox instance root: .telegram_bot data dir (+ optional agent.conf
+    with a resolvable STEWARD_ENV_FILE)."""
+    data_dir = tmp_path / ".telegram_bot"
+    data_dir.mkdir(exist_ok=True)
+    if steward_env is not None:
+        conf_dir = tmp_path / "config"
+        conf_dir.mkdir(exist_ok=True)
+        (conf_dir / "agent.conf").write_text(
+            "STEWARD_ENV_FILE=%s\n" % steward_env, encoding="utf-8"
+        )
+    return data_dir
+
+
+@pytest.mark.parametrize("steward_setting", [None, "", "/nonexistent/steward.env", "configured"])
+def test_reader_zero_owner_chat_and_zero_session_inbox(tmp_path, steward_setting, caplog):
+    """Any steward configuration: durable record, zero delivery or injection."""
     bot = _reader_bot(tmp_path)
+    if steward_setting == "configured":
+        steward = tmp_path / "steward.env"
+        steward.write_text("# Resolvable steward configuration; never read or sent.\n")
+        steward_setting = str(steward)
+    data_dir = _instance(tmp_path, steward_env=steward_setting)
 
     async def scenario():
-        with patch.object(config_mod.config, "allowed_user_ids", [42]):
-            bot._machine_line_alert_sink(RAIL_CONSUMER, ("FOO_BAR",), "FOO_BAR k=v")
-            bot._machine_line_alert_sink(RAIL_CONSUMER, ("FOO_BAR",), "FOO_BAR k=v")  # in-flight dedup
+        with patch.object(config_mod.config, "allowed_user_ids", [42]), \
+             patch.object(config_mod.config, "bot_data_dir", data_dir), \
+             patch.object(mg, "_alert_sink", bot._machine_line_alert_sink), \
+             patch.object(asyncio, "create_subprocess_exec", new_callable=AsyncMock) as spawn:
+            mg.apply_machine_line_gate("FOO_BAR k=v", RAIL_CONSUMER)
+            mg.apply_machine_line_gate("FOO_BAR k=v", RAIL_CONSUMER)  # in-flight dedup
             await asyncio.sleep(0)
             await asyncio.gather(*[t for t in asyncio.all_tasks() if t is not asyncio.current_task()])
-            bot._machine_line_alert_sink(RAIL_CONSUMER, ("FOO_BAR",), "FOO_BAR k=v")  # ledger dedup
+            mg.apply_machine_line_gate("FOO_BAR k=v", RAIL_CONSUMER)  # ledger dedup
             await asyncio.sleep(0)
+            spawn.assert_not_awaited()
     asyncio.run(scenario())
 
-    assert bot.application.bot.send_message.await_count == 1
-    chat_id, text = bot.application.bot.send_message.await_args.args
-    assert chat_id == 42 and "FOO_BAR" in text
-    assert "disable_notification" not in bot.application.bot.send_message.await_args.kwargs  # loud
+    assert bot.application.bot.send_message.await_count == 0   # owner surface: zero
+    assert not (data_dir / "session-inbox").exists()
+    assert "ledger only" in caplog.text
+    markers = list(bot._machine_alert_ledger.directory.iterdir())
+    assert len(markers) == 1
+    assert markers[0].name == "consumer.FOO_BAR." + mg.today_key()
+    assert markers[0].read_text() == mg.today_key() + "\n"
+    # A fresh reader/process sees the durable record too.
+    assert mg.MachineLineAlertLedger(bot._machine_alert_ledger.directory).unseen(
+        RAIL_CONSUMER, ["FOO_BAR"]) == []
     assert bot._machine_alert_ledger.unseen(RAIL_CONSUMER, ["FOO_BAR"]) == []
     assert bot._machine_alert_inflight == set()
 
 
-def test_reader_failed_send_leaves_no_marker_so_it_retries(tmp_path):
+def test_reader_route_is_independent_of_owner_chat(tmp_path):
+    """The old sink required an owner chat to reach; the operator route must
+    not -- an instance with no allowed user still records the alert."""
     bot = _reader_bot(tmp_path)
-    bot.application.bot.send_message = AsyncMock(side_effect=RuntimeError("telegram down"))
+    data_dir = _instance(tmp_path)
 
     async def scenario():
-        with patch.object(config_mod.config, "allowed_user_ids", [42]):
-            bot._machine_line_alert_sink(RAIL_UNKNOWN, ("FOO_BAR",), "x")
+        with patch.object(config_mod.config, "allowed_user_ids", []), \
+             patch.object(config_mod.config, "bot_data_dir", data_dir):
+            bot._machine_line_alert_sink(RAIL_CONSUMER, ("FOO_BAR",), "x")
             await asyncio.sleep(0)
             await asyncio.gather(*[t for t in asyncio.all_tasks() if t is not asyncio.current_task()])
     asyncio.run(scenario())
-
-    assert bot._machine_alert_ledger.unseen(RAIL_UNKNOWN, ["FOO_BAR"]) == ["FOO_BAR"]
-    assert bot._machine_alert_inflight == set()
-
-
-def test_reader_without_owner_chat_logs_and_does_not_crash(tmp_path, caplog):
-    bot = _reader_bot(tmp_path)
-
-    async def scenario():
-        with patch.object(config_mod.config, "allowed_user_ids", []):
-            with caplog.at_level("WARNING", logger="bridge.bot"):
-                bot._machine_line_alert_sink(RAIL_CONSUMER, ("FOO_BAR",), "x")
-    asyncio.run(scenario())
     assert bot.application.bot.send_message.await_count == 0
-    assert any("no owner chat" in r.message for r in caplog.records)
+    assert not (data_dir / "session-inbox").exists()
+    assert bot._machine_alert_ledger.unseen(RAIL_CONSUMER, ["FOO_BAR"]) == []
 
 
 def test_reader_is_installed_by_bot_constructor_source():
@@ -668,3 +721,71 @@ def test_reader_is_installed_by_bot_constructor_source():
     src = (BRIDGE_DIR / "bot.py").read_text(encoding="utf-8")
     init = src.split("    def __init__(self) -> None:")[1].split("\n    def ")[0]
     assert "set_machine_line_alert_sink(self._machine_line_alert_sink)" in init
+
+
+@requires_push
+@pytest.mark.parametrize("configured", [False, True])
+def test_push_zero_owner_send_and_zero_session_inbox(tmp_path, configured):
+    """Run only the extracted alert routing block, never push.sh or a live send."""
+    spool = tmp_path / "alerts.txt"
+    result = _run_hop("NEW_EMITTER k=v", tmp_path, tmp_path / "gated", spool)
+    assert result.returncode == 0
+    src = PUSH_SH.read_text()
+    start = src.index('if [[ -s "$_ALERT_HITS_FILE"')
+    end = src.index('rm -f "$_ALERT_HITS_FILE"', start)
+    steward = tmp_path / "steward.env"
+    steward.write_text("# Resolvable steward configuration; never read or sent.\n")
+    _instance(tmp_path, str(steward) if configured else None)
+    script = ('read_kv() { printf "%s" "$STEWARD_ENV_FILE"; }\n'
+              'bash() { echo unexpected-send; return 99; }\n'
+              '_ALERT_HITS_FILE="$1"\nSCRIPT_DIR="$2"\n' + src[start:end])
+    routed = subprocess.run(["bash", "-c", script, "test", str(spool), str(tmp_path)],
+                            capture_output=True, text=True, timeout=30,
+                            env={"PATH": os.environ["PATH"],
+                                 "STEWARD_ENV_FILE": str(steward) if configured else ""})
+    assert routed.returncode == 0, routed.stderr
+    assert routed.stdout == ""
+    assert "ledger only" in routed.stderr
+    assert not (tmp_path / ".telegram_bot" / "session-inbox").exists()
+    ledger = mg.MachineLineAlertLedger(tmp_path / ".telegram_bot" / "machine-line-alerts")
+    assert ledger.unseen(RAIL_CONSUMER, ["NEW_EMITTER"]) == []
+
+
+
+
+@pytest.mark.parametrize("label", [
+    "목표", "이번 주", "오늘", "진행중 티켓", "백그라운드 작업 중",
+    "Résumé", "今週", "이번 주 계획 3개", "오늘 운동",
+])
+@pytest.mark.parametrize("rail", [RAIL_CONSUMER, RAIL_MODEL, RAIL_UNKNOWN])
+def test_natural_language_bracket_headers_are_owner_copy(label, rail):
+    text = f"[{label}]\n할 일을 확인하세요."
+    calls = []
+    mg.set_machine_line_alert_sink(lambda *args: calls.append(args))
+    assert apply_machine_line_gate(text, rail) == text
+    assert gate_machine_lines(text, rail).unregistered == ()
+    assert calls == []
+
+
+@pytest.mark.parametrize("text", [
+    "[pack lag]", "[FOO_BAR]", "[worker_id]", "[123]", "[🔥]",
+    "[목표 FOO_BAR]", "[작업 worker_id]", "[목표 signal::FOO]",
+    "[작업 dsp-20260927-164715-5044]", "[목표 age=123]",
+    "[목표] age=123", "[목표] signal::FOO", "[목표] dsp-20260927-164715-5044",
+])
+def test_bracket_machine_shapes_still_alert(text):
+    result = gate_machine_lines(text, RAIL_CONSUMER)
+    assert result.text == text
+    assert result.unregistered
+
+
+@requires_push
+def test_push_hop_owner_sections_create_no_diagnostic(tmp_path):
+    text = "[목표]\n운동하기\n[이번 주]\n세 번\n[오늘]\n걷기"
+    spool = tmp_path / "alerts"
+    gated = tmp_path / "gated"
+    result = _run_hop(text, tmp_path, gated, spool)
+    assert result.returncode == 0
+    assert gated.read_text() == text
+    assert not spool.exists()
+    assert not (tmp_path / ".telegram_bot" / "machine-line-alerts").exists()

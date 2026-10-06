@@ -18,6 +18,9 @@ Covers:
   is subtracted from the FOLD (_subtract_paras), never from the answer.
 """
 
+import pytest
+
+from bridge import sdk_bridge as _locale_bridge
 import asyncio
 import unittest
 from types import SimpleNamespace
@@ -49,6 +52,16 @@ from bridge.streaming import edit_fold_html
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _en_instance(monkeypatch):
+    # These fixtures narrate in English: pin an en instance so the interim
+    # locale gate (sdk_bridge._interim_off_locale) stays out of the interim
+    # mechanics under test, whatever LOCALE the shell exports. The ko side
+    # is covered by test_interim_locale_gate.py.
+    monkeypatch.setattr(_locale_bridge.config, "locale", "en")
+
 
 
 def _make_assistant_msg(stop_reason: Optional[str], blocks: List[Any]) -> AssistantMessage:
@@ -802,8 +815,12 @@ class TestFoldLifecyclePaths(unittest.TestCase):
             return req, handler
 
         req, handler = asyncio.run(_inner())
-        # Turn dropped silently (future untouched) but fold confirmed.
-        self.assertFalse(req.future.done())
+        # Turn dropped silently (nothing rendered) but fold confirmed.
+        # DGN-1819 A: the future resolves with the no-render shape instead of
+        # being orphaned to the soft timeout.
+        self.assertTrue(req.future.done())
+        res = req.future.result()
+        self.assertEqual((res.content, res.success, res.streamed), ("", True, True))
         self.assertTrue(req.fold_finalized)
         final_html = _edit_texts(handler.bot)[-1]
         self.assertTrue(final_html.startswith("<blockquote expandable>" + FOLD_CAPTION_NORMAL))

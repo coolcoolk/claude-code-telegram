@@ -43,10 +43,68 @@ ghost pin never survives a restart).  Delete failures fail open (state
 kept, retried on a later tick).  Re-appearance goes through the normal
 recreate path (send+pin, both silent, RECREATE_COOLDOWN unchanged and
 separate from the empty debounce).
-An old message_id (e.g. left behind by a bot-token swap) gets a best-effort
-unpin; failures are ignored. "message is not modified" is normal flow
+An old message_id (e.g. left behind by a bot-token swap) is unpinned via the
+stale-pin queue below. "message is not modified" is normal flow
 (streaming._is_not_modified precedent). Terminal chat-level errors ("chat
 not found", Forbidden) clear the state instead of poisoning it.
+
+Daily rotation (DGN-1768): the pinned board drifts back in chat history as
+days pass, so the first REAL content change on a new local calendar day (OS
+TZ, the instance clock) is sent as a NEW message instead of an edit: send +
+pin(disable_notification) through the recreate path, then delete the previous
+board message (< 48h old on a daily cadence).  A refused delete falls back to
+the existing unpin-only convergence (_is_undeletable etc.): the orphan body
+stays, unpinned.  Later changes that day edit the new message.  A day without
+a change sends nothing -- there is no scheduled send.  "Real change" is a
+content digest compare, not mtime: the always-dirty first tick after a
+restart re-edits (usually "not modified") instead of rotating.  The state
+file therefore carries {chat_id, message_id, sent_day, digest}.  A legacy
+state without them loads with sent_day/digest unknown: the first tick edits as
+before (no rotation on the restart alone) and records the digest; the next
+real change then rotates, since the unknown send day never equals today.
+
+Explicit fresh request (DGN-1768 r2): a producer that owns the day start
+(e.g. a morning brief) runs `status-footer.py --pin-set <owner> ... --fresh`,
+which writes its section and then drops ROTATE_REQUEST_FILE next to the state
+file.  The next tick treats the marker as dirty and rotates (send + pin +
+delete old, same path as above) regardless of day or digest, bypassing the
+recreate cooldown (a deliberate one-shot request, not an edit-failure chain),
+then consumes the marker -- only after the send succeeded, so a failed send
+retries on a later tick.  An empty board consumes it too (nothing to rotate;
+the hide path owns it).  `--wait` on the producer blocks until the marker is
+gone so its message order holds.  DASHBOARD_ROTATE selects the day rule:
+auto (default, the first-change-of-day rule above) | explicit (rotate ONLY on
+a fresh request; every other change, a section clear included, edits).  Read
+per dirty tick from env / .telegram_bot/.env, then config/agent.conf.
+
+One board pin (DGN-1777): every board id the bridge pinned and has not yet
+seen unpinned or deleted is persisted in the state file ("stale_pins", with
+its chat and an attempt count).  After a rotation/recreate the old id is
+queued BEFORE any unpin call (a crash in between cannot lose it), then every
+queued id is unpinned; the live board id is never a target, and nothing the
+bridge did not pin itself (owner pins) is ever touched.  An unpin failure is
+logged and the id stays queued: the tick retries it every
+STALE_UNPIN_RETRY_SECS, up to STALE_UNPIN_MAX_ATTEMPTS, across restarts.
+"Not found" and terminal chat errors converge (nothing left to unpin).  The
+empty/hide path queues the id too when its unpin failed and the delete was
+refused (48h age limit), so the orphan body never stays pinned silently.
+
+Owner-unpinned live board (DGN-1782, dec-201): when the owner unpins the LIVE
+board it is re-pinned silently (disable_notification).  Signal: getChat's
+pinned_message is "the most recent pinned message by SENDING date" (Bot API),
+and message ids grow with send time.  So with top = that id:
+  - top == live board id -> the board is pinned, nothing to do;
+  - no pinned message, or top < live board id -> the board is NOT pinned (if
+    it were, it would outrank every older pin) -> re-pin it;
+  - top > live board id -> the owner pinned a newer message; whether the
+    board is still pinned below it is unknowable through the Bot API, and a
+    re-pin could never make the board the top pin anyway -> leave it alone
+    (no churn; the next rotation re-pins a fresh board).
+Only the live board id is ever re-pinned; stale ids (always older) and owner
+pins are never pinned or unpinned by this check.  Cadence (flood-safe): the
+check runs on an idle tick (not dirty, edit guard ready, no owner turn in
+flight, no pending hide) at most once per PIN_CHECK_MIN_SECS after a real
+content edit, and otherwise at most once per PIN_CHECK_IDLE_SECS.
 
 Owner safety: the stored chat_id is revalidated against the CURRENT owner on
 every dirty tick; a mismatch (owner.lock reclaim / allowed_user_ids change)
@@ -54,10 +112,12 @@ discards the state so dashboard content never leaks into an ex-owner chat.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -86,6 +146,12 @@ logger = logging.getLogger(__name__)
 DASHBOARD_FILE: Path = config.bot_data_dir / "dashboard.md"
 # Flat placement beside poll_heartbeat / last_model.json (existing convention).
 STATE_FILE: Path = config.bot_data_dir / "dashboard_state.json"
+# DGN-1768 r2 fresh-rotation request marker, always the state file's sibling
+# (status-footer.py --pin-set --fresh writes it, the tick consumes it).
+ROTATE_REQUEST_NAME = "dashboard_rotate.request"
+AGENT_CONF_FILE: Path = config.bot_data_dir.parent / "config" / "agent.conf"
+ROTATE_AUTO = "auto"
+ROTATE_EXPLICIT = "explicit"
 
 POLL_INTERVAL = 3.0       # seconds between mtime checks (spec: ~3s)
 RECREATE_COOLDOWN = 60.0  # min seconds between send+pin recreations
@@ -98,6 +164,15 @@ EMPTY_DEBOUNCE_SECS = 45.0
 # this bridge-side value only backs a dumb tail-cut safeguard so an oversized
 # file can never break the edit call.
 MAX_UTF16_UNITS = 3900
+# DGN-1777: retry cadence and cap for unpinning past board ids that failed to
+# unpin (persisted queue, see "One board pin" above).
+STALE_UNPIN_RETRY_SECS = 300.0
+STALE_UNPIN_MAX_ATTEMPTS = 12
+# DGN-1782: live-board pin-state check cadence (getChat).  After a real edit
+# the check may run once PIN_CHECK_MIN_SECS elapsed since the previous one;
+# with no edits it still runs every PIN_CHECK_IDLE_SECS.
+PIN_CHECK_MIN_SECS = 60.0
+PIN_CHECK_IDLE_SECS = 300.0
 
 
 def _utf16_len(text: str) -> int:
@@ -123,6 +198,43 @@ def _tail_cut(text: str) -> str:
         if units > MAX_UTF16_UNITS:
             return text[:i]
     return text
+
+
+def _local_day() -> str:
+    """Today's local calendar day (OS TZ, the instance clock), ISO format.
+
+    OS-local on purpose, same convention as the memory engine's clock line:
+    never hard-code a zone.  Module-level so tests can pin the day.
+    """
+    return datetime.now().astimezone().date().isoformat()
+
+
+def _digest(text: str) -> str:
+    """Short content digest: tells a real board change from a re-read."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _conf_value(path: Path, key: str) -> str:
+    """KEY=value from a conf file (conf_reader.py normalization: first match,
+    whitespace + surrounding quotes stripped).  Any read failure -> ""."""
+    try:
+        for raw in Path(path).read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if line.startswith(key + "="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def _rotate_mode() -> str:
+    """DASHBOARD_ROTATE: env / .telegram_bot/.env -> config/agent.conf ->
+    auto.  Anything but "explicit" is auto (r1 behavior is the default)."""
+    value = (
+        getattr(config, "dashboard_rotate", "")
+        or _conf_value(AGENT_CONF_FILE, "DASHBOARD_ROTATE")
+    )
+    return ROTATE_EXPLICIT if value.strip().lower() == ROTATE_EXPLICIT else ROTATE_AUTO
 
 
 def _needs_recreate(error: Exception) -> bool:
@@ -155,6 +267,16 @@ def _is_message_gone(error: Exception) -> bool:
     """
     text = str(error).lower()
     return "message to delete not found" in text or "message not found" in text
+
+
+def _is_unpin_converged(error: Exception) -> bool:
+    """Unpin errors proving there is nothing left for us to unpin (DGN-1777):
+    the message is gone, or the chat itself is unusable (blocked / not found).
+    """
+    if isinstance(error, telegram.error.Forbidden) or _is_chat_gone(error):
+        return True
+    text = str(error).lower()
+    return "message to unpin not found" in text or "message not found" in text
 
 
 def _is_parse_error(error: Exception) -> bool:
@@ -197,8 +319,13 @@ class DashboardSync:
         self._turn_active = turn_active
         self._dashboard_path = Path(dashboard_path)
         self._state_path = Path(state_path)
+        self._rotate_request = self._state_path.with_name(ROTATE_REQUEST_NAME)
         self._chat_id: Optional[int] = None
         self._message_id: Optional[int] = None
+        # DGN-1768: local day the pinned message was SENT, and the digest of
+        # the last content it shows.  None = unknown (legacy state / fresh).
+        self._sent_day: Optional[str] = None
+        self._digest: Optional[str] = None
         self._last_synced_mtime: Optional[float] = None
         self._dirty = False
         # Flood/interval state lives in the shared guard (DGN-594);
@@ -208,6 +335,13 @@ class DashboardSync:
         # First empty read (monotonic) while a message is pinned; None when
         # content is present or no delete is pending (DGN-541 S1 debounce).
         self._empty_since: Optional[float] = None
+        # DGN-1777: past board ids we pinned and have not seen unpinned or
+        # deleted: [{"chat_id", "message_id", "attempts"}], persisted.
+        self._stale_pins: list = []
+        self._next_unpin_sweep = 0.0  # monotonic
+        # DGN-1782: live-board pin-state check (monotonic; None = never ran).
+        self._last_pin_check: Optional[float] = None
+        self._pin_check_due = False  # a real edit happened since the last check
         self._load_state()
 
     # --- shared edit-guard state (single source: EditRateGuard, DGN-594) ---
@@ -230,7 +364,8 @@ class DashboardSync:
     def _flood_until(self, value: float) -> None:
         self._edit_guard.flood_until = value
 
-    # --- state file ({chat_id, message_id}, atomic writes) ---
+    # --- state file ({chat_id, message_id, sent_day, digest, stale_pins},
+    # atomic writes) ---
 
     def _load_state(self) -> None:
         try:
@@ -240,6 +375,8 @@ class DashboardSync:
         except Exception as e:  # noqa: BLE001 - corrupt state -> fresh start
             logger.warning("dashboard_state.json unreadable (%s); ignoring", e)
             return
+        if isinstance(data, dict):
+            self._stale_pins = self._parse_stale_pins(data.get("stale_pins"))
         chat_id = data.get("chat_id") if isinstance(data, dict) else None
         message_id = data.get("message_id") if isinstance(data, dict) else None
         # type() is int, not isinstance: bools ARE ints in Python, and a
@@ -247,14 +384,50 @@ class DashboardSync:
         if type(chat_id) is int and type(message_id) is int:
             self._chat_id = chat_id
             self._message_id = message_id
+            # DGN-1768 fields are optional: a legacy file without them keeps
+            # loading, with the send day and digest unknown.
+            sent_day = data.get("sent_day")
+            digest = data.get("digest")
+            if isinstance(sent_day, str):
+                self._sent_day = sent_day
+            if isinstance(digest, str):
+                self._digest = digest
         # A loaded chat_id is provisional: _tick revalidates it against the
         # current owner before any network call (owner-change safety).
 
+    @staticmethod
+    def _parse_stale_pins(raw: object) -> list:
+        """Validate the persisted stale-pin queue; malformed entries dropped."""
+        out: list = []
+        if not isinstance(raw, list):
+            return out
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            chat_id = item.get("chat_id")
+            message_id = item.get("message_id")
+            attempts = item.get("attempts", 0)
+            if type(chat_id) is int and type(message_id) is int:
+                out.append({
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "attempts": attempts if type(attempts) is int else 0,
+                })
+        return out
+
     def _clear_state(self) -> None:
         """Discard chat/message state (memory + disk) so the next dirty tick
-        re-bootstraps from the current owner via the recreate path."""
+        re-bootstraps from the current owner via the recreate path.
+
+        The stale-pin queue survives (DGN-1777): those ids are still pinned
+        in their chats; the file is kept for them while any remain."""
         self._chat_id = None
         self._message_id = None
+        self._sent_day = None
+        self._digest = None
+        if self._stale_pins:
+            self._save_state()
+            return
         try:
             self._state_path.unlink()
         except FileNotFoundError:
@@ -267,7 +440,13 @@ class DashboardSync:
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             payload = json.dumps(
-                {"chat_id": self._chat_id, "message_id": self._message_id},
+                {
+                    "chat_id": self._chat_id,
+                    "message_id": self._message_id,
+                    "sent_day": self._sent_day,
+                    "digest": self._digest,
+                    "stale_pins": self._stale_pins,
+                },
                 ensure_ascii=True,
             )
             tmp = self._state_path.with_name(self._state_path.name + ".tmp")
@@ -309,13 +488,23 @@ class DashboardSync:
                 logger.warning("Dashboard tick failed: %s", e)
 
     async def _tick(self) -> None:
+        if self._stale_pins:
+            sweep_now = time.monotonic()
+            if (
+                sweep_now >= self._next_unpin_sweep
+                and self._edit_guard.ready(sweep_now)
+            ):
+                await self._unpin_stale(sweep_now)
         try:
             mtime = os.path.getmtime(self._dashboard_path)
         except OSError:
             return  # file absent = feature dormant (keep polling cheaply)
         if self._last_synced_mtime is None or mtime != self._last_synced_mtime:
             self._dirty = True
+        if self._fresh_requested():
+            self._dirty = True  # DGN-1768 r2: rotate even on unchanged content
         if not self._dirty:
+            await self._maybe_check_pin()
             return
 
         now = time.monotonic()
@@ -356,6 +545,7 @@ class DashboardSync:
         if not text.strip():
             # Empty board = generator hide signal: drive the debounced
             # delete state machine instead of leaving a stale pin (DGN-541).
+            self._consume_fresh_request()  # nothing to rotate on a hidden board
             await self._handle_empty(chat_id, mtime)
             return
         self._empty_since = None  # content is back; cancel any pending delete
@@ -385,13 +575,19 @@ class DashboardSync:
             return
         if (now - self._empty_since) < EMPTY_DEBOUNCE_SECS:
             return  # debounce running; stay dirty
-        # Best-effort unpin first; the delete is the authoritative removal.
+        # Unpin first; the delete is the authoritative removal.  A failed
+        # unpin is logged and, if the delete is refused too, queued below.
+        unpin_failed = False
         try:
             await self._bot.unpin_chat_message(
                 chat_id=chat_id, message_id=self._message_id
             )
-        except telegram.error.TelegramError:
-            pass
+        except telegram.error.TelegramError as e:
+            if not _is_unpin_converged(e):
+                unpin_failed = True
+                logger.warning(
+                    "Dashboard unpin of board %s failed: %s", self._message_id, e
+                )
         try:
             await self._bot.delete_message(
                 chat_id=chat_id, message_id=self._message_id
@@ -423,11 +619,162 @@ class DashboardSync:
                 logger.info(
                     "Dashboard message undeletable (age limit); unpinned, converging: %s", e
                 )
+                if unpin_failed:
+                    # DGN-1777: the body stays AND is still pinned -> retry
+                    # the unpin from the persisted queue.
+                    self._queue_unpin(chat_id, self._message_id)
             # Not-found or undeletable: converge as success.
         self._message_id = None
+        self._sent_day = None
+        self._digest = None
         self._save_state()
         self._empty_since = None
         self._mark_synced(mtime, now)
+
+    # --- stale board pins (DGN-1777): exactly one board pin per chat ---
+
+    def _queue_unpin(self, chat_id: int, message_id: int) -> None:
+        """Remember a board id we pinned that must end up unpinned."""
+        for entry in self._stale_pins:
+            if entry["chat_id"] == chat_id and entry["message_id"] == message_id:
+                return
+        self._stale_pins.append(
+            {"chat_id": chat_id, "message_id": message_id, "attempts": 0}
+        )
+        self._save_state()
+
+    def _drop_stale(self, chat_id: int, message_id: int) -> None:
+        before = len(self._stale_pins)
+        self._stale_pins = [
+            e for e in self._stale_pins
+            if not (e["chat_id"] == chat_id and e["message_id"] == message_id)
+        ]
+        if len(self._stale_pins) != before:
+            self._save_state()
+
+    async def _unpin_stale(self, now: float) -> None:
+        """Unpin every queued past board id; never the live board.
+
+        Success or a converged error drops the entry.  RetryAfter stops the
+        sweep (flood guard armed).  Any other failure is LOGGED, counted and
+        kept for the next sweep; at STALE_UNPIN_MAX_ATTEMPTS it is dropped
+        with a warning so a permanent refusal cannot log forever.
+        """
+        self._next_unpin_sweep = now + STALE_UNPIN_RETRY_SECS
+        changed = False
+        for entry in list(self._stale_pins):
+            chat_id = entry["chat_id"]
+            message_id = entry["message_id"]
+            if chat_id == self._chat_id and message_id == self._message_id:
+                self._stale_pins.remove(entry)  # the live board stays pinned
+                changed = True
+                continue
+            try:
+                await self._bot.unpin_chat_message(
+                    chat_id=chat_id, message_id=message_id
+                )
+            except telegram.error.RetryAfter as e:
+                self._edit_guard.note_retry_after(
+                    float(getattr(e, "retry_after", 5.0)), now
+                )
+                break
+            except telegram.error.TelegramError as e:
+                if _is_unpin_converged(e):
+                    logger.info(
+                        "Dashboard old board %s: nothing to unpin (%s)", message_id, e
+                    )
+                else:
+                    entry["attempts"] += 1
+                    changed = True
+                    if entry["attempts"] < STALE_UNPIN_MAX_ATTEMPTS:
+                        logger.warning(
+                            "Dashboard unpin of old board %s failed (attempt %d/%d,"
+                            " retrying): %s",
+                            message_id, entry["attempts"],
+                            STALE_UNPIN_MAX_ATTEMPTS, e,
+                        )
+                        continue
+                    logger.warning(
+                        "Dashboard unpin of old board %s failed %d times; giving"
+                        " up (may stay pinned): %s",
+                        message_id, entry["attempts"], e,
+                    )
+            else:
+                logger.info("Dashboard old board %s unpinned", message_id)
+            self._stale_pins.remove(entry)
+            changed = True
+        if changed:
+            self._save_state()
+
+    # --- live board pin state (DGN-1782): owner unpin -> silent re-pin ---
+
+    async def _maybe_check_pin(self) -> None:
+        """Re-pin the live board if the owner unpinned it (see module doc).
+
+        Runs only on an idle tick and within the bounded cadence; respects
+        the edit guard (flood wait / min interval) and the owner's turn."""
+        if self._message_id is None or self._chat_id is None:
+            return
+        if self._empty_since is not None:
+            return  # hide pending: the empty path owns this board
+        now = time.monotonic()
+        if self._last_pin_check is not None:
+            elapsed = now - self._last_pin_check
+            due = elapsed >= PIN_CHECK_IDLE_SECS or (
+                self._pin_check_due and elapsed >= PIN_CHECK_MIN_SECS
+            )
+            if not due:
+                return
+        if not self._edit_guard.ready(now):
+            return
+        chat_id = self._owner_chat_id()
+        if chat_id is None or chat_id != self._chat_id:
+            return  # owner change is handled by the dirty path
+        if self._turn_active(chat_id):
+            return  # deferred like every other board call
+        self._last_pin_check = now
+        self._pin_check_due = False
+        message_id = self._message_id
+        try:
+            chat = await self._bot.get_chat(chat_id=chat_id)
+        except telegram.error.RetryAfter as e:
+            self._edit_guard.note_retry_after(
+                float(getattr(e, "retry_after", 5.0)), now
+            )
+            return
+        except telegram.error.TelegramError as e:
+            logger.debug("Dashboard pin check failed: %s", e)
+            return
+        top = getattr(chat, "pinned_message", None)
+        top_id = getattr(top, "message_id", None) if top is not None else None
+        if top_id == message_id:
+            return  # pinned and on top
+        if type(top_id) is int and top_id > message_id:
+            # A newer (owner) pin outranks the board; its own pin state is
+            # not observable, and re-pinning could not change the top.
+            logger.debug(
+                "Dashboard pin check: newer pin %s above board %s; leaving it",
+                top_id, message_id,
+            )
+            return
+        logger.info(
+            "Dashboard board %s no longer pinned (top pin: %s); re-pinning",
+            message_id, top_id,
+        )
+        try:
+            await self._bot.pin_chat_message(
+                chat_id=chat_id,
+                message_id=message_id,
+                disable_notification=notify_silent("dashboard"),
+            )
+            self._edit_guard.note_edit(now)
+        except telegram.error.RetryAfter as e:
+            self._edit_guard.note_retry_after(
+                float(getattr(e, "retry_after", 5.0)), now
+            )
+            self._last_pin_check = None  # retry once the flood wait ends
+        except telegram.error.TelegramError as e:
+            logger.warning("Dashboard re-pin of board %s failed: %s", message_id, e)
 
     # --- sync / recreate ---
 
@@ -435,6 +782,40 @@ class DashboardSync:
         self._dirty = False
         self._last_synced_mtime = mtime
         self._edit_guard.note_edit(now)
+
+    def _note_shown(self, text: str) -> None:
+        """Record the digest of the content the pinned message now shows;
+        persisted only when it changed (restart must see the same digest)."""
+        digest = _digest(text)
+        if digest != self._digest:
+            self._digest = digest
+            self._save_state()
+
+    def _fresh_requested(self) -> bool:
+        return self._rotate_request.exists()
+
+    def _consume_fresh_request(self) -> None:
+        try:
+            self._rotate_request.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning("Dashboard fresh request not consumed: %s", e)
+
+    def _rotation_due(self, text: str) -> bool:
+        """DGN-1768: first real change on a day other than the send day.
+
+        An unknown digest (legacy state) is never a "real change": the edit
+        path runs and records it, so a restart alone cannot rotate.
+        DASHBOARD_ROTATE=explicit disables this rule (fresh requests only).
+        """
+        return (
+            _rotate_mode() == ROTATE_AUTO
+            and self._message_id is not None
+            and self._digest is not None
+            and _digest(text) != self._digest
+            and self._sent_day != _local_day()
+        )
 
     # --- DGN-974: pin surface HTML render + fail-open send helpers ---
 
@@ -533,9 +914,21 @@ class DashboardSync:
 
     async def _sync(self, chat_id: int, text: str, mtime: float) -> None:
         now = time.monotonic()
+        if self._fresh_requested():
+            # DGN-1768 r2 explicit request: rotate now, consume on success.
+            if await self._recreate(chat_id, text, mtime, now, rotate=True,
+                                    force=True):
+                self._consume_fresh_request()
+            return
+        if self._rotation_due(text):
+            # New day, first real change: fresh message + pin, old deleted.
+            await self._recreate(chat_id, text, mtime, now, rotate=True)
+            return
         if self._message_id is not None:
             try:
                 await self._edit_with_fallback(chat_id, self._message_id, text)
+                self._pin_check_due = True  # DGN-1782: verify the pin soon
+                self._note_shown(text)
                 self._mark_synced(mtime, now)
                 return
             except telegram.error.RetryAfter as e:
@@ -545,6 +938,7 @@ class DashboardSync:
                 return  # stay dirty; retried after the flood wait
             except telegram.error.BadRequest as e:
                 if _is_not_modified(e):
+                    self._note_shown(text)
                     self._mark_synced(mtime, now)  # normal flow, not an error
                     return
                 if _is_chat_gone(e):
@@ -577,18 +971,24 @@ class DashboardSync:
         await self._recreate(chat_id, text, mtime, now)
 
     async def _recreate(
-        self, chat_id: int, text: str, mtime: float, now: float
-    ) -> None:
+        self, chat_id: int, text: str, mtime: float, now: float,
+        rotate: bool = False, force: bool = False,
+    ) -> bool:
         """Send a fresh dashboard message, pin it, persist state.
 
         Guarded by a cooldown so a persistently failing edit path cannot spam
-        the chat with chained recreations.
+        the chat with chained recreations.  rotate=True (DGN-1768 daily
+        rotation) additionally deletes the previous board message; any delete
+        refusal falls back to the unpin-only path below.  force=True (r2
+        fresh request) skips the cooldown.  Returns True once the new message
+        was sent.
         """
         if (
-            self._last_recreate is not None
+            not force
+            and self._last_recreate is not None
             and (now - self._last_recreate) < RECREATE_COOLDOWN
         ):
-            return  # cooldown; stay dirty, retry later
+            return False  # cooldown; stay dirty, retry later
 
         old_message_id = self._message_id
         try:
@@ -606,19 +1006,27 @@ class DashboardSync:
             self._edit_guard.note_retry_after(
                 float(getattr(e, "retry_after", 5.0)), now
             )
-            return
+            return False
         except telegram.error.TelegramError as e:
             if isinstance(e, telegram.error.Forbidden) or _is_chat_gone(e):
                 self._clear_state()  # terminal chat-level: do not poison state
             logger.warning("Dashboard recreate send failed: %s", e)
-            return  # stay dirty; retried on a later tick
+            return False  # stay dirty; retried on a later tick
 
         # Cooldown armed only on SUCCESS: it guards against chained
         # recreations spamming the chat -- a failed send posted nothing, so
         # delaying the first healthy recreate would be pure loss.
         self._last_recreate = now
+        self._last_pin_check = now  # DGN-1782: freshly pinned below
+        self._pin_check_due = False
         self._chat_id = chat_id
         self._message_id = message.message_id
+        self._sent_day = _local_day()
+        self._digest = _digest(text)
+        if old_message_id is not None and old_message_id != message.message_id:
+            # DGN-1777: queued (and persisted with the new id) before any
+            # unpin, so a crash in between cannot lose the old pinned id.
+            self._queue_unpin(chat_id, old_message_id)
         self._save_state()
 
         try:
@@ -637,14 +1045,28 @@ class DashboardSync:
             # the source of truth, the pin is an accessibility device).
             logger.warning("Dashboard pin failed (continuing unpinned): %s", e)
 
-        if old_message_id is not None:
-            # A stale pin can survive e.g. a bot-token swap; best-effort
-            # unpin of the previous message, failures ignored.
+        if rotate and old_message_id is not None:
+            # DGN-1768: yesterday's board is ours and < 48h old -> delete it.
+            # Gone already = done; any refusal (undeletable age limit, flood,
+            # other) never retries: the new board is live, so fall back to
+            # the unpin below and leave the orphan body unpinned.
             try:
-                await self._bot.unpin_chat_message(
+                await self._bot.delete_message(
                     chat_id=chat_id, message_id=old_message_id
                 )
-            except telegram.error.TelegramError:
-                pass
+                self._drop_stale(chat_id, old_message_id)  # deleted = unpinned
+            except telegram.error.TelegramError as e:
+                if _is_message_gone(e):
+                    self._drop_stale(chat_id, old_message_id)
+                else:
+                    logger.info(
+                        "Dashboard rotation: old board not deleted (%s); unpinning", e
+                    )
+
+        # The previous board (a stale pin can also survive e.g. a bot-token
+        # swap) and any earlier queued id: unpin now, failures logged and
+        # retried from the persisted queue (DGN-1777).
+        await self._unpin_stale(now)
 
         self._mark_synced(mtime, now)
+        return True

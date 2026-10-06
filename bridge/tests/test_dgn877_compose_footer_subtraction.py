@@ -18,6 +18,7 @@ subtracted as final overlap) still logs a fold-dropped line -- now
 cause-confirmed, not enumerated. These tests pin the split behavior.
 """
 
+from bridge import sdk_bridge as _locale_bridge
 import asyncio
 import json
 import logging
@@ -38,6 +39,16 @@ from bridge.tests.test_dgn699_growing_fold import (
 
 
 FOOTER = "[라이브]\n- 배포 동생"
+
+
+@pytest.fixture(autouse=True)
+def _en_instance(monkeypatch):
+    # These fixtures narrate in English: pin an en instance so the interim
+    # locale gate (sdk_bridge._interim_off_locale) stays out of the interim
+    # mechanics under test, whatever LOCALE the shell exports. The ko side
+    # is covered by test_interim_locale_gate.py.
+    monkeypatch.setattr(_locale_bridge.config, "locale", "en")
+
 
 
 @pytest.fixture
@@ -168,8 +179,13 @@ class TestDgn878ComposeEmptyLog:
         # as the old enumerating "composed empty" drop.
         # Hangul filler keeps the fixture inert under the DGN-686 register
         # guard even when a live ko shell leaks LOCALE=ko into the run.
+        # DGN-1838: 1000 chars of narration as 10 short progress lines (one
+        # 1000-char block would be promoted out of the fold as an answer).
         msgs = [
-            _make_assistant_msg("tool_use", [TextBlock(text="n" * 1000)]),
+            *(
+                _make_assistant_msg("tool_use", [TextBlock(text="n" * 100)])
+                for _ in range(10)
+            ),
             _make_assistant_msg("end_turn", [TextBlock(text="가" * 3998)]),
             _make_result_msg(result=""),
         ]

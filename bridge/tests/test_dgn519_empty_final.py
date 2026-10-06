@@ -1,7 +1,11 @@
 """DGN-519: empty-final turn must be silently dropped; error/normal turns unchanged.
 
 Regression suite for the change in _finalize_result:
-  (a) Empty-final non-error turn -> future NOT resolved, exactly one INFO log line.
+  (a) Empty-final non-error turn -> nothing rendered, exactly one INFO log line,
+      and (DGN-1819 A) the future IS resolved with the no-render shape
+      (content="", success=True, streamed=True). An unresolved future was
+      orphaned by the reader's popleft and ran to the soft timeout -> false
+      time-limit notice.
   (b) Error turn (is_error=True) -> PROCESSING_FAILED path intact (future resolved,
       success=False, content formatted via messages.PROCESSING_FAILED).
   (c) Normal turn with non-empty text -> future resolved success=True, content present.
@@ -63,6 +67,16 @@ def _make_result_msg(result_text=None, is_error=False) -> ResultMessage:
     )
 
 
+def _assert_no_render_resolved(tc, req):
+    # DGN-1819 A: resolved, but with the shape that renders nothing.
+    tc.assertTrue(req.future.done(), "empty-final future must be resolved")
+    res = req.future.result()
+    tc.assertTrue(res.success)
+    tc.assertEqual(res.content, "")
+    tc.assertTrue(res.streamed)
+    tc.assertFalse(res.timed_out)
+
+
 def _run_finalize(bridge, state, req, msg):
     loop = asyncio.new_event_loop()
     try:
@@ -88,10 +102,7 @@ class TestEmptyFinalDropped(unittest.TestCase):
         msg = _make_result_msg(result_text=None, is_error=False)
         with self.assertLogs("bridge.sdk_bridge", level="INFO") as cm:
             _run_finalize(self.bridge, self.state, req, msg)
-        self.assertFalse(
-            req.future.done(),
-            "Future must NOT be resolved on empty-final turn",
-        )
+        _assert_no_render_resolved(self, req)
         info_lines = [l for l in cm.output if "empty-final turn dropped" in l and "INFO" in l]
         self.assertEqual(len(info_lines), 1, f"Expected exactly one INFO drop log, got: {cm.output}")
 
@@ -101,7 +112,7 @@ class TestEmptyFinalDropped(unittest.TestCase):
         msg = _make_result_msg(result_text=None, is_error=False)
         with self.assertLogs("bridge.sdk_bridge", level="INFO") as cm:
             _run_finalize(self.bridge, self.state, req, msg)
-        self.assertFalse(req.future.done())
+        _assert_no_render_resolved(self, req)
         info_lines = [l for l in cm.output if "empty-final turn dropped" in l and "INFO" in l]
         self.assertEqual(len(info_lines), 1)
 
@@ -122,7 +133,7 @@ class TestEmptyFinalDropped(unittest.TestCase):
         msg = _make_result_msg(result_text=None, is_error=False)
         with self.assertLogs("bridge.sdk_bridge", level="INFO") as cm:
             _run_finalize(self.bridge, self.state, req, msg)
-        self.assertFalse(req.future.done())
+        _assert_no_render_resolved(self, req)
         info_lines = [l for l in cm.output if "empty-final turn dropped" in l and "INFO" in l]
         self.assertEqual(len(info_lines), 1)
 

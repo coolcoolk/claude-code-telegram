@@ -13,17 +13,18 @@ STRINGS = {
         "Please contact the admin for access."
     ),
     "no_permission_callback": "No permission to use this feature",
-    # Expired-button tap toast (makes the STALE gate visible).
-    # Confirmed -- owner approval 2026-09-10 07:42.
-    # The contract narrowed to (1) alone: that an old button stops working and
-    # the request has to be typed is an affordance a reader learns after a
-    # couple of encounters, and re-explaining it on every tap costs more than
-    # it saves. Both keys carry the same value, so the label branch no longer
-    # changes the wording (call sites unchanged).
-    "stale_callback_expired": "Button expired",
-    "stale_callback_expired_nolabel": "Button expired",
+    # Expired-button tap alert (STALE gate made visible).
+    # Confirmed -- owner 2026-10-02 08:17: name the expiry window and point
+    # to typing in the chat. {minutes} = STALE window. Both keys share the
+    # value -- call sites unchanged.
+    "stale_callback_expired": "This button expired after {minutes} minutes. Please type what you need in the chat.",
+    "stale_callback_expired_nolabel": "This button expired after {minutes} minutes. Please type what you need in the chat.",
     # --- Born-locked ownership / claim flow ---
-    "claim_success": "You are now the owner of this bot.",
+    # Fallback ONLY: a successful /claim normally opens the agent's own first
+    # turn (bot._open_first_contact) and this line is never sent. It goes out
+    # when that turn could not be started. Confirmed -- owner 2026-10-02 17:39
+    # (first-contact rework 2026-10-02).
+    "claim_success": "You're all set. Say hi whenever you like.",
     "claim_code_log": (
         "CLAIM CODE: {code} -- send '/claim {code}' to this bot from your Telegram "
         "account to become the owner."
@@ -41,10 +42,19 @@ STRINGS = {
         "session."
     ),
     "model_switched": "Switched to {label} · new session started",
-    "model_select": (
-        "Select Claude model:\n"
-        "(switching starts a new session)"
-    ),
+    # DGN-1814 r4 /model picker (owner copy final 2026-10-01 09:52): header /
+    # "Current:" / note, one line each; one header for the one-vendor and the
+    # vendor-step screen.
+    "model_select": "Select an LLM model.",
+    "model_now": "Current: {model}",
+    # Appended to "Current:" when the live version of a configured alias is
+    # not the table's. The _batchim twin exists for the ko particle only.
+    "model_latest_hint": " (latest is {version}; a restart may switch to it)",
+    "model_latest_hint_batchim": " (latest is {version}; a restart may switch to it)",
+    "model_switch_note": "(switching starts a new session)",
+    # Appended to the current model / vendor button label.
+    "model_current_mark": " (current)",
+    "model_vendor_not_wired": "{vendor} models can't answer in chat yet.",
     "model_switch_warning": (
         "Note: switching the model starts a fresh conversation."
     ),
@@ -74,14 +84,20 @@ STRINGS = {
     # on in-session vs detached dispatch, so no blanket claim is true) plus
     # a second-/stop threat the code never needed (bot.py's soft-interrupt
     # except-block already falls back to _hard_stop automatically). The
-    # real fact-based signal for an actual kill is bg_subagent_killed_notice
-    # below, which stays.
+    # real fact-based signal for an actual kill is bg_task_killed_notice
+    # below, automatic interrupts only (DGN-1593: never after /stop).
     "stop_interrupted": "Stopped what was running.",
-    # DGN-1015: fact-based, fires only when a background subagent actually
-    # died. Copy OWNER-APPROVED 2026-08-24 (commit f67bf57e): the draft's
-    # developer vocabulary was rejected -- the reader just typed a message
-    # and does not know an interrupt happened.
-    "bg_subagent_killed_notice": "⚠️ {names} stopped.",
+    # DGN-1015: fact-based, fires only when tracked background work
+    # (subagent or background command) actually died in an AUTOMATIC
+    # interrupt -- never after the owner's own /stop (DGN-1593 B).
+    # Vocabulary rule OWNER-APPROVED 2026-08-24 (commit f67bf57e): no
+    # developer terms. DGN-1593 A: count only -- the registry holds only
+    # internal tool-call labels. DGN-1593 r2 (owner 2026-10-02 08:47): one
+    # bg_task_killed_item bullet per job whose name the owner already knows
+    # (START push / workbench row); a nameless job is only counted. Copy
+    # OWNER-CONFIRMED 2026-10-02.
+    "bg_task_killed_notice": "⚠️ {count} running task(s) stopped too.",
+    "bg_task_killed_item": "- {name}",
     # DGN-1016 O1: dedicated copy for the AUTOMATIC in-flight interrupt
     # notice (BRIDGE_INFLIGHT_INTERRUPT_NOTICE opt-in; default stays OFF =
     # silence, owner decision 2026-08-17). The flag previously reused
@@ -241,15 +257,19 @@ STRINGS = {
         "if you need it."
     ),
     # --- Timeout / resume ---
-    # DGN-1523: "timeout_paused" removed -- messages.TIMEOUT_PAUSED now
-    # reuses "still_working" (see bridge/messages.py) so the timeout content
-    # never claims a button that only _send_resume_notice can actually build.
+    # DGN-1523: fact only, no button instruction -- this string reaches the
+    # user through layers that may or may not have created a button
+    # (auto-resume success never shows a button at all). The tap instruction
+    # lives solely in timeout_tap_notice, next to the button it describes.
+    "timeout_paused": (
+        "This is taking a while, so I paused once and am continuing automatically."
+    ),
     "timeout_no_resume": (
-        "Work stopped on timeout, but no session was found to resume. "
+        "This took a while and paused, but I could not find where to continue. "
         "Please send your request again."
     ),
     "tap_to_continue": "Continue",
-    "timeout_tap_notice": "Stopped on timeout. Tap to continue.",
+    "timeout_tap_notice": "This took a while and paused. Tap to continue.",
     "resume_expired": (
         "This button was already handled or has expired. Please request again if "
         "needed."
@@ -292,8 +312,11 @@ STRINGS = {
     "network_timeout": "Network connection timed out. Please try again shortly.",
     # --- DGN-686: is_error result notices ---
     "error_transient_retry": "Processing failed temporarily. Try again?",
+    # DGN-1857: re-login guide (LOCKED copy, owner-confirmed dec-256 -- do not reword).
     "error_auth_relogin": (
-        "Please log in to Claude again, then let me know and I'll recover."
+        "Your Claude login has expired. On this Mac, run `claude auth login` "
+        "in Terminal, then send /restart. If you are connected remotely (SSH), "
+        "first run `security unlock-keychain ~/Library/Keychains/login.keychain-db`."
     ),
     "error_generic_retry": "Processing failed. Try again?",
     "error_retry_button": "Retry",
@@ -392,10 +415,14 @@ STRINGS = {
     # (e.g. "SOME_TOKEN k=v") reached an owner-facing rail and was passed
     # through. PLACEHOLDER COPY -- owner confirmation pending (UX gate); the
     # ticket report lists the candidate wordings. {tokens} / {rail} required.
+    # DGN-1589/DGN-1591: this alert's reader is the framework OPERATOR, never
+    # the end-user (routing: bot.py/machine_gate.py audience axis). The copy
+    # must not itself look machine-shaped -- no leading bracket or ALL-CAPS
+    # token, or it re-triggers the detector on the operator rail.
     "machine_line_alert": (
-        "[bridge] An internal machine line reached your screen without "
-        "registration: {tokens} (rail: {rail}). It was passed through "
-        "unchanged; this notice fires once per day per token."
+        "Framework hygiene notice: unregistered machine-shaped line(s) "
+        "passed the user surface unchanged: {tokens} (rail: {rail}). "
+        "Nothing was dropped; this fires once per day per token."
     ),
     # Appended when the call site declared no rail (rail=unknown): the missing
     # declaration itself is the work item. PLACEHOLDER COPY (same gate).
@@ -444,12 +471,18 @@ STRINGS = {
         "marker or the choice list inside a code block.\n"
         "- Do not mix a code block or a table with [[OPTIONS]] in one message; "
         "send code/tables first, then the choice message.\n"
+        "- The buttons attach to your reply message itself (no separate "
+        "prompt bubble); a reply that is ONLY the choice list gets a short "
+        "prompt line to carry them.\n"
         "- Labels are thin tokens; per-option descriptions belong in the body "
-        "lines. Each button renders as 'N. label' and that WHOLE line must fit "
+        "lines. A button shows 'N. label' only when the body still shows the "
+        "matching numbered list after the buttons consumed it; a single button, "
+        "or a list the buttons consumed, shows the bare label -- then refer to "
+        "options by label, not by number. The WHOLE button line must fit "
         "~31 character widths (CJK counts 1.5x), so keep labels within about "
-        "27 latin / 18 Korean characters. If ANY one overflows, EVERY button "
-        "in that keyboard degrades to a bare number token -- keep the full "
-        "option text readable in the body.\n"
+        "27 latin / 18 Korean characters. If ANY numbered one overflows, EVERY "
+        "button in that keyboard degrades to a bare number token and the body "
+        "keeps the numbered list -- keep the full option text readable there.\n"
         "- A marker that yields no labels from any source builds ZERO buttons "
         "(the body text is kept). Always provide labels via one of the three "
         "shapes.\n\n"
@@ -512,6 +545,8 @@ STRINGS = {
         "1. {allow_token} (Allow this external path access)\n"
         "2. {deny_token} (Deny)"
     ),
+    "outside_approval_allow_words": "allow|yes|y",
+    "outside_approval_deny_words": "deny|no|n",
     "outside_path_deny_no_confirm": (
         "Access to a protected or out-of-root path was denied. This is a "
         "background turn with no user available to confirm it. Skip this path or "

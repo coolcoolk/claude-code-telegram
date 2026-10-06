@@ -24,8 +24,10 @@ This file covers the fix layered on top of DGN-1016's registry:
      stream exists.
   4. bot.py wiring: the auto-interrupt path (defer-cap-exceeded kill) and
      the /stop path both fetch pop_interrupt_killed() after a successful
-     interrupt and, ONLY when it is non-empty, send
-     messages.BG_SUBAGENT_KILLED_NOTICE naming what died. This is
+     interrupt; the auto path, ONLY when it is non-empty, sends
+     messages.BG_TASK_KILLED_NOTICE with the count of what died, plus one
+     bullet per owner-facing name (DGN-1593 r2)
+     (DGN-1593: no internal labels, and /stop sends nothing extra). This is
      unconditional (not gated by the silent-by-default
      BRIDGE_INFLIGHT_INTERRUPT_NOTICE flag, which governs a different,
      older fact -- "your message caused an interrupt" -- not "a background
@@ -163,7 +165,10 @@ async def test_interrupt_with_live_tasks_clears_registry_and_stashes_killed():
     assert state.active_tasks == {}
     assert state.task_descriptions == {}
     killed = bridge.pop_interrupt_killed(USER_ID)
-    assert set(killed) == {"DGN-991 1차 빌드", "t2"}  # t2 falls back to its id
+    # One entry per killed task.  DGN-1593 r2: an entry is the owner-facing
+    # name or "" -- never the raw SDK description, never the task id (no
+    # name registry in this hermetic root, and t1 is not a subagent).
+    assert killed == ["", ""]
     # Read-once: a second pop is empty.
     assert bridge.pop_interrupt_killed(USER_ID) == []
 
@@ -189,7 +194,7 @@ def test_pop_interrupt_killed_no_stream_is_empty():
 
 
 # ---------------------------------------------------------------------------
-# (4) bot.py wiring: /stop path names what died, only when something did
+# (4) bot.py wiring: /stop path drains the kill list, adds nothing (DGN-1593)
 # ---------------------------------------------------------------------------
 
 
@@ -208,7 +213,7 @@ def _fake_update(user_id):
 
 
 @pytest.mark.asyncio
-async def test_cmd_stop_names_killed_subagent(monkeypatch):
+async def test_cmd_stop_does_not_announce_killed_subagent(monkeypatch):
     b = _make_bot()
     user_id = 9101
 
@@ -228,11 +233,7 @@ async def test_cmd_stop_names_killed_subagent(monkeypatch):
     upd = _fake_update(user_id)
     await b._cmd_stop(upd, SimpleNamespace(args=[]))
 
-    expected = (
-        f"{messages.STOP_INTERRUPTED}\n"
-        + messages.BG_SUBAGENT_KILLED_NOTICE.format(names="DGN-991 1차 빌드")
-    )
-    upd.message.reply_text.assert_awaited_once_with(expected)
+    upd.message.reply_text.assert_awaited_once_with(messages.STOP_INTERRUPTED)
 
 
 @pytest.mark.asyncio
@@ -259,7 +260,7 @@ async def test_cmd_stop_silent_when_nothing_killed(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# (4) bot.py wiring: auto-interrupt (defer-cap-exceeded kill) names the dead
+# (4) bot.py wiring: auto-interrupt (defer-cap-exceeded kill) counts the dead
 # ---------------------------------------------------------------------------
 
 
@@ -340,5 +341,8 @@ async def test_auto_interrupt_cap_exceeded_kill_is_notified(monkeypatch):
     await _await_all_tasks(b, user_id)
 
     fake_bot.send_message.assert_awaited_once_with(
-        1, messages.BG_SUBAGENT_KILLED_NOTICE.format(names="DGN-991 1차 빌드")
-    )
+        1,
+        messages.BG_TASK_KILLED_NOTICE.format(count=1)
+        + "\n"
+        + messages.BG_TASK_KILLED_ITEM.format(name="DGN-991 1차 빌드"),
+    )  # pop_interrupt_killed yields owner names (DGN-1593 r2): bulleted

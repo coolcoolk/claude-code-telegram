@@ -22,6 +22,9 @@ The harness reuses test_dgn877's compose-path driver (FOLD_CREATE_MIN_INTERIMS
 pinned high to force the finalize-time compose branch).
 """
 
+import pytest
+
+from bridge import sdk_bridge as _locale_bridge
 import logging
 
 from claude_agent_sdk import TextBlock
@@ -36,6 +39,16 @@ from bridge.tests.test_dgn699_growing_fold import (
     _make_result_msg,
 )
 from bridge.tests.test_dgn877_compose_footer_subtraction import _run_msgs
+
+
+@pytest.fixture(autouse=True)
+def _en_instance(monkeypatch):
+    # These fixtures narrate in English: pin an en instance so the interim
+    # locale gate (sdk_bridge._interim_off_locale) stays out of the interim
+    # mechanics under test, whatever LOCALE the shell exports. The ko side
+    # is covered by test_interim_locale_gate.py.
+    monkeypatch.setattr(_locale_bridge.config, "locale", "en")
+
 
 
 def _run_msgs_no_handler(messages_seq, fold_min_chars: int = 300):

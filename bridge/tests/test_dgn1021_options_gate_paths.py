@@ -181,7 +181,7 @@ class TestFinalizePathGate:
         kb = _keyboard_sends(sent)
         assert len(kb) == 1, f"no keyboard attached: {sent}"
         rows = kb[0]["reply_markup"].inline_keyboard
-        assert [r[0].text for r in rows] == ["1. 흡수", "2. 분리"]
+        assert [r[0].text for r in rows] == ["흡수", "분리"]
 
     def test_bare_marker_trailing_labels_gate_true_keyboard(self, monkeypatch):
         """No-regression: bare marker + trailing label lines (DGN-992 rev2)."""
@@ -206,7 +206,7 @@ class TestFinalizePathGate:
         kb = _keyboard_sends(sent)
         assert len(kb) == 1
         rows = kb[0]["reply_markup"].inline_keyboard
-        assert [r[0].text for r in rows] == ["1. proceed", "2. hold"]
+        assert [r[0].text for r in rows] == ["proceed", "hold"]
 
     def test_numbered_only_gate_true_source3_preserved(self, monkeypatch):
         """No-regression (source 3): a numbered run WITHOUT any marker must
@@ -293,7 +293,7 @@ class TestProactivePathGate:
         kb = _keyboard_sends(sent)
         assert len(kb) == 1, f"no keyboard attached: {sent}"
         rows = kb[0]["reply_markup"].inline_keyboard
-        assert [r[0].text for r in rows] == ["1. 흡수", "2. 분리"]
+        assert [r[0].text for r in rows] == ["흡수", "분리"]
 
     def test_bare_marker_numbered_proactive_keyboard(self, monkeypatch):
         """No-regression: bare marker + numbered run on the proactive path."""
@@ -490,7 +490,7 @@ class TestFastpathPathGate:
         kb = _keyboard_sends(sent)
         assert len(kb) == 1, f"no keyboard attached: {sent}"
         rows = kb[0]["reply_markup"].inline_keyboard
-        assert [r[0].text for r in rows] == ["1. proceed", "2. hold"]
+        assert [r[0].text for r in rows] == ["proceed", "hold"]
         bodies = [e for e in sent if e["reply_markup"] is None]
         assert any("항목" in b["text"] for b in bodies), (
             "table body must still be delivered, not swallowed by the split"

@@ -365,7 +365,7 @@ class TestSendSmartSeatLabeledMarker:
         assert "· 흡수" in bodies[0]["text"]
         assert "[[OPTIONS" not in bodies[0]["text"]
         kb_rows = buttons[0]["reply_markup"].inline_keyboard
-        assert [r[0].text for r in kb_rows] == ["1. 흡수", "2. 분리", "3. 나중에"]
+        assert [r[0].text for r in kb_rows] == ["흡수", "분리", "나중에"]
 
     def test_incident_shape_three_buttons_rendered(self):
         """DGN-992 rev2 seat: the verbatim incident content produces exactly
@@ -381,7 +381,7 @@ class TestSendSmartSeatLabeledMarker:
         assert len(buttons) == 1, f"got {sent}"
         kb_rows = buttons[0]["reply_markup"].inline_keyboard
         assert [r[0].text for r in kb_rows] == [
-            "1. 도가니", "2. 도가니 에이전트", "3. 도가니 프레임워크",
+            "도가니", "도가니 에이전트", "도가니 프레임워크",
         ]
         assert len(bodies) == 1
         assert bodies[0]["text"].strip().endswith("...본문...")

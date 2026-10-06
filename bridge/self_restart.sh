@@ -38,10 +38,10 @@
 #   --resume-label TEXT (optional; DGN-834) short user-facing label for the
 #                   in-flight task shown in the restart completion push. When
 #                   set with --resume-intent, this label is used verbatim in
-#                   the push ("재시작 완료 — LABEL 이어서 진행합니다."). When
+#                   the push (i18n restart.resume, "{label}" slot). When
 #                   omitted, derived from the first clause of RESUME_INTENT (up
-#                   to the first colon or newline); falls back to "직전 작업"
-#                   when derivation yields nothing. Has no effect without
+#                   to the first colon or newline); falls back to i18n
+#                   restart.resume_default_label when derivation yields nothing. Has no effect without
 #                   --resume-intent.
 #   --model NAME    (optional) model for --verify (default haiku)
 #   --delay N       (optional) seconds before SIGTERM, lets the current turn flush (default 6)
@@ -215,6 +215,66 @@ case "$PREFIX" in
 esac
 [[ -x "$PUSH" ]]   || { echo "push.sh not executable at $PUSH" >&2; exit 3; }
 
+# DGN-1814 r2: owner-facing words of the success notice come from the layered
+# i18n lookup (config/i18n/<lang>.json + kit layers) in the instance's
+# config/agent.conf AGENT_LANG (same source as self-update.sh; default en).
+# English defaults in code; a miss never blocks the notice.
+AGENT_LANG="$(sed -n 's/^AGENT_LANG=//p' "$INSTANCE_ROOT/config/agent.conf" 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
+AGENT_LANG="${AGENT_LANG:-en}"
+i18n_get() { python3 "$INSTANCE_ROOT/routines/lib/i18n_lookup.py" "$INSTANCE_ROOT" "$AGENT_LANG" "$1" 2>/dev/null || true; }
+# DGN-1814 r2b: EVERY owner-facing line this script can push renders through
+# i18n_fmt -- restart.* keys shared with routines/self-update.sh (one copy for
+# both restart-notice paths). No Korean literal in this file; the ko copy
+# lives in config/i18n/ko.json.
+# i18n_fmt <key> <en-default> [name=value ...] -> value, {name} slots filled.
+i18n_fmt() {
+  local val kv k
+  val="$(i18n_get "$1")"
+  [[ -n "$val" ]] || val="$2"
+  shift 2
+  for kv in "$@"; do
+    k="{${kv%%=*}}"
+    val=${val//"$k"/"${kv#*=}"}
+  done
+  printf '%s' "$val"
+}
+
+# DGN-1814-BEGIN (extracted verbatim by bridge/tests/test_dgn1814_restart_model_line.py)
+# Model line (owner copy 2026-10-01 08:19): when the model that ANSWERS after
+# the restart differs from the one that answered before it, the ONE success
+# notice says so -- "<emoji> Restart complete · Now answering with Claude
+# Sonnet 5.5." The id is what the CLI reported (bridge/live_model.py records
+# system/init), the name is routines/lib/model_display.py's; settings are
+# never read. Composition rule, for every notice source (default, resume
+# label, DGN-706b version auto-notice, caller --notice): " · <sentence>" is
+# appended to the FIRST line (the headline); later lines (release-note fold,
+# verify output) stay below. A caller notice that already names the model is
+# left alone (no duplicate).
+model_sentence() { # <display> -> sentence in AGENT_LANG
+  local disp="$1" key="restart.model_now" tpl out
+  # A display ending in 0/3/6 reads with a final consonant; the ko copy then
+  # takes the other particle form. Other languages carry the same text twice.
+  case "$disp" in *[036]) key="restart.model_now_batchim" ;; esac
+  tpl="$(i18n_get "$key")"
+  [[ -n "$tpl" ]] || tpl="Now answering with {model}."
+  out=${tpl//"{model}"/"$disp"}
+  printf '%s' "$out"
+}
+join_model_line() { # <msg> <display> -> msg with the sentence on its headline
+  local msg="$1" disp="$2" first rest
+  if [[ -z "$disp" || "$msg" == *"$disp"* ]]; then
+    printf '%s' "$msg"; return 0
+  fi
+  first="${msg%%$'\n'*}"
+  rest="${msg:${#first}}"
+  printf '%s · %s%s' "$first" "$(model_sentence "$disp")" "$rest"
+}
+restart_complete_word() {
+  local w; w="$(i18n_get restart.complete)"
+  printf '%s' "${w:-Restart complete}"
+}
+# DGN-1814-END
+
 # DGN-822: push.sh now sanitizes every text send (bridge sanitizer) and always
 # transmits parse_mode=HTML. Contract for THIS caller: pass RAW text -- never
 # pre-escape & < > (the sanitizer escapes them; pre-escaping double-escapes,
@@ -222,7 +282,7 @@ esac
 # (<blockquote expandable>, <b>, ...) stay raw and pass through the sanitizer.
 # The old --html flag is a deprecated no-op and is no longer attached.
 notify() {
-  "$PUSH" --env "$ENV_FILE" --text "$1" || echo "[self_restart] push failed" >&2
+  "$PUSH" --env "$ENV_FILE" --text "$1" --audience owner || echo "[self_restart] push failed" >&2
 }
 cur_pid() { launchctl list | awk -v l="$LABEL" '$3==l && $1 ~ /^[0-9]+$/ {print $1}'; }
 
@@ -246,10 +306,15 @@ maybe_compose_update_notice() {
   [[ -f "$relnote" ]] || return 0
   notes="$(awk '/^## Summary/{g=1;next} g&&/^(---|## )/{exit} g{print}' "$relnote" | sed -e '/./,$!d' | head -n 12)"
   [[ -n "$notes" ]] || return 0
-  fold="Update summary ..."
+  # DGN-1814 r2b: header + fold label are the SAME keys self-update.sh's
+  # restart_notice renders (restart.update_done / restart.fold_summary), in
+  # the instance's AGENT_LANG -- the ko header is the owner-locked
+  # "<restart done> · v<ver> <update done>" form, never English on a ko
+  # instance.
+  fold="<b>▸ $(i18n_fmt restart.fold_summary "At a glance")</b>"
   # DGN-822: notes go in RAW (no html_esc) -- push.sh's sanitizer escapes
   # entities; the blockquote tags pass its whitelist verbatim.
-  NOTICE="Restart complete · v${cur} update applied
+  NOTICE="$(i18n_fmt restart.update_done "Restart complete · {version} update complete" "version=v${cur}")
 <blockquote expandable>${fold}
 ${notes}</blockquote>"
   mkdir -p "$(dirname "$VER_MARKER")" 2>/dev/null && printf '%s\n' "$cur" >"$VER_MARKER"
@@ -355,6 +420,22 @@ VER_MARKER="$(dirname "$SPOOL_DIR")/state/last_notified_fw_version"
 # in exactly ONE terminal notification: never silence, never a duplicate.
 RESTART_MARKER="$(dirname "$SPOOL_DIR")/state/restart-pending.marker"
 MARKER_ARMED=""
+# DGN-1814 r2: per-process "model that answered" record (bridge/live_model.py).
+# MODEL_WAIT bounds how long the success notice waits for the new process's
+# first system/init (the verify-spool turn below produces it; the session
+# inbox polls every 20s). On timeout the notice goes out without the line and
+# the worker keeps watching up to MODEL_FOLLOWUP_WAIT; a change seen then is
+# sent as one short follow-up line (degraded path, never a silent loss).
+LIVE_MODEL_STATE="$(dirname "$SPOOL_DIR")/state/live_model.json"
+MODEL_WAIT="${DGN1814_MODEL_WAIT:-45}"
+MODEL_FOLLOWUP_WAIT="${DGN1814_MODEL_FOLLOWUP_WAIT:-300}"
+KILL_EPOCH=""
+# live_model_changed <timeout> -> stdout display name when changed; rc 0 seen
+# (changed or not), 2 timeout, 3 no prior record (first-ever: nothing to say).
+live_model_changed() {
+  python3 "$SELF_BIN_DIR/live_model.py" changed "$LIVE_MODEL_STATE" \
+    "${KILL_EPOCH:-0}" "$1" "$INSTANCE_ROOT/routines/lib" 2>/dev/null
+}
 # DGN-1012 third leg: terminal-state ledger (single machine, routines/). The
 # marker backstop above covers "worker dead, NEW bridge alive"; the ledger
 # sweep (hourly housekeeper launchd job + push.sh, both bridge-independent)
@@ -520,11 +601,12 @@ if [[ -z "$DRY_RUN" && -z "$SKIP_SMOKE" ]]; then
     # DGN712 smoke-fail push copy (owner-confirmed 2026-08-03): itemized,
     # non-technical, reassurance + escape hatch. Technical cause stays in the
     # worker log line below, NOT in the user push.
-    notify "⚠️ 업데이트 잠시 보류
-- 새 버전이 바로 안 떠서 멈췄어요
-- 지금 버전 그대로 정상 운영 중 (서비스 이상 없음)
-- 원인 확인 후 다시 안내드릴게요
-- 바로 처리 원하시면: 다시 시도"
+    # Copy: i18n restart.update_held (ko = the owner-confirmed text verbatim).
+    notify "$(i18n_fmt restart.update_held "⚠️ Update on hold for now
+- Stopped because the new version didn't come up right away
+- Still running normally on the current version (no service impact)
+- I'll let you know once I've found the cause
+- To handle it right away: try again")"
     echo "[$(date '+%F %T')] ABORT: pre-restart smoke gate failed; old bridge kept alive (pid ${OLD_PID:-none}). detail: ${SMOKE_FAIL_DETAIL}" >&2
     exit 4
   fi
@@ -554,8 +636,9 @@ if [[ -z "$DRY_RUN" ]]; then
   # the ONLY remaining closer. TTL 900s: worker runway (~90s) + bridge
   # backstop window (90-150s) + margin; detection rides the hourly sweep.
   /usr/bin/python3 "$TSL_LEDGER" open --surface restart-cta --id restart-pending \
-    --ttl 900 --notify owner --note "재시작: ${REASON}" \
+    --ttl 900 --notify owner --note "$(i18n_fmt restart.ledger_note "Restart: {reason}" "reason=${REASON}")" \
     --evidence "$TSL_EVIDENCE" >/dev/null || true
+  KILL_EPOCH="$(date '+%s')"   # DGN-1814 r2: the new process boots after this
   if [[ -n "$OLD_PID" ]]; then
     kill -TERM "$OLD_PID" 2>/dev/null || true
   else
@@ -597,14 +680,23 @@ if [[ -n "$POLL_UP" ]]; then
     # this worker log (echoed at worker start + done lines).
     # ${PREFIX:+...}: prefix + ONE space only when a prefix resolved -- an
     # empty prefix must not leave a leading space (DGN-828).
-    MSG="${PREFIX:+${PREFIX} }${NOTICE}"
+    # DGN-1591 (D): prefix application is IDEMPOTENT. A caller-composed
+    # --notice may already carry the persona prefix (measured 2026-09-19:
+    # a live agent passed --notice "<emoji> ..." and this line stacked a
+    # second emoji on the owner's screen). If the notice already starts
+    # with the resolved prefix, it goes out as-is.
+    if [[ -n "$PREFIX" && "$NOTICE" == "$PREFIX"* ]]; then
+      MSG="$NOTICE"
+    else
+      MSG="${PREFIX:+${PREFIX} }${NOTICE}"
+    fi
   else
     # DGN-687 / DGN-233 / DGN-834: default fallback -- user-facing tone.
     # No REASON (dev jargon) and no pid in the push; both stay in this worker log.
     # When RESUME_INTENT is set, merge a short label into the single push line
-    # (2통 -> 1통). Label source: explicit --resume-label (verbatim); else derived
-    # from the first clause/line of RESUME_INTENT (up to first colon or newline);
-    # ultimate fallback is the generic Korean phrase.
+    # (two pushes -> one). Label source: explicit --resume-label (verbatim); else
+    # derived from the first clause/line of RESUME_INTENT (up to first colon or
+    # newline); ultimate fallback is i18n restart.resume_default_label.
     if [[ -n "$RESUME_INTENT" ]]; then
       _push_label=""
       if [[ -n "$RESUME_LABEL" ]]; then
@@ -612,17 +704,17 @@ if [[ -n "$POLL_UP" ]]; then
       else
         _push_label="$(printf '%s' "$RESUME_INTENT" | head -n1 | sed 's/:.*//' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')"
         if [[ -z "$_push_label" ]]; then
-          _push_label="직전 작업"
+          _push_label="$(i18n_fmt restart.resume_default_label "the previous task")"
         fi
       fi
-      MSG="${PREFIX:+${PREFIX} }재시작 완료 — ${_push_label} 이어서 진행합니다."
+      MSG="${PREFIX:+${PREFIX} }$(i18n_fmt restart.resume "Restart complete — continuing {label}." "label=${_push_label}")"
     else
-      MSG="${PREFIX:+${PREFIX} }재시작 완료"
+      MSG="${PREFIX:+${PREFIX} }$(restart_complete_word)"
     fi
   fi
-  [[ -n "$DRY_RUN" ]] && MSG="${PREFIX:+${PREFIX} }[DRY-RUN] 재시작 통보 경로 정상: ${REASON}"
+  [[ -n "$DRY_RUN" ]] && MSG="${PREFIX:+${PREFIX} }$(i18n_fmt restart.dry_run "[DRY-RUN] Restart notice path OK: {reason}" "reason=${REASON}")"
   [[ -n "$VERIFY_OUT" ]] && MSG="${MSG}
-검증: ${VERIFY_OUT}"
+$(i18n_fmt restart.verify "Check: {output}" "output=${VERIFY_OUT}")"
   # DGN-1010: claim before pushing. A lost claim means the bridge backstop
   # already terminal-closed this restart -- pushing again would duplicate.
   if ! claim_terminal_push; then
@@ -630,6 +722,16 @@ if [[ -n "$POLL_UP" ]]; then
     exit 0
   fi
   [[ -z "$DRY_RUN" ]] && drop_verify_spool
+  # DGN-1814 r2: the spool turn above is the new process's first session turn;
+  # wait (bounded) for the model it reports, then fold the line in.
+  MODEL_DISP=""; MODEL_PENDING=""
+  if [[ -z "$DRY_RUN" ]]; then
+    _lm_rc=0
+    MODEL_DISP="$(live_model_changed "$MODEL_WAIT")" || _lm_rc=$?
+    [[ "$_lm_rc" -eq 2 ]] && MODEL_PENDING="true"
+    echo "[$(date '+%F %T')] live model check rc=${_lm_rc} changed_to='${MODEL_DISP}'"
+  fi
+  MSG="$(join_model_line "$MSG" "$MODEL_DISP")"
   notify "$MSG"
   # DGN-1012 registration: terminal notice delivered by this worker -> close.
   if [[ -z "$DRY_RUN" ]]; then
@@ -637,12 +739,21 @@ if [[ -n "$POLL_UP" ]]; then
       --note "worker completion push sent (new_pid=${NEW_PID})" \
       --evidence "$TSL_EVIDENCE" >/dev/null || true
   fi
+  if [[ -n "$MODEL_PENDING" ]]; then
+    _lm_rc=0
+    MODEL_DISP="$(live_model_changed "$MODEL_FOLLOWUP_WAIT")" || _lm_rc=$?
+    echo "[$(date '+%F %T')] live model follow-up rc=${_lm_rc} changed_to='${MODEL_DISP}'"
+    if [[ "$_lm_rc" -eq 0 && -n "$MODEL_DISP" ]]; then
+      notify "${PREFIX:+${PREFIX} }$(model_sentence "$MODEL_DISP")"
+    fi
+  fi
   echo "[$(date '+%F %T')] done OK new_pid=${NEW_PID}"
   exit 0
 else
   if claim_terminal_push; then
-    notify "⚠️ 재시작 이상: ${REASON}
-새 pid=${NEW_PID:-none} 떴으나 '${POLL_MARKER}' 마커 60s 내 안 보임(좀비폴링 의심). 확인 필요."
+    notify "$(i18n_fmt restart.poll_warn "⚠️ Restart problem: {reason}
+New pid={pid} is up, but the '{marker}' marker did not show within 60s (suspected zombie polling). Needs a check." \
+      "reason=${REASON}" "pid=${NEW_PID:-none}" "marker=${POLL_MARKER}")"
     # DGN-1012 registration: abnormal but TERMINAL (owner got the warn push).
     if [[ -z "$DRY_RUN" ]]; then
       /usr/bin/python3 "$TSL_LEDGER" close --id restart-pending --state failed \

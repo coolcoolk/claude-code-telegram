@@ -4,7 +4,7 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
-from bridge.sdk_bridge import SdkBridge, _UserStreamState
+from bridge.sdk_bridge import INJECTED_TURN_MARK, SdkBridge, _UserStreamState
 
 
 def _make_state(**kw):
@@ -38,14 +38,17 @@ class TestInjectBackgroundTurn(unittest.TestCase):
         self.bridge._streams[1] = st
         ok = asyncio.run(self.bridge.inject_background_turn(1, "notify"))
         self.assertTrue(ok)
-        st.client.query.assert_awaited_once_with("notify", session_id="sess-42")
+        # DGN-1606: injected turns open with the harness mark.
+        st.client.query.assert_awaited_once_with(
+            INJECTED_TURN_MARK + "\nnotify", session_id="sess-42")
 
     def test_idle_stream_no_session_uses_default(self):
         st = _make_state(session_id=None)
         self.bridge._streams[1] = st
         ok = asyncio.run(self.bridge.inject_background_turn(1, "notify"))
         self.assertTrue(ok)
-        st.client.query.assert_awaited_once_with("notify", session_id="default")
+        st.client.query.assert_awaited_once_with(
+            INJECTED_TURN_MARK + "\nnotify", session_id="default")
 
 
 class TestNoPushSentinel(unittest.TestCase):

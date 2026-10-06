@@ -18,16 +18,18 @@ STRINGS = {
         "이용하시려면 관리자에게 문의해 주세요."
     ),
     "no_permission_callback": "이 기능을 사용할 권한이 없습니다",
-    # 만료된 버튼 탭 토스트 (STALE 게이트 가시화).
-    # 확정 -- 오너 승인 2026-09-10 07:42.
-    # 계약은 (1) 만료 사실 하나로 좁혔다: 버튼이 오래되면 안 먹고 타이핑하게 된다는
-    # 것은 몇 번 겪으면 학습되는 조작이며, 매번 재설명하는 비용이 더 크다
-    # (오너 2026-09-10 07:36 [축자] "만료된 버튼 / 이거만 표시해주도됨").
-    # 라벨 유무로 문구가 갈리지 않으므로 두 키가 같은 값을 가진다 -- 호출부 무변경.
-    "stale_callback_expired": "만료된 버튼",
-    "stale_callback_expired_nolabel": "만료된 버튼",
+    # Expired-button tap alert (STALE gate made visible).
+    # Confirmed -- owner 2026-10-02 08:17 (verbatim copy): name the expiry
+    # window and point to typing in the chat. {minutes} = STALE window.
+    # Both keys share the value -- call sites unchanged.
+    "stale_callback_expired": "{minutes}분이 지나서 만료된 버튼입니다. 필요하신 내용을 채팅에 입력해주세요.",
+    "stale_callback_expired_nolabel": "{minutes}분이 지나서 만료된 버튼입니다. 필요하신 내용을 채팅에 입력해주세요.",
     # --- Born-locked ownership / claim flow ---
-    "claim_success": "이 봇의 소유자가 되셨습니다.",
+    # Fallback ONLY: a successful /claim normally opens the agent's own first
+    # turn (bot._open_first_contact) and this line is never sent. It goes out
+    # when that turn could not be started. Confirmed -- owner 2026-10-02 17:39
+    # (first-contact rework 2026-10-02; replaces the "소유자가 되셨습니다" line).
+    "claim_success": "연결됐어요. 편하게 말 걸어 주세요.",
     "claim_code_log": (
         "CLAIM CODE: {code} -- 소유자가 되려면 텔레그램 계정에서 이 봇에게 "
         "'/claim {code}' 를 보내세요."
@@ -43,10 +45,19 @@ STRINGS = {
         "새 세션으로 전환했습니다."
     ),
     "model_switched": "전환 완료: {label} · 새 세션으로 시작합니다",
-    "model_select": (
-         "Claude 모델을 선택하세요:\n"
-         "(모델 전환 시 새 세션으로 시작됩니다)"
-                     ),
+    # DGN-1814 r4 /model picker (owner copy final 2026-10-01 09:52). One
+    # header for the one-vendor and the vendor-step screen.
+    "model_select": "LLM 모델을 선택해주세요.",
+    "model_now": "현재: {model}",
+    # Appended to "현재:" when the live version of a configured alias is not
+    # the table's. _batchim: the version ends in a digit read with a final
+    # consonant (0/1/3/6/7/8) -> 이에요.
+    "model_latest_hint": " (최신은 {version}예요. 재시작하면 바뀔 수 있어요)",
+    "model_latest_hint_batchim": " (최신은 {version}이에요. 재시작하면 바뀔 수 있어요)",
+    "model_switch_note": "(모델 전환 시 새 세션으로 시작됩니다)",
+    # Appended to the current model / vendor button label.
+    "model_current_mark": " (현재)",
+    "model_vendor_not_wired": "{vendor} 모델은 아직 대화에 연결되지 않았습니다.",
     "model_switch_warning": "주의: 모델을 전환하면 새 세션이 시작됩니다.",
     "model_unknown": "알 수 없는 모델 '{name}'. 사용 가능한 모델: {allowed}",
     "model_state_fallback": "저장된 모델 설정을 읽지 못해 기본값으로 시작합니다.",
@@ -70,14 +81,21 @@ STRINGS = {
     # on in-session vs detached dispatch, so no blanket claim is true) plus
     # a second-/stop threat the code never needed (bot.py's soft-interrupt
     # except-block already falls back to _hard_stop automatically). The
-    # real fact-based signal for an actual kill is bg_subagent_killed_notice
-    # below, which stays.
+    # real fact-based signal for an actual kill is bg_task_killed_notice
+    # below, automatic interrupts only (DGN-1593: never after /stop).
     "stop_interrupted": "진행하던 작업을 멈췄습니다.",
-    # DGN-1015: fact-based, fires only when a background subagent actually
-    # died. Copy OWNER-APPROVED 2026-08-24 (commit f67bf57e): the draft's
-    # developer vocabulary ("배경 작업"/"인터럽트") was rejected -- the
-    # reader just typed a message and does not know an interrupt happened.
-    "bg_subagent_killed_notice": "⚠️ {names} 작업이 멈췄습니다.",
+    # DGN-1015: fact-based, fires only when tracked background work
+    # (subagent or background command) actually died in an AUTOMATIC
+    # interrupt -- never after the owner's own /stop (DGN-1593 B: the
+    # owner already knows).
+    # Vocabulary rule OWNER-APPROVED 2026-08-24 (commit f67bf57e): no
+    # developer terms ("배경 작업"/"인터럽트"). DGN-1593 A: never an
+    # internal label. DGN-1593 r2 (owner 2026-10-02 08:47 "작업들 이름도
+    # 알려줘야돼 불릿 항목으로"): one bg_task_killed_item bullet per job
+    # whose name the owner already knows (START push / workbench row); a
+    # nameless job is only counted. Copy OWNER-CONFIRMED 2026-10-02.
+    "bg_task_killed_notice": "⚠️ 진행 중이던 작업 {count}건이 함께 멈췄습니다.",
+    "bg_task_killed_item": "- {name}",
     # DGN-1016 O1: dedicated copy for the AUTOMATIC in-flight interrupt
     # notice (BRIDGE_INFLIGHT_INTERRUPT_NOTICE opt-in; default stays OFF =
     # silence, owner decision 2026-08-17: closest to a natural
@@ -234,15 +252,18 @@ STRINGS = {
         "발송 경로라서 보내지 않았습니다. 필요하시면 채팅으로 다시 요청해주세요."
     ),
     # --- Timeout / resume ---
-    # DGN-1523: "timeout_paused" removed -- messages.TIMEOUT_PAUSED now
-    # reuses "still_working" (see bridge/messages.py) so the timeout content
-    # never claims a button that only _send_resume_notice can actually build.
+    # DGN-1523: 사실만 진술 -- 버튼 지시 없음. 이 문구는 버튼이 생길지 모르는
+    # 층(자동재개 성공 시 버튼은 끝내 안 생김)에서도 쓰인다. 누르라는 지시는
+    # timeout_tap_notice 하나에만 둔다 -- 그 버튼과 같은 자리, 같은 호출.
+    "timeout_paused": (
+        "작업이 길어져서 한 번 끊고 갑니다. 자동으로 이어서 진행합니다."
+    ),
     "timeout_no_resume": (
-        "타임아웃으로 작업이 멈췄는데, 이어갈 세션을 찾지 못했습니다. 요청을 다시 "
-        "보내주세요."
+        "작업이 길어져서 한 번 끊었는데, 이어갈 지점을 찾지 못했습니다. 요청을 "
+        "다시 보내주세요."
     ),
     "tap_to_continue": "이어서 진행하기",
-    "timeout_tap_notice": "타임아웃으로 멈췄습니다. 이어서 진행하려면 누르세요.",
+    "timeout_tap_notice": "작업이 길어져서 한 번 끊었습니다. 이어서 진행하려면 누르세요.",
     "resume_expired": (
         "이미 처리됐거나 만료된 버튼입니다. 다시 요청해 주세요."
     ),
@@ -282,7 +303,13 @@ STRINGS = {
     "network_timeout": "네트워크 연결이 잠시 불안정했습니다. 잠시 후 다시 시도해 주세요.",
     # --- DGN-686: is_error result notices (LOCKED copy -- do not reword) ---
     "error_transient_retry": "일시적으로 처리에 실패했어요. 다시 시도할까요?",
-    "error_auth_relogin": "클로드에 다시 로그인 하신 후 알려주시면 복구하겠습니다.",
+    # DGN-1857: re-login guide (LOCKED copy, owner-confirmed dec-256 -- do not reword).
+    "error_auth_relogin": (
+        "Claude 로그인이 만료됐어요. 이 맥의 터미널에서 `claude auth login` 을 "
+        "실행한 뒤 /restart 를 보내 주세요. 원격(SSH)으로 접속했다면 그 전에 "
+        "`security unlock-keychain ~/Library/Keychains/login.keychain-db` 를 "
+        "먼저 실행해 주세요."
+    ),
     "error_generic_retry": "처리 실패했어요. 다시 시도할까요?",
     "error_retry_button": "다시 시도",
     "error_retrying": "다시 시도하고 있어요...",
@@ -376,9 +403,13 @@ STRINGS = {
     # DGN-1209: 기계라인 게이트 알림 -- 미등록 기계어형 줄(예: "SOME_TOKEN k=v")이
     # 형님 표면 레일에 도달해 통과됐을 때. **임시 문구 -- 형님 확인 대기(UX 게이트).**
     # 후보 문구는 티켓 보고서에 있다. {tokens} / {rail} 자리표시자 필수.
+    # DGN-1589/DGN-1591: 이 알림의 독자는 프레임워크 운영자다(오너/사용자 아님;
+    # 라우팅은 bot.py/machine_gate.py의 audience 축). 문구는 스스로 기계어
+    # 형상이 되지 않아야 한다 -- 대괄호/영문 대문자 시작 금지(재탐지 방지).
     "machine_line_alert": (
-        "[브릿지] 내부 기계어 줄이 등록 없이 화면에 도달했습니다: {tokens} "
-        "(레일: {rail}). 내용은 그대로 전달됐고, 이 알림은 토큰당 하루 1회만 옵니다."
+        "프레임워크 위생 알림: 등록되지 않은 기계어 형상 줄이 사용자 화면을 "
+        "그대로 통과했습니다: {tokens} (레일: {rail}). 내용 손실은 없으며, "
+        "이 알림은 토큰당 하루 1회만 옵니다."
     ),
     # 호출 지점이 레일을 선언하지 않은 경우(rail=unknown) 덧붙는 문장: 선언 누락
     # 자체가 작업 항목이다. 임시 문구(같은 게이트).
@@ -424,12 +455,18 @@ STRINGS = {
         "marker or the choice list inside a code block.\n"
         "- Do not mix a code block or a table with [[OPTIONS]] in one message; "
         "send code/tables first, then the choice message.\n"
+        "- The buttons attach to your reply message itself (no separate "
+        "prompt bubble); a reply that is ONLY the choice list gets a short "
+        "prompt line to carry them.\n"
         "- Labels are thin tokens; per-option descriptions belong in the body "
-        "lines. Each button renders as 'N. label' and that WHOLE line must fit "
+        "lines. A button shows 'N. label' only when the body still shows the "
+        "matching numbered list after the buttons consumed it; a single button, "
+        "or a list the buttons consumed, shows the bare label -- then refer to "
+        "options by label, not by number. The WHOLE button line must fit "
         "~31 character widths (CJK counts 1.5x), so keep labels within about "
-        "27 latin / 18 Korean characters. If ANY one overflows, EVERY button "
-        "in that keyboard degrades to a bare number token -- keep the full "
-        "option text readable in the body.\n"
+        "27 latin / 18 Korean characters. If ANY numbered one overflows, EVERY "
+        "button in that keyboard degrades to a bare number token and the body "
+        "keeps the numbered list -- keep the full option text readable there.\n"
         "- A marker that yields no labels from any source builds ZERO buttons "
         "(the body text is kept). Always provide labels via one of the three "
         "shapes.\n\n"
@@ -492,6 +529,8 @@ STRINGS = {
         "1. {allow_token} (Allow this external path access)\n"
         "2. {deny_token} (Deny)"
     ),
+    "outside_approval_allow_words": "allow|yes|y|\ud5c8\uc6a9|\uc774\ubc88\ub9cc \ud5c8\uc6a9|\uc608|\ub124",
+    "outside_approval_deny_words": "deny|no|n|\uac70\ubd80|\uc544\ub2c8\uc694|\uc544\ub2c8\uc624",
     "outside_path_deny_no_confirm": (
         "Access to a protected or out-of-root path was denied. This is a "
         "background turn with no user available to confirm it. Skip this path or "

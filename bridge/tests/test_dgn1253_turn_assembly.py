@@ -21,6 +21,9 @@ Regression matrix (hook blocks {0,1,2} x attachment {yes,no} x OPTIONS
 - ChatResponse.turn_assembled flag + the bot-side force_edit skip bypass.
 """
 
+import pytest
+
+from bridge import sdk_bridge as _locale_bridge
 import asyncio
 import unittest
 from pathlib import Path
@@ -38,6 +41,16 @@ from claude_agent_sdk import (
 from bridge.formatting import resolve_send_paths
 from bridge.options import extract_marker_labels
 from bridge.sdk_bridge import SdkBridge, _PendingRequest, _UserStreamState
+
+
+@pytest.fixture(autouse=True)
+def _en_instance(monkeypatch):
+    # These fixtures narrate in English: pin an en instance so the interim
+    # locale gate (sdk_bridge._interim_off_locale) stays out of the interim
+    # mechanics under test, whatever LOCALE the shell exports. The ko side
+    # is covered by test_interim_locale_gate.py.
+    monkeypatch.setattr(_locale_bridge.config, "locale", "en")
+
 
 
 def _text(t: str) -> TextBlock:

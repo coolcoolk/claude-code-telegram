@@ -83,6 +83,23 @@ class _BackstopHarness(unittest.IsolatedAsyncioTestCase):
 
 class TestBackstopFires(_BackstopHarness):
 
+    async def test_claimed_owner_with_empty_allowlist(self):
+        bot = _make_bot()
+        _write_marker(self.state_dir, 0, text="not a marker at all\n")
+        (self.data_dir / "owner.lock").write_text("42\n", encoding="ascii")
+        with patch.object(_bot.config, "allowed_user_ids", []):
+            await bot._restart_backstop_loop()
+        bot.application.bot.send_message.assert_awaited_once_with(
+            chat_id=42, text=messages.RESTART_BACKSTOP_NOTICE
+        )
+
+    async def test_no_owner_sends_nothing(self):
+        bot = _make_bot()
+        _write_marker(self.state_dir, 0, text="not a marker at all\n")
+        with patch.object(_bot.config, "allowed_user_ids", []):
+            await bot._restart_backstop_loop()
+        bot.application.bot.send_message.assert_not_awaited()
+
     async def test_dead_worker_marker_terminal_closed_with_owner_push(self):
         bot = _make_bot()
         # A pid that is certainly dead: fork a child and reap it.

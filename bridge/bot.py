@@ -7,13 +7,16 @@ blips (launchd owns crash-restart). Per-user serialized queue (max 3 in-flight,
 
 import asyncio
 import html
+import importlib.util
 import json
 import logging
 import os
 import re
 import signal
 import subprocess
+import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -38,11 +41,10 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.request import HTTPXRequest
 
 from bridge import btw as btw_module
 from bridge import ext
-from bridge import fastpath, heartbeat, messages, model_state
+from bridge import fastpath, heartbeat, live_model, messages, model_picker, model_state, owner_belt
 from bridge.i18n import skill_display_name
 from bridge.config import (
     AUTO_RESUME,
@@ -55,6 +57,7 @@ from bridge.config import (
     REPLY_LINK_ENABLED,
     REPLY_LINK_LATENCY_S,
     config,
+    log_claude_cli_resolution,
     notify_silent,
 )
 from bridge import ownership
@@ -84,8 +87,8 @@ from bridge.machine_gate import (
     RAIL_UNKNOWN,
     MachineLineAlertLedger,
     apply_machine_line_gate,
-    format_alert_text,
     set_machine_line_alert_sink,
+    strip_no_push_sentinel,
     today_key,
 )
 from bridge.health import PollingConflict, PollingRestart, polling_watchdog
@@ -97,6 +100,7 @@ from bridge.image_send import (
 )
 from bridge.options import (
     OPTIONS_MARKER,
+    body_lists_options,
     build_option_keyboard,
     extract_marker_labels,
     extract_options,
@@ -113,6 +117,7 @@ from bridge.permissions import (
     extract_protected_paths,
     outside_path_deny_message,
 )
+from bridge import notice_spool
 from bridge.sdk_bridge import ChatResponse, PROJECT_ROOT, TYPING_INTERVAL, sdk_bridge
 from bridge.session import session_manager
 from bridge.dashboard import DashboardSync
@@ -148,15 +153,59 @@ logger = logging.getLogger(__name__)
 #                 that is still satisfiable ("help 앞"/before help) and the
 #                 DGN-997/DGN-1050 ordering as landed on main. NOT re-run
 #                 past the owner -- flagged for confirmation.
+# First contact after /claim (rehearsal 2026-10-02): the claim no longer
+# answers with a fixed ownership line; it opens the agent's own first turn so
+# the very first bubble is the agent introducing itself. Model-facing turn
+# text, not owner copy: it states what happened and defers WHAT to say to the
+# agent's first-contact rules (persona onboarding block / onboarding-check.py)
+# -- no example sentences here by rule.
+# DGN-1842: the turn also restates the opener constraints the host's opener
+# Stop gate (DGN-1837) enforces, so the first draft passes and no blocked
+# draft is generated at all. Rules only, no wording.
+# DGN-1848: the identity is a personal agent with no owner possessive -- a
+# possessive identity plus the pronoun ban made the model invent a
+# substitute possessive (rehearsal 2026-10-04).
+FIRST_CONTACT_TURN = (
+    "[bridge:first-contact] The owner has just claimed this bot (/claim "
+    "succeeded) and is in the chat now. Nothing has been said yet: open the "
+    "conversation with your first-contact message, following your "
+    "first-contact rules. The opener is at most two short sentences; it "
+    "addresses the user with no second-person pronoun and no name, title or "
+    "address guessed for the user, and it asks no question. With no kit yet "
+    "(Primary focus still the placeholder) it says only that you are a "
+    "personal agent, newly born, plus a light invitation to say hello -- no "
+    "task, example, domain or capability. It names no owner at all: no "
+    "second-person possessive, and no substitute possessive or place word "
+    "in front of personal agent. Compose the wording "
+    "yourself in the instance language. Do not mention claiming, ownership, "
+    "codes or this note. Send it once; end with a plain reply (never "
+    "NO_PUSH)."
+)
+
+
+def first_contact_turn() -> str:
+    """The first-contact turn: the rules-only FIRST_CONTACT_TURN."""
+    return FIRST_CONTACT_TURN
+
+
+def machine_opener_text() -> str:
+    """No machine-sent opener in this build: the model-turn opener."""
+    return ""
+
+
+def record_machine_opener(text: str) -> bool:
+    return False
+
+
 COMMAND_MENU_SPEC = [
     ("new",      lambda: messages.CMD_DESC_NEW),
     ("stop",     lambda: messages.CMD_DESC_STOP),
-    ("btw",      lambda: messages.CMD_DESC_BTW),
     # DGN-1362: /usage ships. routines/claude-usage.sh sits at the instance
     # root on BOTH sides of the fork (OSS 2.0.1), so the row is public.
     ("usage",    lambda: messages.CMD_DESC_USAGE),
-    ("queue",    lambda: messages.CMD_DESC_QUEUE),
     ("model",    lambda: messages.CMD_DESC_MODEL),
+    ("btw",      lambda: messages.CMD_DESC_BTW),
+    ("queue",    lambda: messages.CMD_DESC_QUEUE),
     ("skills",   lambda: messages.CMD_DESC_SKILLS),
     ("resume",   lambda: messages.CMD_DESC_RESUME),
     # DGN-997: owner-only explicit restart command.
@@ -247,20 +296,22 @@ RESTART_LATCH_S = 120
 # keeps waiting while the worker is still alive (e.g. a long --verify).
 RESTART_BACKSTOP_INITIAL_S = 90
 RESTART_BACKSTOP_POLL_S = 60
+# DGN-1588/DGN-1591: session-inbox drops whose CONTENT starts with one of
+# these prefixes are self-record injections -- the turn they trigger is
+# quiet by default (output suppressed unless the model ends with the bare
+# PUSH sentinel; see sdk_bridge.inject_background_turn / _flush_proactive).
+# push.sh _record_outbound puts its prefix first. The legacy operator-alert
+# prefix remains quiet for compatibility; R2 removes its writer entirely.
+QUIET_INJECT_PREFIXES = ("[outbound-record]", "[operator-alert]")
 # DGN-376: auto link previews are OFF on every outbound text send by default.
 # A reply opts back in with a standalone "link_preview::" line (stripped before
 # sending), which restores Telegram's default preview for that reply's text.
 LINK_PREVIEW_OFF = LinkPreviewOptions(is_disabled=True)
 
-_MODEL_LABELS = {
-    "sonnet": "Claude Sonnet",
-    "opus": "Claude Opus",
-    "haiku": "Claude Haiku",
-    "fable": "Claude Fable",
-}
-
 # DGN-192: performance ordering for the /model picker -- strongest first.
-# Unknown names sort last (rank 99 in the sort key) alphabetically.
+# Unknown names sort last (rank 99 in the sort key) alphabetically. Its keys
+# are also the built-in short names; display names and versions come from the
+# model table (bridge/model_picker.py, DGN-1814 r3), never from the bridge.
 _MODEL_PERF_RANK = {"fable": 0, "opus": 1, "sonnet": 2, "haiku": 3}
 
 
@@ -276,17 +327,14 @@ def _model_whitelist() -> List[str]:
     return names or ["sonnet"]
 
 
-# Backwards-compatible list of (name, label) for the inline model picker.
-MODELS = [(n, _MODEL_LABELS.get(n, n)) for n in _model_whitelist()]
-
 # Hardcoded last-rung fallback when nothing else in the chain yields a model.
 DEFAULT_MODEL = "sonnet"
 
 
 def _known_models() -> List[str]:
     """Short names accepted for persistence/resolution: the env whitelist plus
-    the built-in labels (full 'claude-*' ids are accepted by the validator)."""
-    return list(dict.fromkeys([*_model_whitelist(), *_MODEL_LABELS.keys()]))
+    the built-in short names (full 'claude-*' ids are accepted by the validator)."""
+    return list(dict.fromkeys([*_model_whitelist(), *_MODEL_PERF_RANK.keys()]))
 
 
 def _fmt_error(e: Exception) -> str:
@@ -394,7 +442,10 @@ class TelegramBot:
         # the long-poll timeout, so every getUpdates would raise TimedOut and the
         # bot never finishes starting. The get_updates request needs a read_timeout
         # comfortably longer than the long-poll interval.
-        request = HTTPXRequest(
+        # DGN-1736 slice 0: every owner-bound send rides this transport, so it
+        # carries the observe-only owner belt (logs OWNER_BELT_HIT on a leaked
+        # directive line, never mutates the request).
+        request = owner_belt.OwnerGuardRequest(
             connection_pool_size=8,
             connect_timeout=5.0,
             read_timeout=10.0,
@@ -421,6 +472,8 @@ class TelegramBot:
         self.application.add_error_handler(self._error_handler)
 
     def run(self) -> None:
+        # DGN-1814: name the Claude CLI every launch site will use, once.
+        log_claude_cli_resolution()
         asyncio.run(self._run_async())
 
     async def _run_async(self) -> None:
@@ -728,9 +781,12 @@ class TelegramBot:
                 if not files:
                     continue
                 owner_ids = config.allowed_user_ids
-                if not owner_ids:
-                    continue  # claim mode, owner unknown yet
-                owner_id = owner_ids[0]
+                owner_id = (
+                    owner_ids[0] if owner_ids
+                    else ownership.read_owner_lock(config.bot_data_dir)
+                )
+                if owner_id is None:
+                    continue  # Unclaimed or locked out: no recipient.
                 if self._user_turn_active(owner_id):
                     continue  # defer: never race a live turn
                 path = files[0]
@@ -775,10 +831,22 @@ class TelegramBot:
                     owner_id,
                     self._proactive_push,
                 )
-                ok = await sdk_bridge.inject_background_turn(owner_id, text)
+                # DGN-1588/DGN-1591: self-record drops (outbound-record /
+                # operator-alert) inject QUIET -- the turn's output is
+                # suppressed unless the model ends it with the bare PUSH
+                # sentinel (see sdk_bridge._flush_proactive). Keyed on the
+                # content prefix (push.sh _record_outbound; the legacy
+                # operator-alert writer was removed in DGN-1591 R2).
+                quiet = text.startswith(QUIET_INJECT_PREFIXES)
+                ok = await sdk_bridge.inject_background_turn(
+                    owner_id, text, quiet=quiet
+                )
                 if ok:
                     path.unlink(missing_ok=True)
-                    logger.info("session-inbox injected: %s", path.name)
+                    logger.info(
+                        "session-inbox injected%s: %s",
+                        " (quiet)" if quiet else "", path.name,
+                    )
                 # not ok -> stream missing or busy; keep the file, retry next tick
             except asyncio.CancelledError:
                 raise
@@ -863,9 +931,13 @@ class TelegramBot:
                     return
                 try:
                     owner_ids = config.allowed_user_ids
-                    if owner_ids and self.application:
+                    owner_id = (
+                        owner_ids[0] if owner_ids
+                        else ownership.read_owner_lock(config.bot_data_dir)
+                    )
+                    if owner_id is not None and self.application:
                         await self.application.bot.send_message(
-                            chat_id=owner_ids[0],
+                            chat_id=owner_id,
                             text=messages.RESTART_BACKSTOP_NOTICE,
                         )
                     logger.warning(
@@ -1146,14 +1218,17 @@ class TelegramBot:
         markup = getattr(message, "reply_markup", None)
         keyboard = getattr(markup, "inline_keyboard", None)
         if not data or not keyboard:
-            return messages.STALE_CALLBACK_EXPIRED_NOLABEL
+            return messages.STALE_CALLBACK_EXPIRED_NOLABEL.format(
+                minutes=STALE_MESSAGE_SECONDS // 60)
         label = resolve_choice(data, keyboard)
         label = self._OPT_NUMBER_PREFIX_RE.sub("", label or "").strip()
         if not label or is_number_handle(label):
-            return messages.STALE_CALLBACK_EXPIRED_NOLABEL
+            return messages.STALE_CALLBACK_EXPIRED_NOLABEL.format(
+                minutes=STALE_MESSAGE_SECONDS // 60)
         if len(label) > self._STALE_ALERT_LABEL_MAX:
             label = label[: self._STALE_ALERT_LABEL_MAX - 1].rstrip() + "…"
-        return messages.STALE_CALLBACK_EXPIRED.format(choice=label)
+        return messages.STALE_CALLBACK_EXPIRED.format(
+            choice=label, minutes=STALE_MESSAGE_SECONDS // 60)
 
     async def _announce_stale_drop(self, update: Update, age: float) -> None:
         """Make a STALE-gate drop observable instead of silent.
@@ -1224,16 +1299,76 @@ class TelegramBot:
         message in claim mode ever reaches normal processing / the model.
 
         A correct '/claim <code>' text message makes the sender the owner and
-        gets the one success reply. Every other message (wrong code, /start,
-        random text, callbacks) is silently dropped with no reply.
+        opens the agent's first turn (_open_first_contact). Every other
+        message (wrong code, /start, random text, callbacks) is silently
+        dropped with no reply.
         """
         text = update.message.text if update.message else None
         if text and ownership.verify_and_claim(text, user_id, config.bot_data_dir):
-            try:
-                await update.message.reply_text(messages.CLAIM_SUCCESS)
-            except Exception as e:
-                logger.warning("claim success reply failed for user %s: %s", user_id, e)
+            # The claim code is consumed by verify_and_claim, so this branch
+            # runs at most once per instance -- the opener cannot repeat.
+            # Off the handler path: starting the stream spawns the CLI.
+            chat = update.effective_chat
+            chat_id = chat.id if chat is not None else user_id
+            # Strong reference: a bare create_task may be collected mid-run.
+            tasks = self.__dict__.setdefault("_first_contact_tasks", set())
+            task = asyncio.get_running_loop().create_task(
+                self._open_first_contact(user_id, chat_id, update.message)
+            )
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
         return False
+
+    async def _open_first_contact(self, user_id: int, chat_id: int, message) -> None:
+        """After a successful /claim, let the agent speak first.
+
+        Bootstraps the owner's stream (DGN-399 seam, same as the session
+        inbox) and injects first_contact_turn() once; the agent's reply rides
+        the proactive push, so the owner's first bubble is the agent's own
+        introduction instead of a system line. inject_background_turn
+        returning False on a live stream means the owner already sent a
+        message: that turn opens the conversation, so nothing else is sent.
+        Only a failure to start the turn at all falls back to the fixed
+        CLAIM_SUCCESS line (never both).
+
+        DGN-1849: a kit-pending main gets the fixed opener sent here
+        directly (machine_opener_text) and recorded on the first-contact
+        state -- no stream, no model turn. A failed send falls through to
+        the model-turn path above.
+        """
+        opener = machine_opener_text()
+        if opener:
+            try:
+                await message.reply_text(opener)
+                record_machine_opener(opener)
+                logger.info("first contact after claim: fixed opener sent")
+                return
+            except Exception as e:
+                logger.warning(
+                    "fixed opener send failed for user %s: %s", user_id, e
+                )
+        try:
+            session = await session_manager.get_session(user_id)
+            if not await sdk_bridge.ensure_owner_stream(
+                user_id, session.get("model"), chat_id, self._proactive_push
+            ):
+                raise RuntimeError("owner stream not started")
+            injected = await sdk_bridge.inject_background_turn(
+                user_id, first_contact_turn()
+            )
+            logger.info(
+                "first contact after claim: %s",
+                "opener injected" if injected else "owner spoke first, opener skipped",
+            )
+        except Exception as e:
+            logger.warning("first-contact opener failed for user %s: %s", user_id, e)
+            await self._claim_success_fallback(message, user_id)
+
+    async def _claim_success_fallback(self, message, user_id: int) -> None:
+        try:
+            await message.reply_text(messages.CLAIM_SUCCESS)
+        except Exception as e:
+            logger.warning("claim success reply failed for user %s: %s", user_id, e)
 
     # --- session helpers ---
 
@@ -1345,14 +1480,34 @@ class TelegramBot:
             session.pop("pending_outside_at", None)
             await session_manager.update_session(user_id, session)
             return False
-        normalized = text.strip().lower()
-        allow = ALLOW_OUTSIDE_ONCE_TOKEN.lower() in normalized or normalized in {
-            "1", "allow", "yes", "y"
-        }
-        deny = DENY_OUTSIDE_TOKEN.lower() in normalized or normalized in {
-            "2", "deny", "no", "n"
-        }
-        if allow:
+        def normalize(value: str) -> str:
+            return re.sub(r"[_\s-]+", "", value.strip().lower())
+
+        reply = text.strip()
+        # Only a bare option or a dotted label is numeric approval; ordinary
+        # prose such as "1 more thing" must leave the prompt pending.
+        option = re.match(r"^([12])(?:\.(?:\s+|$)|$)", reply)
+        number = option.group(1) if option else None
+        label = normalize(reply[option.end():] if option else reply)
+        normalized = normalize(reply)
+        allow = (
+            normalize(ALLOW_OUTSIDE_ONCE_TOKEN) in normalized
+            or number == "1"
+            or label in {
+                normalize(word)
+                for word in messages.OUTSIDE_APPROVAL_ALLOW_WORDS.split("|")
+            }
+        )
+        deny = (
+            normalize(DENY_OUTSIDE_TOKEN) in normalized
+            or number == "2"
+            or label in {
+                normalize(word)
+                for word in messages.OUTSIDE_APPROVAL_DENY_WORDS.split("|")
+            }
+        )
+        # A contradictory label/token must never override a denial.
+        if allow and not deny:
             session["outside_path_approved_once"] = True
             # Bind the grant to exactly the paths that were shown (F7).
             session["outside_path_approved_paths"] = list(pending)
@@ -1731,7 +1886,7 @@ class TelegramBot:
                             # Guard failure must never block the interrupt
                             # path -- fall through as "no live tasks".
                             logger.error(
-                                "DGN-1016 live-task probe failed for user %s: %s",
+                                "live-task probe failed for user %s: %s",
                                 user_id,
                                 e,
                             )
@@ -1744,7 +1899,7 @@ class TelegramBot:
                         if deferred_since is None:
                             self._interrupt_deferred_since[user_id] = now_mono
                         logger.info(
-                            "DGN-1016 auto-interrupt deferred for user %s: "
+                            "auto-interrupt deferred for user %s: "
                             "%d live background task(s); falling back to "
                             "coalescing merge on turn end (deferred %.0fs)",
                             user_id,
@@ -1756,7 +1911,7 @@ class TelegramBot:
                         return
                     if live_tasks > 0:
                         logger.warning(
-                            "DGN-1016 defer cap exceeded for user %s "
+                            "defer cap exceeded for user %s "
                             "(%.0fs >= %.0fs): auto-interrupting despite "
                             "%d live background task(s)",
                             user_id,
@@ -1779,7 +1934,7 @@ class TelegramBot:
                             )
                     except Exception as e:
                         logger.error(
-                            "DGN-911 auto-interrupt failed for user %s: %s -- "
+                            "auto-interrupt failed for user %s: %s -- "
                             "degrading to coalescing merge on turn end",
                             user_id,
                             e,
@@ -1798,7 +1953,7 @@ class TelegramBot:
             # _debounce_texts if the lock section itself failed) -- both are
             # drained by later turns, so log loudly but never drop.
             logger.error(
-                "DGN-911 debounce-expire failed for user %s: %s",
+                "debounce-expire failed for user %s: %s",
                 user_id,
                 e,
                 exc_info=True,
@@ -1820,7 +1975,7 @@ class TelegramBot:
                 )
             except Exception as e:
                 logger.error(
-                    "DGN-911 interrupt notice send failed for user %s: %s",
+                    "interrupt notice send failed for user %s: %s",
                     user_id,
                     e,
                 )
@@ -1829,23 +1984,37 @@ class TelegramBot:
             # NOTICE) -- that flag silences "your message caused an
             # interrupt" noise (owner decision 2026-08-17, predates the
             # live-task registry this reports on). This is a different,
-            # narrower fact: a background subagent is confirmed dead, which
-            # is exactly the silent-death gap DGN-1015 exists to close.
-            try:
-                chat = newest_update.effective_chat
-                chat_id = chat.id if chat else user_id
-                await self.application.bot.send_message(
-                    chat_id,
-                    messages.BG_SUBAGENT_KILLED_NOTICE.format(
-                        names=", ".join(killed_descs)
-                    ),
-                )
-            except Exception as e:
-                logger.error(
-                    "DGN-1015 bg-kill notice send failed for user %s: %s",
-                    user_id,
-                    e,
-                )
+            # narrower fact: background work is confirmed dead, which is
+            # exactly the silent-death gap DGN-1015 exists to close.
+            chat = getattr(newest_update, "effective_chat", None)
+            await self._send_bg_killed_notice(
+                chat.id if chat else user_id, user_id, killed_descs
+            )
+
+    async def _send_bg_killed_notice(self, chat_id, user_id, killed) -> None:
+        """DGN-1015 bg-kill notice, shared by every AUTOMATIC kill: the
+        defer-cap auto-interrupt and (DGN-1593 r3) the DGN-1499 timeout stop
+        signal. Never /stop (DGN-1593 B). No-op on an empty kill list.
+
+        DGN-1593: the count line always; one bullet per job with an
+        owner-facing name (r2 -- "" entries are counted, unnamed).
+        """
+        if not killed:
+            return
+        try:
+            lines = [messages.BG_TASK_KILLED_NOTICE.format(count=len(killed))]
+            lines += [
+                messages.BG_TASK_KILLED_ITEM.format(name=name)
+                for name in killed
+                if name
+            ]
+            await self.application.bot.send_message(chat_id, "\n".join(lines))
+        except Exception as e:
+            logger.error(
+                "bg-kill notice send failed for user %s: %s",
+                user_id,
+                e,
+            )
 
     async def _dispatch_text_turn(
         self, user_id: int, text: str, ts, update, *, failure_message=None
@@ -2150,7 +2319,7 @@ class TelegramBot:
         Called from inside a render (sync context) when an UNREGISTERED
         machine-shape line PASSED on a consumer/unknown rail. Dedup against
         the durable (rail, token, day) ledger plus an in-flight set, then
-        schedule the owner-chat notice on the running loop. Never raises
+        schedule ledger-only recording on the running loop. Never raises
         (the send this alert rides on must not fail because of the alert).
         """
         try:
@@ -2161,34 +2330,31 @@ class TelegramBot:
             ]
             if not fresh:
                 return
-            owner_ids = config.allowed_user_ids
-            if not owner_ids or self.application is None:
-                logger.warning(
-                    "machine-line gate: alert has no owner chat to reach "
-                    "(rail=%s tokens=%s) -- log only: %r",
-                    rail, ",".join(fresh), sample[:120],
-                )
-                return
             for t in fresh:
                 self._machine_alert_inflight.add((rail, t, day))
             loop = asyncio.get_running_loop()
             loop.create_task(
-                self._send_machine_line_alert(owner_ids[0], rail, fresh, day)
+                self._send_machine_line_alert(rail, fresh, day)
             )
         except Exception:  # noqa: BLE001 -- never let the alert break a send
             logger.exception("machine-line gate: alert scheduling failed")
 
+    # DGN-1779: no longer regioned. Since DGN-1756 this is log + ledger mark
+    # only (no steward routing), and the sink above calls it on every build --
+    # stripping it left the public bridge raising AttributeError per alert.
     async def _send_machine_line_alert(
-        self, chat_id: int, rail: str, tokens: List[str], day: str
+        self, rail: str, tokens: List[str], day: str
     ) -> None:
-        """Loud owner notice (no disable_notification); marker AFTER success."""
+        """Persist diagnostics in the alert ledger; never push to an owner chat."""
         try:
-            text = format_alert_text(rail, tokens)
-            await self.application.bot.send_message(chat_id, text)
+            logger.warning(
+                "machine-line gate: ledger only rail=%s tokens=%s",
+                rail, ",".join(tokens),
+            )
             self._machine_alert_ledger.mark(rail, tokens, day)
         except Exception as e:  # noqa: BLE001
             logger.error(
-                "machine-line gate: alert send failed for rail=%s tokens=%s: %s",
+                "machine-line gate: alert routing failed for rail=%s tokens=%s: %s",
                 rail, ",".join(tokens), e,
             )
         finally:
@@ -2213,7 +2379,7 @@ class TelegramBot:
         session["new_session"] = True
         await session_manager.update_session(user_id, session)
         self._runtime_active_sessions.discard(user_id)
-        await update.message.reply_text(messages.NEW_SESSION)
+        await self._reply_guaranteed(update, messages.NEW_SESSION)
 
     def _get_real_model(self, session: dict) -> str:
         # Resolution chain (DGN-162): explicit session override > persisted
@@ -2245,7 +2411,7 @@ class TelegramBot:
             # DGN-192: switching to the already-active model is a no-op --
             # never reset the session for a switch that changes nothing.
             if name == self._get_real_model(session):
-                label = _MODEL_LABELS.get(name, name)
+                label = model_picker.full_name(name, model_picker.chat_table())
                 await update.message.reply_text(
                     messages.MODEL_ALREADY_ACTIVE.format(label=label)
                 )
@@ -2257,27 +2423,31 @@ class TelegramBot:
             # DGN-162: a user-initiated switch becomes the new last-session model.
             model_state.persist_model(name, _known_models())
             self._runtime_active_sessions.discard(user_id)
-            label = _MODEL_LABELS.get(name, name)
-            await update.message.reply_text(
-                messages.MODEL_SWITCHED.format(label=label)
+            label = model_picker.full_name(name, model_picker.chat_table())
+            await self._reply_guaranteed(
+                update, messages.MODEL_SWITCHED.format(label=label)
             )
             return
-        current = self._get_real_model(session)
-        models = list(MODELS)
-        if current not in dict(models):
-            models.append((current, current))
-        # DGN-192: strongest model first (fable > opus > sonnet > haiku).
-        models.sort(key=lambda x: (_MODEL_PERF_RANK.get(x[0], 99), x[0]))
-        buttons = [
-            [InlineKeyboardButton(
-                f"{label} (current)" if name == current else label,
-                callback_data=f"model:{name}",
-            )]
-            for name, label in models
-        ]
-        await update.message.reply_text(
-            messages.MODEL_SELECT, reply_markup=InlineKeyboardMarkup(buttons)
+        # DGN-1814 r3: versioned family buttons, current one marked (i18n),
+        # "Now:" = the model that really answered; two-step (vendor first)
+        # once the table offers 2+ chat vendors. DGN-192 order kept.
+        text, buttons = model_picker.render(
+            self._get_real_model(session), _model_whitelist(),
+            self._live_model_id(), _MODEL_PERF_RANK,
         )
+        await update.message.reply_text(
+            text, reply_markup=self._picker_markup(buttons)
+        )
+
+    @staticmethod
+    def _picker_markup(buttons) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(label, callback_data=cb)] for label, cb in buttons
+        ])
+
+    @staticmethod
+    def _live_model_id() -> str:
+        return live_model.this_process_model(live_model.state_path(config.bot_data_dir))
 
     async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """DGN-581: ESC-parity stop. Soft interrupt first -- stop the in-flight
@@ -2312,16 +2482,12 @@ class TelegramBot:
                 # dispatches survive it, so a blanket claim either way would
                 # be false). The same STOP_INTERRUPTED copy is also reused by
                 # the DGN-911 auto-interrupt notice.
-                reply = messages.STOP_INTERRUPTED
-                # DGN-1015: when the live task registry (DGN-1016) confirms
-                # an actual kill, name it -- this is the fact-based notice
-                # that replaces the old standing generic warning.
-                killed_descs = sdk_bridge.pop_interrupt_killed(user_id)
-                if killed_descs:
-                    reply += "\n" + messages.BG_SUBAGENT_KILLED_NOTICE.format(
-                        names=", ".join(killed_descs)
-                    )
-                await update.message.reply_text(reply)
+                # DGN-1593 B: no kill notice here even when the registry
+                # confirms a kill -- the owner just ordered the stop, so it
+                # is not a silent death (DGN-1015's notice is for the
+                # automatic interrupt only). Drained so it cannot linger.
+                sdk_bridge.pop_interrupt_killed(user_id)
+                await self._reply_guaranteed(update, messages.STOP_INTERRUPTED)
                 return
         except Exception as e:
             logger.error(
@@ -2399,7 +2565,7 @@ class TelegramBot:
             reply = messages.STOP_PAUSED
         else:
             reply = messages.STOP_NOTHING
-        await update.message.reply_text(reply)
+        await self._reply_guaranteed(update, reply)
 
     async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._check_access(update):
@@ -2481,6 +2647,7 @@ class TelegramBot:
                 await update.message.reply_text(body, parse_mode="HTML")
             except Exception:
                 await update.message.reply_text(html_to_plain_text(body))
+
 
 
     async def _cmd_authsync(
@@ -2619,7 +2786,7 @@ class TelegramBot:
         # synchronously, before this handler returns, so it lands well
         # inside the SIGTERM window. Distinct from the completion push
         # self_restart.sh sends after the worker finishes -- no duplicate.
-        await update.message.reply_text(messages.RESTART_ACK)
+        await self._reply_guaranteed(update, messages.RESTART_ACK)
 
     async def _cmd_btw(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -3139,14 +3306,27 @@ class TelegramBot:
                     bot=app.bot,
                     proactive_push=self._proactive_push,
                 )
-                resume_caller = self._make_resume_caller(
-                    user_id=user_id, chat_id=chat.id, app=app
-                )
-                response = await self._finish_turn(
+
+                async def resume_caller(cont: str) -> ChatResponse:
+                    sess = await session_manager.get_session(user_id)
+                    return await sdk_bridge.process_message(
+                        user_message=cont,
+                        user_id=user_id,
+                        chat_id=chat.id,
+                        session_id=self._effective_session_id(user_id, sess),
+                        model=sess.get("model"),
+                        permission_callback=self._permission_callback,
+                        typing_callback=lambda: message.chat.send_action(action="typing"),
+                        bot=app.bot,
+                        proactive_push=self._proactive_push,
+                    )
+
+                response = await self._finish_turn_with_auto_resume(
                     user_id=user_id, chat_id=chat.id, response=response, resume_caller=resume_caller
                 )
                 if response is None:
                     return
+                await self._save_session_id(user_id, response)
                 await self._reply_smart(
                     message,
                     response.content,
@@ -3155,6 +3335,7 @@ class TelegramBot:
                     draft_message_ids=response.draft_message_ids,
                     classifier_injected=getattr(response, "options_classifier_injected", False),
                     assembled=getattr(response, "turn_assembled", False),
+                    notice_meta=self._notice_meta(response),
                 )
             except Exception as e:
                 logger.error("Skill execution failed: %s", e, exc_info=True)
@@ -3800,14 +3981,34 @@ class TelegramBot:
                 typing_callback=lambda: message.chat.send_action(action="typing"),
                 bot=app.bot,
                 proactive_push=self._proactive_push,
+                inbound={
+                    "chat_id": chat.id,
+                    "thread_id": getattr(message, "message_thread_id", None),
+                    "message_id": getattr(message, "message_id", None),
+                    "source": "message",
+                },
             )
 
-            resume_caller = self._make_resume_caller(user_id=user_id, chat_id=chat.id, app=app)
-            response = await self._finish_turn(
+            async def resume_caller(cont: str) -> ChatResponse:
+                sess = await session_manager.get_session(user_id)
+                return await sdk_bridge.process_message(
+                    user_message=cont,
+                    user_id=user_id,
+                    chat_id=chat.id,
+                    session_id=self._effective_session_id(user_id, sess),
+                    model=sess.get("model"),
+                    permission_callback=self._permission_callback,
+                    typing_callback=lambda: message.chat.send_action(action="typing"),
+                    bot=app.bot,
+                    proactive_push=self._proactive_push,
+                )
+
+            response = await self._finish_turn_with_auto_resume(
                 user_id=user_id, chat_id=chat.id, response=response, resume_caller=resume_caller
             )
             if response is None:
                 return
+            await self._save_session_id(user_id, response)
             # DGN-686 MAJOR-1: a transient is_error result auto-retries ONCE
             # here in the caller context (never inside the reader loop). Only
             # if the single retry also fails do we surface the notice + button.
@@ -3835,6 +4036,7 @@ class TelegramBot:
                 draft_message_ids=response.draft_message_ids,
                 classifier_injected=getattr(response, "options_classifier_injected", False),
                 assembled=getattr(response, "turn_assembled", False),
+                notice_meta=self._notice_meta(response),
             )
         except asyncio.CancelledError:
             raise
@@ -3867,19 +4069,30 @@ class TelegramBot:
             logger.error("resume sid fallback failed for user %s: %s", user_id, e)
             return None
 
-    async def _send_guaranteed(
-        self, chat_id: int, text: str, *, reply_markup=None, retries: int = 3
+    async def _retry_send(
+        self, send, *, chat_id, text: str, retries: int, raise_on_failure: bool = False
     ) -> bool:
-        """B3: at timeout the Telegram HTTP path can be transiently down, and a single
-        unguarded send gets swallowed -> total silence. Retry with backoff so at least
-        one user-facing message lands; log loudly (never swallow) on final failure."""
-        app = self.application
+        """DGN-1557 shared retry-with-backoff core: attempt `send()` up to
+        `retries` times (1s -> 2s backoff), log loudly (never swallow silently)
+        on final failure. `send` closes over whichever transport a caller has
+        on hand (app.bot.send_message for a bare chat_id, update.message.
+        reply_text for a command ack) -- one retry loop, two send shapes.
+
+        raise_on_failure=True re-raises the last attempt's exception instead
+        of returning False: used by _reply_guaranteed so a genuinely dead
+        channel still escapes to PTB's own dispatcher and the existing
+        _error_handler turn-death notice -- the same fallback a bare
+        reply_text already had, not a new one. _send_guaranteed's callers
+        (mid-stream notices) keep the swallow-and-return-False default.
+        """
         delay = 1.0
+        last_exc: Optional[Exception] = None
         for i in range(retries):
             try:
-                await app.bot.send_message(chat_id, text, reply_markup=reply_markup)
+                await send()
                 return True
             except Exception as e:
+                last_exc = e
                 logger.warning(
                     "guaranteed send attempt %d/%d failed for chat %s: %s",
                     i + 1, retries, chat_id, e,
@@ -3891,12 +4104,56 @@ class TelegramBot:
             "guaranteed send FAILED after %d attempts for chat %s (text head: %r)",
             retries, chat_id, text[:60],
         )
+        if raise_on_failure and last_exc is not None:
+            raise last_exc
         return False
+
+    async def _send_guaranteed(
+        self, chat_id: int, text: str, *, reply_markup=None, retries: int = 3
+    ) -> bool:
+        """B3: at timeout the Telegram HTTP path can be transiently down, and a single
+        unguarded send gets swallowed -> total silence. Retry with backoff so at least
+        one user-facing message lands; log loudly (never swallow) on final failure."""
+        app = self.application
+        return await self._retry_send(
+            lambda: app.bot.send_message(chat_id, text, reply_markup=reply_markup),
+            chat_id=chat_id, text=text, retries=retries,
+        )
+
+    async def _reply_guaranteed(
+        self, update: Update, text: str, *, reply_markup=None, retries: int = 3
+    ) -> None:
+        """DGN-1557: command acks that follow a REAL committed side effect
+        (session reset, model switch, interrupt/teardown, restart launch,
+        usage-retry job launch) travel the same flaky channel a plain
+        reply_text can silently lose -- and unlike a fresh notice, the state
+        change already happened, so losing the ack is a correctness gap, not
+        just a UX one. Retries a transient failure silently. If the channel
+        is genuinely dead past all retries, raises the last exception so
+        PTB's normal dispatch takes over: the existing _error_handler sends
+        its one TURN_FAILED notice exactly as it always has -- no new
+        "committed but unacked" copy, no witness bookkeeping (owner
+        explicitly rejected both). If that notice also fails, the SAME
+        channel just failed twice in a row, which is the expected shape of a
+        truly dead transport, not a new failure mode to design around."""
+        message = update.message
+        chat = getattr(update, "effective_chat", None)
+        chat_id = chat.id if chat else getattr(message, "chat_id", None)
+        kwargs = {"reply_markup": reply_markup} if reply_markup is not None else {}
+        await self._retry_send(
+            lambda: message.reply_text(text, **kwargs),
+            chat_id=chat_id, text=text, retries=retries, raise_on_failure=True,
+        )
 
     async def _auto_resume_loop(self, *, user_id, chat_id, response, resume_caller):
         app = self.application
         attempt = 0
         notified = False
+        # DGN-1593 r3: a timeout stop signal kills background jobs like an
+        # auto-interrupt; tell the owner which, before STILL_WORKING.
+        await self._send_bg_killed_notice(
+            chat_id, user_id, getattr(response, "killed_jobs", None)
+        )
         while (
             getattr(response, "timed_out", False)
             and AUTO_RESUME
@@ -3904,6 +4161,11 @@ class TelegramBot:
         ):
             resume_sid = await self._resolve_resume_sid(user_id, response)
             if not resume_sid:
+                logger.warning(
+                    "Auto-resume for user %s: no resume sid available on "
+                    "attempt %d -- ending resume loop without dispatching",
+                    user_id, attempt,
+                )
                 break
             attempt += 1
             if not notified:
@@ -3919,6 +4181,33 @@ class TelegramBot:
             except Exception:
                 pass
             response = await resume_caller(messages.RESUME_CONTINUATION_PROMPT)
+            await self._send_bg_killed_notice(
+                chat_id, user_id, getattr(response, "killed_jobs", None)
+            )
+        return response
+
+    async def _finish_turn_with_auto_resume(
+        self, *, user_id: int, chat_id: int, response: ChatResponse, resume_caller
+    ) -> Optional[ChatResponse]:
+        """DGN-1523: the ONE gate every process_message caller must pass
+        through before touching response.content.
+
+        Runs _auto_resume_loop; if the settled response still carries
+        timed_out=True (auto-resume off, exhausted, or no resume sid), sends
+        the tap-to-continue notice (the ONLY place that both instructs a tap
+        AND creates the button) and returns None -- the caller must stop.
+        Otherwise returns the settled response for the caller's normal reply
+        path. Skipping this call (as three call sites did before DGN-1523)
+        means a turn that soft-stops on timeout never gets a resume attempt
+        AND leaks response.content -- messages.TIMEOUT_PAUSED, a fact-only
+        string with no button behind it -- straight to the user.
+        """
+        response = await self._auto_resume_loop(
+            user_id=user_id, chat_id=chat_id, response=response, resume_caller=resume_caller
+        )
+        if getattr(response, "timed_out", False):
+            await self._send_resume_notice(chat_id=chat_id, user_id=user_id, response=response)
+            return None
         return response
 
     async def _send_resume_notice(self, *, chat_id: int, user_id: int, response: ChatResponse) -> None:
@@ -3934,57 +4223,6 @@ class TelegramBot:
             [[InlineKeyboardButton(messages.TAP_TO_CONTINUE, callback_data=f"resume:{token}")]]
         )
         await self._send_guaranteed(chat_id, messages.TIMEOUT_TAP_NOTICE, reply_markup=kb)
-
-    def _make_resume_caller(
-        self, *, user_id: int, chat_id: int, app
-    ) -> Callable[[str], Awaitable[ChatResponse]]:
-        """Build the continuation closure _auto_resume_loop drives.
-
-        Shared by every SDK-turn call site so a resume attempt always looks
-        the same regardless of which turn kind timed out.
-        """
-
-        async def resume_caller(cont: str) -> ChatResponse:
-            sess = await session_manager.get_session(user_id)
-            return await sdk_bridge.process_message(
-                user_message=cont,
-                user_id=user_id,
-                chat_id=chat_id,
-                session_id=self._effective_session_id(user_id, sess),
-                model=sess.get("model"),
-                permission_callback=self._permission_callback,
-                typing_callback=lambda: app.bot.send_chat_action(chat_id, action="typing"),
-                bot=app.bot,
-                proactive_push=self._proactive_push,
-            )
-
-        return resume_caller
-
-    async def _finish_turn(
-        self,
-        *,
-        user_id: int,
-        chat_id: int,
-        response: ChatResponse,
-        resume_caller: Callable[[str], Awaitable[ChatResponse]],
-    ) -> Optional[ChatResponse]:
-        """DGN-1554: the ONE seam every SDK-turn call site routes its response
-        through. Runs auto-resume while the turn is timed out; if it comes
-        back still timed out (AUTO_RESUME off, or resumes exhausted), sends
-        the tap-to-continue notice and returns None -- the caller must stop.
-        Otherwise persists the session id and hands back the live response.
-
-        A sixth call site that calls this instead of hand-checking
-        `timed_out` cannot forget the timeout branch, because it never sees it.
-        """
-        response = await self._auto_resume_loop(
-            user_id=user_id, chat_id=chat_id, response=response, resume_caller=resume_caller
-        )
-        if getattr(response, "timed_out", False):
-            await self._send_resume_notice(chat_id=chat_id, user_id=user_id, response=response)
-            return None
-        await self._save_session_id(user_id, response)
-        return response
 
     async def _send_retry_notice(
         self, *, chat_id: int, user_id: int, notice: str, user_message: str
@@ -4032,6 +4270,124 @@ class TelegramBot:
             return trigger_id
         return None
 
+    @staticmethod
+    def _notice_meta(response) -> Optional[Dict[str, Any]]:
+        """DGN-1586: typed notice-carrier metadata off a ChatResponse. The
+        promotion decision keys off THIS, never off string matching against
+        the body (an accidental identical model string is not a receipt)."""
+        nid = getattr(response, "notice_id", None)
+        if not nid:
+            return None
+        return {
+            "id": nid,
+            "attempt": getattr(response, "notice_attempt", None),
+            "kind": getattr(response, "notice_kind", None),
+            "version": getattr(response, "notice_version", None),
+            "text": getattr(response, "notice_text", None),
+        }
+
+    async def _promote_notice_delivered(
+        self,
+        meta: Dict[str, Any],
+        chat_id: int,
+        message_id: int,
+        method: str,
+        body_text: str,
+        related_ids: Optional[List[int]] = None,
+    ) -> None:
+        """DGN-1586 receipt processor (spec 3.6): record the REAL carrier
+        receipt on the spool AND the outbound ledger. Both writes are
+        fail-soft in opposite directions: a promotion failure after a real
+        send still leaves the ledger row as success evidence (duplicate risk
+        stays bounded by the 3-attempt cap), and a ledger failure after a
+        promoted receipt keeps delivered (record repair is operator-owned,
+        spec 5)."""
+        try:
+            await asyncio.to_thread(
+                notice_spool.promote_delivered,
+                PROJECT_ROOT,
+                meta["id"],
+                chat_id,
+                message_id,
+                method,
+                meta.get("attempt"),
+                related_ids,
+            )
+        except Exception:
+            logger.exception(
+                "notice %s promotion failed AFTER successful send "
+                "(chat %s msg %s) -- ledger row below is the evidence",
+                meta["id"], chat_id, message_id,
+            )
+        try:
+            await asyncio.to_thread(
+                notice_spool.append_ledger,
+                PROJECT_ROOT,
+                {
+                    "ts": datetime.now(timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"),
+                    "chat_id": str(chat_id),
+                    "body": body_text,
+                    "audience": "owner",
+                    "notice_id": meta["id"],
+                    "kind": meta.get("kind"),
+                    "version": meta.get("version"),
+                    "message_id": message_id,
+                    "method": method,
+                    "attempt": meta.get("attempt"),
+                },
+            )
+        except Exception:
+            logger.exception("notice ledger append failed")
+
+    async def _settle_notice_receipt(
+        self,
+        meta: Dict[str, Any],
+        chat_id: int,
+        body_receipts: List[Tuple[Any, str]],
+        edited_message_id: Optional[int],
+        display: str,
+    ) -> None:
+        """DGN-1586: pick the carrier receipt for this turn's notice.
+
+        The notice rides the TAIL of the body, so the carrier is the LAST
+        successfully sent body part (all earlier parts succeeded too or the
+        send raised before reaching here -- a first-segment success alone
+        can never promote). The streamed in-place edit path passes the
+        edited draft id: force_edit guarantees the edit request actually
+        carried the full notice payload (a no-call `True` cannot reach
+        here), and Telegram's `message is not modified` on that exact
+        payload is accepted as same-content confirmation (spec 3.6). No
+        carrier at all -> pending is preserved for the next owner turn."""
+        if edited_message_id is not None:
+            converted = balance_telegram_html(markdown_to_telegram_html(display))
+            await self._promote_notice_delivered(
+                meta, chat_id, edited_message_id, "edit", converted
+            )
+            return
+        if body_receipts:
+            carrier, sent_text = body_receipts[-1]
+            mid = getattr(carrier, "message_id", None)
+            if mid is None:
+                logger.error(
+                    "notice %s carrier has no message_id -- not "
+                    "promoted (pending preserved)", meta["id"],
+                )
+                return
+            related = [
+                m for m, _ in body_receipts
+                if getattr(m, "message_id", None) is not None
+            ]
+            await self._promote_notice_delivered(
+                meta, chat_id, mid, "send", sent_text,
+                related_ids=[m.message_id for m in related],
+            )
+            return
+        logger.warning(
+            "notice %s: no body carrier went out this turn -- "
+            "attempt consumed, pending preserved", meta["id"],
+        )
+
     async def _reply_smart(
         self,
         message,
@@ -4041,9 +4397,14 @@ class TelegramBot:
         draft_message_ids: Optional[List[int]] = None,
         classifier_injected: bool = False,
         assembled: bool = False,
+        notice_meta: Optional[Dict[str, Any]] = None,
     ) -> None:
+        # DGN-1732: shared delivery seat -- the NO_PUSH sentinel never reaches
+        # the owner (the streamed-edit path skips the render-time gate).
+        content, _ = strip_no_push_sentinel(content)
         display, has_marker = strip_options_marker(content)
         display, _ = strip_send_markers(display)
+        prose_normalized = False
         # DGN-376: link previews default OFF; a link_preview:: line opts in.
         display, preview = strip_link_preview_marker(display)
         # DGN-159: last-mile scrub of leaked tool-call markup on the non-streamed
@@ -4073,11 +4434,15 @@ class TelegramBot:
         # the button appendix can fall back to loud when it is the turn's only
         # notification (turn-level 1-loud guarantee, M1 fix).
         body_was_loud = False
+        # DGN-1586: carrier receipts for a notice-bearing turn (spec 3.6).
+        body_receipts: List[Tuple[Any, str]] = []
+        edited_message_id: Optional[int] = None
         if not streamed:
             # DGN-665: a list-only body strips to whitespace -- skip the empty
             # bubble; the SELECT_PROMPT + buttons message carries the turn.
             if display.strip():
-                await self._send_text_body(message, display, preview, reply_to=reply_to)
+                body_receipts = await self._send_text_body(
+                    message, display, preview, reply_to=reply_to)
                 body_was_loud = True
         elif has_code and (force_options or draft_message_ids):
             # DGN-085 (comment refreshed in DGN-376 v1.1, finding m4): when code
@@ -4093,7 +4458,8 @@ class TelegramBot:
                     await bot.delete_message(chat_id, mid)
                 except Exception as e:
                     logger.warning("Failed to delete streamed draft %s: %s", mid, e)
-            await self._send_text_body(message, display, preview, reply_to=reply_to)
+            body_receipts = await self._send_text_body(
+                message, display, preview, reply_to=reply_to)
             body_was_loud = True
         elif consumed_options and draft_message_ids:
             # DGN-665: the terminal AssistantMessage live-streams into drafts, so
@@ -4109,7 +4475,8 @@ class TelegramBot:
                 except Exception as e:
                     logger.warning("Failed to delete streamed draft %s: %s", mid, e)
             if display.strip():
-                await self._send_text_body(message, display, preview, reply_to=reply_to)
+                body_receipts = await self._send_text_body(
+                    message, display, preview, reply_to=reply_to)
                 body_was_loud = True
             else:
                 # Streamed draft was the loud carrier before the turn finalized;
@@ -4122,25 +4489,66 @@ class TelegramBot:
             # bubble reply or edit failure): delete the drafts and re-send
             # through the converting body path so the message is never lost.
             # DGN-555: a reply link cannot ride an in-place edit, so when the
-            # link policy fires the edit is skipped and the same delete +
-            # re-send fallback delivers the body as a fresh, linked message.
+            # link policy fires on a RICH final (DGN-1720) the edit is skipped
+            # and the same delete + re-send fallback delivers the body as a
+            # fresh, linked message.
+            # DGN-1586: a notice-bearing turn forces the REAL edit -- the
+            # live draft streamed WITHOUT the finalize-appended notice, so
+            # the no-op skip's "draft already correct" assumption is false
+            # and its no-call True is not delivery evidence (spec 3.6).
+            # DGN-1720 (owner 2026-09-26): the reply-link swap is reserved for
+            # a RICH final. A plain final (nothing the plain draft cannot
+            # already show -- see _streamed_final_rich_reasons) is edited in
+            # place even when the link policy fires: no fade-out + re-send,
+            # the reply link is forgone. An edit failure still falls through
+            # to the linked delete + re-send below, so no text is lost.
             bot = message.get_bot()
             chat_id = message.chat.id
-            if reply_to is not None or not await self._edit_streamed_prose_html(
-                bot, chat_id, display, preview, draft_message_ids,
-                force_edit=assembled,
-            ):
+            edited = False
+            rich = self._streamed_final_rich_reasons(
+                content, display, preview, force_options, notice_meta,
+                draft_message_ids,
+            )
+            if reply_to is None or not rich:
+                edited = await self._edit_streamed_prose_html(
+                    bot, chat_id, display, preview, draft_message_ids,
+                    force_edit=(assembled or notice_meta is not None
+                                or prose_normalized),
+                )
+            if edited:
+                edited_message_id = draft_message_ids[0]
+                if reply_to is not None:
+                    logger.info(
+                        "plain final edited in place (draft %s); "
+                        "reply link to %s skipped",
+                        draft_message_ids[0], reply_to,
+                    )
+            else:
+                if reply_to is not None and rich:
+                    logger.info(
+                        "rich final (%s): draft swap with reply link",
+                        ",".join(rich),
+                    )
                 for mid in draft_message_ids:
                     try:
                         await bot.delete_message(chat_id, mid)
                     except Exception as e:
                         logger.warning("Failed to delete streamed draft %s: %s", mid, e)
-                await self._send_text_body(message, display, preview, reply_to=reply_to)
+                body_receipts = await self._send_text_body(
+                    message, display, preview, reply_to=reply_to)
             # In-place edit or re-send: draft already notified at creation.
             body_was_loud = True
+        if notice_meta is not None:
+            # Promote BEFORE the artifact tail: buttons/files are not the
+            # notice carrier and their failures must not lose the receipt.
+            await self._settle_notice_receipt(
+                notice_meta, message.chat.id, body_receipts,
+                edited_message_id, display,
+            )
         await self._send_content_artifacts(
             message, content, force_options, options=consumed_options,
-            body_was_loud=body_was_loud,
+            body_was_loud=body_was_loud, body=display,
+            carrier_id=self._body_carrier_id(body_receipts, edited_message_id),
         )
 
     async def _send_text_body(
@@ -4149,7 +4557,13 @@ class TelegramBot:
         content: str,
         preview: bool = False,
         reply_to: Optional[int] = None,
-    ) -> None:
+    ) -> List[Tuple[Any, str]]:
+        # DGN-1586: returns the per-part send receipts [(telegram message,
+        # actually-transmitted text)] so a notice-carrying turn can promote
+        # delivered from the REAL carrier (the last body part). A mid-body
+        # send failure raises out of here, so a partial send never returns
+        # a receipt list that looks complete.
+        receipts: List[Tuple[Any, str]] = []
         # DGN-376: preview=True (link_preview:: opt-in) restores Telegram's
         # default preview; otherwise previews are suppressed.
         lp = None if preview else LINK_PREVIEW_OFF
@@ -4165,34 +4579,44 @@ class TelegramBot:
         for rendered in self._render_prose_html_segments(content, rail=RAIL_MODEL):
             if link_pending:
                 link_pending = False
-                if await self._try_send_linked(message, rendered, lp, reply_to):
+                linked_ok, linked = await self._try_send_linked(
+                    message, rendered, lp, reply_to)
+                if linked_ok:
+                    receipts.append((linked, rendered))
                     continue
                 # DGN-555: linked send rejected -> degrade to the plain
                 # (unlinked) sends below; a reply link never fails a turn.
             try:
-                await message.reply_text(
+                sent = await message.reply_text(
                     rendered,
                     parse_mode="HTML",
                     link_preview_options=lp,
                 )
+                receipts.append((sent, rendered))
             except Exception:
                 # DGN-376 v1.1 (m1) + DGN-891: tag-STRIPPED readable
                 # fallback (never raw markdown source, never leaked
                 # tags); keeps the preview suppression of the send it
-                # replaces.
-                await message.reply_text(
-                    html_to_plain_text(rendered), link_preview_options=lp
-                )
+                # replaces. DGN-1586: the receipt records the fallback
+                # text -- the ledger body is what actually went out.
+                plain = html_to_plain_text(rendered)
+                sent = await message.reply_text(plain, link_preview_options=lp)
+                receipts.append((sent, plain))
+        return receipts
 
-    async def _try_send_linked(self, message, rendered: str, lp, reply_to: int) -> bool:
+    async def _try_send_linked(self, message, rendered: str, lp, reply_to: int):
         """DGN-555: attempt the reply-linked send of the first body part.
 
         allow_sending_without_reply lets Telegram itself degrade to a plain
         send when the trigger message is gone; any other rejection returns
-        False so the caller re-sends unlinked. Never raises.
+        (False, None) so the caller re-sends unlinked. Never raises.
+        Returns (True, sent message) on success -- the success FLAG is
+        separate from the message object so the send-succeeded judgment
+        never depends on what the transport returned (DGN-1586 receipt
+        source; a receipt-less success just skips promotion).
         """
         try:
-            await message.reply_text(
+            sent = await message.reply_text(
                 rendered,
                 parse_mode="HTML",
                 link_preview_options=lp,
@@ -4200,10 +4624,68 @@ class TelegramBot:
                     message_id=reply_to, allow_sending_without_reply=True
                 ),
             )
-            return True
+            return True, sent
         except Exception as e:
             logger.warning("Reply-linked send failed (mid=%s): %s", reply_to, e)
-            return False
+            return False, None
+
+    _RICH_TAG_REASONS = {
+        "blockquote": "blockquote",
+        "code": "code",
+        "pre": "code",
+    }
+
+    @classmethod
+    def _streamed_final_rich_reasons(
+        cls,
+        content: str,
+        display: str,
+        preview: bool,
+        force_options: bool,
+        notice_meta: Optional[Dict[str, Any]],
+        draft_message_ids: Optional[List[int]],
+    ) -> List[str]:
+        """DGN-1720: why a streamed final is RICH (empty list == PLAIN).
+
+        PLAIN means the plain-text draft already shows everything the final
+        carries, so finalizing is an in-place edit of that draft (no fade-out
+        + re-send). Anything listed here is something the live draft cannot
+        show; a rich final keeps today's finalize (swap where it swapped).
+        Reasons:
+          buttons      -- [[OPTIONS]] keyboard (authored or classifier)
+          send_file    -- send_file:: marker (file follows the body)
+          code_block   -- fenced ``` code (DGN-085 HTML segment re-send)
+          blockquote   -- blockquote / expandable fold in the HTML render
+          code         -- inline <code>/<pre> in the HTML render
+          formatting   -- any other HTML tag (bold, italic, link, heading..)
+          link_preview -- link_preview:: opt-in (draft streams previews off)
+          notice       -- DGN-1586 notice-bearing turn (receipt contract)
+          multi_bubble -- more than one draft or the final splits (overflow)
+        Pure; never raises into the finalize path.
+        """
+        reasons: List[str] = []
+        try:
+            if force_options:
+                reasons.append("buttons")
+            if strip_send_markers(content)[1]:
+                reasons.append("send_file")
+            if "```" in display:
+                reasons.append("code_block")
+            converted = markdown_to_telegram_html(display)
+            for tag in sorted(set(re.findall(r"<([a-zA-Z][a-zA-Z0-9-]*)", converted))):
+                reason = cls._RICH_TAG_REASONS.get(tag.lower(), "formatting")
+                if reason not in reasons:
+                    reasons.append(reason)
+            if preview:
+                reasons.append("link_preview")
+            if notice_meta is not None:
+                reasons.append("notice")
+            if len(draft_message_ids or []) != 1 or len(split_text(display)) != 1:
+                reasons.append("multi_bubble")
+        except Exception as e:
+            logger.warning("rich classification failed: %s", e)
+            reasons.append("unclassified")
+        return reasons
 
     async def _edit_streamed_prose_html(
         self,
@@ -4302,6 +4784,83 @@ class TelegramBot:
         else:
             await self.application.bot.send_message(target, text, **kwargs)
 
+    @staticmethod
+    async def _reply_selected(message, text: str) -> None:
+        """DGN-1813: "Selected: <label>" as a silent reply to the tapped bubble.
+
+        Used when the confirmation cannot be appended to the bubble itself
+        (Telegram length limit, or the edit was rejected). The owner just
+        tapped, so it never alerts. Never raises: the tap still dispatches.
+        """
+        try:
+            await message.reply_text(
+                text,
+                disable_notification=True,
+                reply_parameters=ReplyParameters(
+                    message_id=message.message_id,
+                    allow_sending_without_reply=True,
+                ),
+            )
+        except Exception as e:
+            logger.warning("selected-reply send failed: %s", e)
+
+    async def _strip_keyboard_and_confirm(
+        self, query, message, visible_confirmation: str
+    ) -> None:
+        """DGN-1876: drop the keyboard, then confirm in a silent reply.
+
+        Never raises: a keyboard-strip rejection ("not modified" when the
+        keyboard is already gone, or any other API error) must not abort the
+        tap -- the choice still dispatches and the owner never sees a generic
+        processing-error message for it.
+        """
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception as e:
+            logger.info("keyboard strip skipped: %s", e)
+        await self._reply_selected(message, visible_confirmation)
+
+    async def _attach_keyboard(self, target, message_id: int, kb) -> bool:
+        """DGN-1813: put the [[OPTIONS]] keyboard on an already-sent body message.
+
+        A markup-only edit: the body text and its formatting are untouched
+        and no second notification fires (the body already alerted). Returns
+        False on any failure so the caller falls back to the SELECT_PROMPT
+        line -- the buttons are never lost.
+        """
+        chat_id = self._artifact_chat_id(target)
+        try:
+            bot = (
+                target.get_bot() if hasattr(target, "get_bot")
+                else self.application.bot
+            )
+            await bot.edit_message_reply_markup(
+                chat_id=chat_id, message_id=message_id, reply_markup=kb
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                "keyboard attach to body message %s failed (%s); "
+                "falling back to the prompt line", message_id, e,
+            )
+            return False
+
+    @staticmethod
+    def _body_carrier_id(
+        receipts: List[Tuple[Any, str]], edited_message_id: Optional[int]
+    ) -> Optional[int]:
+        """DGN-1813: id of the LAST body message of a turn, or None.
+
+        A re-sent body's last receipt wins (split body -> last chunk); else
+        the draft that was finalized in place.
+        """
+        if receipts:
+            mid = getattr(receipts[-1][0], "message_id", None)
+            if isinstance(mid, int):
+                return mid
+            return None
+        return edited_message_id
+
     async def _send_content_artifacts(
         self,
         target,
@@ -4309,6 +4868,8 @@ class TelegramBot:
         force_options: bool,
         options: Optional[List[str]] = None,
         body_was_loud: bool = True,
+        body: Optional[str] = None,
+        carrier_id: Optional[int] = None,
     ) -> None:
         """DGN-966: the SHARED artifact-render tail (marker -> file / keyboard).
 
@@ -4316,6 +4877,14 @@ class TelegramBot:
         and proactive (_send_smart) -- so a content string produces the SAME
         artifacts regardless of which path carried it. `target` is a telegram
         message or a bare chat_id (see _artifact_send).
+
+        DGN-1813: `carrier_id` is the LAST body message of this turn (the
+        last split chunk, or the draft edited in place) and `body` the text
+        it was rendered from. The [[OPTIONS]] keyboard rides that message
+        (attached after the final edit); only when there is no carrier (a
+        DGN-665 list-only body stripped to nothing) or the attach fails does
+        a short SELECT_PROMPT line carry it. `body` also decides the "N. "
+        button prefix (options.body_lists_options).
         """
         chat_id = self._artifact_chat_id(target)
         resolved = resolve_send_paths(content, PROJECT_ROOT)
@@ -4356,7 +4925,14 @@ class TelegramBot:
                     )
                 if not button_options:
                     button_options = extract_options(clean)
-                kb = build_option_keyboard(button_options)
+                # DGN-1813: number the buttons only when the body as sent
+                # still shows the matching numbered list; body=None (caller
+                # without a body) keeps the lone-button rule only.
+                numbered = (
+                    body_lists_options(body, button_options or [])
+                    if body is not None else None
+                )
+                kb = build_option_keyboard(button_options, numbered=numbered)
                 if not kb:
                     # DGN-992 (fail-loud): a marker with ZERO buildable buttons
                     # must never pass silently. The body is guaranteed intact
@@ -4378,6 +4954,11 @@ class TelegramBot:
                     # Turn-level 1-loud guarantee: when no loud send preceded
                     # this turn (list-only body, non-streamed, no drafts), the
                     # buttons ARE the turn's only signal -- promote to loud.
+                    if carrier_id is not None and await self._attach_keyboard(
+                        target, carrier_id, kb
+                    ):
+                        kb = None
+                if kb:
                     silent = (
                         notify_silent("options_prompt")
                         if body_was_loud
@@ -4418,6 +4999,13 @@ class TelegramBot:
         Reuses _send_smart so formatting and [[OPTIONS]] buttons behave the same
         as a normal reply. DGN-665: classifier_injected forwards marker
         provenance so a classifier-injected list keeps its body text.
+
+        DGN-1736 F1: a delivery failure is logged and RE-RAISED. Swallowing it
+        made the result-first caller (sdk_bridge._send_dispatch_return_first_text)
+        read success, open the latch and drop the text (popped from the
+        proactive buffer / subtracted from the final), so a failed first
+        text reached the owner nowhere. Every proactive_push caller already
+        wraps the await in try/except.
         """
         try:
             await self._send_smart(
@@ -4429,6 +5017,7 @@ class TelegramBot:
             )
         except Exception as e:
             logger.error("Proactive push delivery failed for chat %s: %s", chat_id, e)
+            raise
 
     async def _notify_outage_recovered(self, down_seconds: int) -> None:
         """Tell the user the bot was offline, after the watchdog reconnects.
@@ -4458,6 +5047,7 @@ class TelegramBot:
         classifier_injected: bool = False,
         rail: str = RAIL_UNKNOWN,
         assembled: bool = False,
+        notice_meta: Optional[Dict[str, Any]] = None,
     ) -> None:
         # DGN-1209: `rail` is the caller's declaration for the machine-line gate
         # (never inferred). Threaded down to _render_prose_html_segments.
@@ -4466,8 +5056,19 @@ class TelegramBot:
         if self.application is None:
             raise RuntimeError("Bot application already stopped")
         bot = self.application.bot
+        # DGN-1732: shared delivery seat for every proactive / option / resume
+        # send. NO_PUSH is a bridge directive, never owner text: bare -> no
+        # body goes out; trailing line -> stripped, the rest is sent.
+        content, had_sentinel = strip_no_push_sentinel(content)
+        if (
+            had_sentinel and not content.strip()
+            and not draft_message_ids and notice_meta is None
+        ):
+            logger.info("NO_PUSH-only send to chat %s suppressed at the seat", chat_id)
+            return
         display, has_marker = strip_options_marker(content)
         display, _ = strip_send_markers(display)
+        prose_normalized = False
         # DGN-376: link previews default OFF; a link_preview:: line opts in.
         display, preview = strip_link_preview_marker(display)
         # DGN-159: last-mile scrub of leaked tool-call markup (proactive / option /
@@ -4492,11 +5093,16 @@ class TelegramBot:
         # the button appendix can fall back to loud when it is the turn's only
         # notification (turn-level 1-loud guarantee, M1 fix).
         body_was_loud = False
+        # DGN-1586: same carrier-receipt contract as _reply_smart -- both
+        # rails share it (spec 3.6).
+        body_receipts: List[Tuple[Any, str]] = []
+        edited_message_id: Optional[int] = None
         if not streamed:
             # DGN-665: a list-only body strips to whitespace -- skip the empty
             # bubble; the SELECT_PROMPT + buttons message carries the turn.
             if display.strip():
-                await self._send_text_body_chat(chat_id, display, preview, rail=rail)
+                body_receipts = await self._send_text_body_chat(
+                    chat_id, display, preview, rail=rail)
                 body_was_loud = True
         elif has_code and (force_options or draft_message_ids):
             # DGN-085: same backstop as _reply_smart -- code+options coexistence
@@ -4506,7 +5112,8 @@ class TelegramBot:
                     await bot.delete_message(chat_id, mid)
                 except Exception as e:
                     logger.warning("Failed to delete streamed draft %s: %s", mid, e)
-            await self._send_text_body_chat(chat_id, display, preview, rail=rail)
+            body_receipts = await self._send_text_body_chat(
+                chat_id, display, preview, rail=rail)
             body_was_loud = True
         elif options and draft_message_ids:
             # DGN-665: streamed decision-ask -- the draft baked in the unstripped
@@ -4518,7 +5125,8 @@ class TelegramBot:
                 except Exception as e:
                     logger.warning("Failed to delete streamed draft %s: %s", mid, e)
             if display.strip():
-                await self._send_text_body_chat(chat_id, display, preview, rail=rail)
+                body_receipts = await self._send_text_body_chat(
+                    chat_id, display, preview, rail=rail)
             # Streamed draft was the loud carrier; notification fired at
             # create_draft() time.
             body_was_loud = True
@@ -4526,18 +5134,30 @@ class TelegramBot:
             # DGN-376 v1.1 (M1): same streamed prose finalize as _reply_smart --
             # edit the single draft bubble to HTML in place; fall back to
             # delete + convert-resend so the message is never lost.
-            if not await self._edit_streamed_prose_html(
+            # DGN-1586: notice-bearing turn -> force the real edit (the
+            # draft never carried the finalize-appended notice; a no-call
+            # skip is not delivery evidence).
+            if await self._edit_streamed_prose_html(
                 bot, chat_id, display, preview, draft_message_ids,
-                force_edit=assembled,
+                force_edit=(assembled or notice_meta is not None
+                            or prose_normalized),
             ):
+                edited_message_id = draft_message_ids[0]
+            else:
                 for mid in draft_message_ids:
                     try:
                         await bot.delete_message(chat_id, mid)
                     except Exception as e:
                         logger.warning("Failed to delete streamed draft %s: %s", mid, e)
-                await self._send_text_body_chat(chat_id, display, preview, rail=rail)
+                body_receipts = await self._send_text_body_chat(
+                    chat_id, display, preview, rail=rail)
             # Draft was loud at creation; in-place edit inherits that.
             body_was_loud = True
+        if notice_meta is not None:
+            await self._settle_notice_receipt(
+                notice_meta, chat_id, body_receipts, edited_message_id,
+                display,
+            )
         # DGN-966: the artifact tail (send_file paths, [[OPTIONS]] keyboard,
         # [[IDRILL]] keyboard) is the SHARED renderer -- the same one the
         # model-turn path uses -- so the fast-path (DGN-801) and proactive
@@ -4549,6 +5169,8 @@ class TelegramBot:
             force_options,
             options=options or None,
             body_was_loud=body_was_loud,
+            body=display,
+            carrier_id=self._body_carrier_id(body_receipts, edited_message_id),
         )
 
     @staticmethod
@@ -4589,27 +5211,34 @@ class TelegramBot:
 
     async def _send_text_body_chat(
         self, chat_id: int, content: str, preview: bool = False, rail: str = RAIL_UNKNOWN
-    ) -> None:
+    ) -> List[Tuple[Any, str]]:
+        # DGN-1586: same per-part receipt contract as _send_text_body (the
+        # bare-chat rail shares the notice receipt contract, spec 3.6).
+        receipts: List[Tuple[Any, str]] = []
         bot = self.application.bot
         # DGN-376: preview=True (link_preview:: opt-in) restores Telegram's
         # default preview; otherwise previews are suppressed.
         lp = None if preview else LINK_PREVIEW_OFF
         for rendered in self._render_prose_html_segments(content, rail=rail):
             try:
-                await bot.send_message(
+                sent = await bot.send_message(
                     chat_id,
                     rendered,
                     parse_mode="HTML",
                     link_preview_options=lp,
                 )
+                receipts.append((sent, rendered))
             except Exception:
                 # DGN-376 v1.1 (m1) + DGN-891: tag-STRIPPED readable
                 # fallback (never raw markdown source, never leaked
                 # tags); keeps the preview suppression of the send it
                 # replaces.
-                await bot.send_message(
-                    chat_id, html_to_plain_text(rendered), link_preview_options=lp
+                plain = html_to_plain_text(rendered)
+                sent = await bot.send_message(
+                    chat_id, plain, link_preview_options=lp
                 )
+                receipts.append((sent, plain))
+        return receipts
 
     async def _send_file_paths(self, chat_id: int, paths: List[Path]) -> None:
         bot = self.application.bot
@@ -4770,6 +5399,7 @@ class TelegramBot:
         if data is None:
             return
 
+
         if data.startswith("extsend:"):
             session = await session_manager.get_session(user_id)
             pending = session.get("pending_external_files", [])
@@ -4814,7 +5444,74 @@ class TelegramBot:
                         "opt callback %r matched no button in the keyboard "
                         "(stale or duplicate tap); using bare fallback %r", data, choice
                     )
-            await query.edit_message_text(messages.SELECTED.format(choice=choice))
+            # DGN-1813: the keyboard rides the body bubble (model replies and
+            # push notifications alike). On tap that SAME bubble is edited:
+            # body kept verbatim, keyboard removed, "Selected: <label>"
+            # appended. Only the DGN-665 fallback prompt line (a list-only
+            # body) is replaced outright -- it has no body to keep.
+            message = query.message
+            text = getattr(message, "text", None)
+            caption = getattr(message, "caption", None)
+            if isinstance(text, str) and text.strip() == messages.SELECT_PROMPT.strip():
+                await query.edit_message_text(messages.SELECTED.format(choice=choice))
+            # Non-text callback messages have no body to preserve. Keep the
+            # legacy confirmation behavior for them (also covers old clients).
+            elif not isinstance(text, str) and not isinstance(caption, str):
+                await query.edit_message_text(messages.SELECTED.format(choice=choice))
+            else:
+                is_caption = isinstance(caption, str)
+                body_html = getattr(
+                    message, "caption_html" if is_caption else "text_html", None
+                )
+                confirmation = messages.SELECTED.format(choice=html.escape(choice))
+                visible_confirmation = messages.SELECTED.format(choice=choice)
+                limit = 1024 if is_caption else 4096
+                combined = (
+                    body_html + "\n\n" + confirmation
+                    if isinstance(body_html, str) else None
+                )
+                visible_body = caption if is_caption else text
+                if (
+                    combined is not None
+                    and len(visible_body + "\n\n" + visible_confirmation) <= limit
+                ):
+                    try:
+                        if is_caption:
+                            await query.edit_message_caption(
+                                combined, parse_mode="HTML", reply_markup=None
+                            )
+                        else:
+                            await query.edit_message_text(
+                                combined, parse_mode="HTML", reply_markup=None
+                            )
+                    except telegram.error.BadRequest as e:
+                        # DGN-1876: "not modified" means this bubble already
+                        # carries this exact selection with no keyboard -- an
+                        # earlier callback for the same tap (double tap /
+                        # redelivery) already confirmed AND dispatched it.
+                        # Re-dispatching would send the choice to the agent
+                        # twice; surfacing it would show the owner a generic
+                        # processing error. Drop the duplicate quietly.
+                        if "not modified" in str(e).lower():
+                            logger.info(
+                                "opt callback %r: bubble already shows this "
+                                "selection (duplicate tap) -- ignored", data
+                            )
+                            return
+                        await self._strip_keyboard_and_confirm(
+                            query, message, visible_confirmation
+                        )
+                    except Exception:
+                        await self._strip_keyboard_and_confirm(
+                            query, message, visible_confirmation
+                        )
+                else:
+                    # DGN-1813: appending would break the message limit --
+                    # strip the keyboard only and confirm in a short reply
+                    # to that bubble.
+                    await self._strip_keyboard_and_confirm(
+                        query, message, visible_confirmation
+                    )
             await self._maybe_capture_outside_approval(user_id, choice)
             chat_id = chat.id
 
@@ -4843,15 +5540,34 @@ class TelegramBot:
                         typing_callback=lambda: app.bot.send_chat_action(chat_id, action="typing"),
                         bot=app.bot,
                         proactive_push=self._proactive_push,
+                        inbound={
+                            "chat_id": chat_id,
+                            "thread_id": getattr(query.message, "message_thread_id", None),
+                            "message_id": getattr(query.message, "message_id", None),
+                            "source": "callback",
+                        },
                     )
-                    resume_caller = self._make_resume_caller(
-                        user_id=user_id, chat_id=chat_id, app=app
-                    )
-                    response = await self._finish_turn(
+
+                    async def resume_caller(cont: str) -> ChatResponse:
+                        sess = await session_manager.get_session(user_id)
+                        return await sdk_bridge.process_message(
+                            user_message=cont,
+                            user_id=user_id,
+                            chat_id=chat_id,
+                            session_id=self._effective_session_id(user_id, sess),
+                            model=sess.get("model"),
+                            permission_callback=self._permission_callback,
+                            typing_callback=lambda: app.bot.send_chat_action(chat_id, action="typing"),
+                            bot=app.bot,
+                            proactive_push=self._proactive_push,
+                        )
+
+                    response = await self._finish_turn_with_auto_resume(
                         user_id=user_id, chat_id=chat_id, response=response, resume_caller=resume_caller
                     )
                     if response is None:
                         return
+                    await self._save_session_id(user_id, response)
                     await self._send_smart(
                         chat_id,
                         response.content,
@@ -4861,6 +5577,7 @@ class TelegramBot:
                         classifier_injected=getattr(response, "options_classifier_injected", False),
                         rail=RAIL_MODEL,
                         assembled=getattr(response, "turn_assembled", False),
+                        notice_meta=self._notice_meta(response),
                     )
                 except Exception as e:
                     logger.error("Option reply failed: %s", e, exc_info=True)
@@ -4908,10 +5625,31 @@ class TelegramBot:
         # falls through all branches below and no-ops (query already answered
         # above; the 20-min stale gate drops most of them before that).
 
+        # DGN-1814 r3 two-step picker: a vendor tap opens its family step; a
+        # family of a vendor the bridge cannot run says so (no switch).
+        if data.startswith(model_picker.CB_VENDOR):
+            vendor = data[len(model_picker.CB_VENDOR):]
+            session = await session_manager.get_session(user_id)
+            text, buttons = model_picker.family_step(
+                vendor, self._get_real_model(session), _model_whitelist(),
+                self._live_model_id(), _MODEL_PERF_RANK,
+            )
+            await query.edit_message_text(
+                text, reply_markup=self._picker_markup(buttons)
+            )
+            return
+
+        if data.startswith(model_picker.CB_FOREIGN):
+            vendor = data[len(model_picker.CB_FOREIGN):].split(":", 1)[0]
+            await query.edit_message_text(
+                messages.MODEL_VENDOR_NOT_WIRED.format(vendor=vendor)
+            )
+            return
+
         if data.startswith("model:"):
             model_name = data.split(":", 1)[1]
             session = await session_manager.get_session(user_id)
-            label = _MODEL_LABELS.get(model_name, model_name)
+            label = model_picker.full_name(model_name, model_picker.chat_table())
             # DGN-192: same-model tap is a no-op switch -- keep the session.
             if model_name == self._get_real_model(session):
                 await query.edit_message_text(
@@ -4975,12 +5713,26 @@ class TelegramBot:
                     proactive_push=self._proactive_push,
                 )
 
-                resume_caller = self._make_resume_caller(user_id=user_id, chat_id=chat_id, app=app)
-                response = await self._finish_turn(
+                async def resume_caller(cont: str) -> ChatResponse:
+                    s = await session_manager.get_session(user_id)
+                    return await sdk_bridge.process_message(
+                        user_message=cont,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        session_id=self._effective_session_id(user_id, s),
+                        model=s.get("model"),
+                        permission_callback=self._permission_callback,
+                        typing_callback=lambda: app.bot.send_chat_action(chat_id, action="typing"),
+                        bot=app.bot,
+                        proactive_push=self._proactive_push,
+                    )
+
+                response = await self._finish_turn_with_auto_resume(
                     user_id=user_id, chat_id=chat_id, response=response, resume_caller=resume_caller
                 )
                 if response is None:
                     return
+                await self._save_session_id(user_id, response)
                 await self._send_smart(
                     chat_id,
                     response.content,
@@ -4990,6 +5742,7 @@ class TelegramBot:
                     classifier_injected=getattr(response, "options_classifier_injected", False),
                     rail=RAIL_MODEL,
                     assembled=getattr(response, "turn_assembled", False),
+                    notice_meta=self._notice_meta(response),
                 )
             except Exception as e:
                 logger.error("Resume continuation failed: %s", e, exc_info=True)
@@ -5044,14 +5797,27 @@ class TelegramBot:
                     bot=app.bot,
                     proactive_push=self._proactive_push,
                 )
-                resume_caller = self._make_resume_caller(
-                    user_id=user_id, chat_id=chat_id, app=app
-                )
-                response = await self._finish_turn(
+
+                async def resume_caller(cont: str) -> ChatResponse:
+                    s = await session_manager.get_session(user_id)
+                    return await sdk_bridge.process_message(
+                        user_message=cont,
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        session_id=self._effective_session_id(user_id, s),
+                        model=s.get("model"),
+                        permission_callback=self._permission_callback,
+                        typing_callback=lambda: app.bot.send_chat_action(chat_id, action="typing"),
+                        bot=app.bot,
+                        proactive_push=self._proactive_push,
+                    )
+
+                response = await self._finish_turn_with_auto_resume(
                     user_id=user_id, chat_id=chat_id, response=response, resume_caller=resume_caller
                 )
                 if response is None:
                     return
+                await self._save_session_id(user_id, response)
                 if getattr(response, "retry_offer", False):
                     await self._send_retry_notice(
                         chat_id=chat_id, user_id=user_id,
@@ -5067,6 +5833,7 @@ class TelegramBot:
                     classifier_injected=getattr(response, "options_classifier_injected", False),
                     rail=RAIL_MODEL,
                     assembled=getattr(response, "turn_assembled", False),
+                    notice_meta=self._notice_meta(response),
                 )
             except Exception as e:
                 # DGN-686 MINOR-2: never leak the English detail to the user;

@@ -34,7 +34,9 @@ class FrontmatterBlockScalarTest(unittest.TestCase):
     def _parse(self, body):
         import tempfile
         from pathlib import Path
-        tmp = Path(tempfile.mkdtemp())
+        directory = tempfile.TemporaryDirectory(prefix="dgn618-test-")
+        self.addCleanup(directory.cleanup)
+        tmp = Path(directory.name)
         md = _write_skill(tmp, "some-skill", body)
         return TelegramBot._read_skill_frontmatter(md)
 

@@ -26,12 +26,17 @@ from bridge.dashboard import (
     EMPTY_DEBOUNCE_SECS,
     MAX_UTF16_UNITS,
     MIN_EDIT_INTERVAL,
+    PIN_CHECK_IDLE_SECS,
+    PIN_CHECK_MIN_SECS,
     RECREATE_COOLDOWN,
+    ROTATE_REQUEST_NAME,
+    STALE_UNPIN_MAX_ATTEMPTS,
     _is_chat_gone,
     _is_message_gone,
     _is_not_modified,
     _is_undeletable,
     _needs_recreate,
+    _rotate_mode,
     _tail_cut,
     _utf16_len,
 )
@@ -210,9 +215,17 @@ class TestStateFile(unittest.TestCase):
         ds = self._ds()
         ds._chat_id = 1001
         ds._message_id = 9001
+        ds._sent_day = "2026-09-28"
+        ds._digest = "abc"
         ds._save_state()
         data = json.loads(self._state.read_text(encoding="utf-8"))
-        self.assertEqual(data, {"chat_id": 1001, "message_id": 9001})
+        self.assertEqual(data, {
+            "chat_id": 1001, "message_id": 9001,
+            "sent_day": "2026-09-28", "digest": "abc", "stale_pins": [],
+        })
+        ds2 = self._ds()
+        self.assertEqual(ds2._sent_day, "2026-09-28")
+        self.assertEqual(ds2._digest, "abc")
 
     def test_save_no_tmp_leftover(self):
         ds = self._ds()
@@ -755,13 +768,20 @@ class TestRecreate(unittest.TestCase):
         self._recreate()  # must not raise
         self.assertFalse(self._ds._dirty)
 
-    def test_unpin_failure_is_swallowed(self):
+    def test_unpin_failure_is_logged_and_queued(self):
+        # DGN-1777: no longer swallowed silently -- logged, and the old id
+        # stays in the persisted queue for a retry.
         self._fake_send(9999)
         self._bot.unpin_chat_message = AsyncMock(
             side_effect=telegram.error.TelegramError("unpin refused")
         )
-        self._recreate(old_msg=1111)  # must not raise
+        with self.assertLogs("bridge.dashboard", level="WARNING") as logs:
+            self._recreate(old_msg=1111)  # must not raise
         self.assertFalse(self._ds._dirty)
+        self.assertIn("1111", "\n".join(logs.output))
+        self.assertEqual(
+            [e["message_id"] for e in self._ds._stale_pins], [1111]
+        )
 
     def test_send_retry_after_sets_flood(self):
         self._bot.send_message = AsyncMock(
@@ -796,6 +816,828 @@ class TestRecreate(unittest.TestCase):
         now = time.monotonic()
         asyncio.run(self._ds._recreate(OWNER_ID, "text", 100.0, now))
         self.assertIsNone(self._ds._last_recreate)
+
+
+# ---------------------------------------------------------------------------
+# DGN-1768 daily rotation: first real change of a new day -> new pinned message
+# ---------------------------------------------------------------------------
+
+DAY1 = "2026-09-27"
+DAY2 = "2026-09-28"
+
+
+class TestDailyRotation(unittest.TestCase):
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory(prefix="dash-rotate-")
+        self._dir = Path(self._td.name)
+        self._dash = self._dir / "dashboard.md"
+        self._state = self._dir / "state.json"
+        self._bot = _mock_bot()
+        self._next_id = 100
+        self._bot.send_message = AsyncMock(side_effect=self._send)
+        self._ds = self._new_ds()
+        self._mtime = 1000.0
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _send(self, **kwargs):
+        self._next_id += 1
+        msg = MagicMock()
+        msg.message_id = self._next_id
+        return msg
+
+    def _new_ds(self):
+        return DashboardSync(
+            bot=self._bot,
+            turn_active=lambda uid: False,
+            dashboard_path=self._dash,
+            state_path=self._state,
+        )
+
+    def _write(self, text):
+        self._dash.write_text(text)
+        self._mtime += 10.0
+        os.utime(self._dash, (self._mtime, self._mtime))
+
+    def _tick(self, day, ds=None):
+        ds = ds or self._ds
+        # Clear interval/cooldown gates: the test drives calendar days, not
+        # wall-clock seconds.
+        ds._last_edit = None
+        ds._last_recreate = None
+        cfg = _fake_config(allowed_user_ids=[OWNER_ID], bot_data_dir=self._dir)
+        with patch("bridge.dashboard.ownership.resolve_owner",
+                   return_value=(ownership.MODE_AUTHORITATIVE, None)), \
+             patch("bridge.dashboard.config", cfg), \
+             patch("bridge.dashboard._local_day", return_value=day):
+            asyncio.run(ds._tick())
+
+    def _day1_board(self):
+        self._write("board v1")
+        self._tick(DAY1)
+        self.assertEqual(self._ds._message_id, 101)
+        self.assertEqual(self._ds._sent_day, DAY1)
+        self._bot.reset_mock()
+
+    def test_day2_first_change_sends_pins_and_deletes_old(self):
+        self._day1_board()
+        self._write("board v2 (morning brief schedule)")
+        self._tick(DAY2)
+        self._bot.edit_message_text.assert_not_awaited()
+        self._bot.send_message.assert_awaited_once()
+        self.assertTrue(
+            self._bot.send_message.await_args.kwargs["disable_notification"]
+        )
+        self._bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=OWNER_ID, message_id=102, disable_notification=True
+        )
+        self._bot.delete_message.assert_awaited_once_with(
+            chat_id=OWNER_ID, message_id=101
+        )
+        self._bot.unpin_chat_message.assert_not_awaited()  # deleted, not orphaned
+        self.assertEqual(self._ds._message_id, 102)
+        self.assertEqual(self._ds._sent_day, DAY2)
+        self.assertFalse(self._ds._dirty)
+
+    def test_same_day_second_change_edits_only(self):
+        self._day1_board()
+        self._write("board v2")
+        self._tick(DAY2)
+        self._bot.reset_mock()
+        self._write("board v3")
+        self._tick(DAY2)
+        self._bot.send_message.assert_not_awaited()
+        self._bot.delete_message.assert_not_awaited()
+        self._bot.pin_chat_message.assert_not_awaited()
+        self._bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(
+            self._bot.edit_message_text.await_args.kwargs["message_id"], 102
+        )
+
+    def test_same_day_change_on_send_day_edits(self):
+        self._day1_board()
+        self._write("board v1b")
+        self._tick(DAY1)
+        self._bot.send_message.assert_not_awaited()
+        self._bot.edit_message_text.assert_awaited_once()
+
+    def test_unchanged_day_sends_nothing(self):
+        self._day1_board()
+        self._tick(DAY2)  # mtime unchanged: not dirty
+        self._tick(DAY2)
+        self._bot.send_message.assert_not_awaited()
+        self._bot.edit_message_text.assert_not_awaited()
+        self._bot.delete_message.assert_not_awaited()
+
+    def test_restart_on_new_day_without_change_does_not_rotate(self):
+        # The first tick after a restart is always dirty; same content must
+        # not count as the day's first change.
+        self._day1_board()
+        ds2 = self._new_ds()
+        self._tick(DAY2, ds=ds2)
+        self._bot.send_message.assert_not_awaited()
+        self._bot.delete_message.assert_not_awaited()
+        self.assertEqual(ds2._message_id, 101)
+        self.assertEqual(ds2._sent_day, DAY1)
+
+    def test_delete_refused_unpins_only_no_crash(self):
+        self._day1_board()
+        self._bot.delete_message = AsyncMock(
+            side_effect=telegram.error.BadRequest(
+                "Message can't be deleted for everyone"
+            )
+        )
+        self._write("board v2")
+        self._tick(DAY2)  # must not raise
+        self._bot.pin_chat_message.assert_awaited_once()
+        self._bot.unpin_chat_message.assert_awaited_once_with(
+            chat_id=OWNER_ID, message_id=101
+        )
+        self.assertEqual(self._ds._message_id, 102)
+        self.assertFalse(self._ds._dirty)
+        # No retry of the delete on the next tick.
+        self._tick(DAY2)
+        self._bot.delete_message.assert_awaited_once()
+
+    def test_delete_old_already_gone_skips_unpin(self):
+        self._day1_board()
+        self._bot.delete_message = AsyncMock(
+            side_effect=telegram.error.BadRequest("message to delete not found")
+        )
+        self._write("board v2")
+        self._tick(DAY2)
+        self._bot.unpin_chat_message.assert_not_awaited()
+        self.assertEqual(self._ds._message_id, 102)
+
+    def test_rotation_send_failure_keeps_old_and_retries(self):
+        self._day1_board()
+        self._bot.send_message = AsyncMock(
+            side_effect=telegram.error.TelegramError("internal error")
+        )
+        self._write("board v2")
+        self._tick(DAY2)
+        self._bot.delete_message.assert_not_awaited()
+        self.assertEqual(self._ds._message_id, 101)
+        self.assertTrue(self._ds._dirty)
+        self._bot.send_message = AsyncMock(side_effect=self._send)
+        self._tick(DAY2)
+        self._bot.delete_message.assert_awaited_once_with(
+            chat_id=OWNER_ID, message_id=101
+        )
+        self.assertEqual(self._ds._sent_day, DAY2)
+
+    def test_state_file_carries_send_day_across_restart(self):
+        self._day1_board()
+        data = json.loads(self._state.read_text())
+        self.assertEqual(data["sent_day"], DAY1)
+        self.assertEqual(data["message_id"], 101)
+        ds2 = self._new_ds()
+        self.assertEqual(ds2._sent_day, DAY1)
+        self.assertEqual(ds2._message_id, 101)
+        # Restarted process, same day: a change edits.
+        self._tick(DAY1, ds=ds2)  # restart tick (same content)
+        self._write("board v1b")
+        self._tick(DAY1, ds=ds2)
+        self._bot.send_message.assert_not_awaited()
+        # Restarted again, next day: the first change rotates.
+        ds3 = self._new_ds()
+        self._write("board v2")
+        self._tick(DAY2, ds=ds3)
+        self._bot.delete_message.assert_awaited_once_with(
+            chat_id=OWNER_ID, message_id=101
+        )
+        self.assertEqual(ds3._message_id, 102)
+        self.assertEqual(json.loads(self._state.read_text())["sent_day"], DAY2)
+
+    def test_legacy_state_without_day_rotates_on_next_real_change(self):
+        # Old {chat_id, message_id} file: the restart tick edits (no rotation
+        # on the restart alone); the next real change rotates.
+        self._write("board v1")
+        self._state.write_text(json.dumps({"chat_id": OWNER_ID, "message_id": 55}))
+        ds = self._new_ds()
+        self.assertIsNone(ds._sent_day)
+        self._tick(DAY2, ds=ds)
+        self._bot.send_message.assert_not_awaited()
+        self._bot.edit_message_text.assert_awaited_once()
+        self._write("board v2")
+        self._tick(DAY2, ds=ds)
+        self._bot.send_message.assert_awaited_once()
+        self._bot.delete_message.assert_awaited_once_with(
+            chat_id=OWNER_ID, message_id=55
+        )
+        self.assertEqual(ds._sent_day, DAY2)
+
+    def test_empty_delete_clears_day(self):
+        self._day1_board()
+        self._ds._empty_since = time.monotonic() - EMPTY_DEBOUNCE_SECS - 1.0
+        self._write("")
+        self._tick(DAY1)
+        self.assertIsNone(self._ds._message_id)
+        self.assertIsNone(self._ds._sent_day)
+
+
+# ---------------------------------------------------------------------------
+# DGN-1768 r2: explicit fresh request marker + DASHBOARD_ROTATE mode
+# ---------------------------------------------------------------------------
+
+class TestFreshRequest(TestDailyRotation):
+    """Inherits the rotation fixture; the parent's tests re-run here too,
+    with no marker and the default mode (auto stays byte-for-byte r1)."""
+
+    MODE = ""
+
+    def setUp(self):
+        super().setUp()
+        self._marker = self._dir / ROTATE_REQUEST_NAME
+
+    def _tick(self, day, ds=None, reset_cooldown=True):
+        ds = ds or self._ds
+        ds._last_edit = None
+        if reset_cooldown:
+            ds._last_recreate = None
+        cfg = _fake_config(allowed_user_ids=[OWNER_ID], bot_data_dir=self._dir,
+                           dashboard_rotate=self.MODE)
+        with patch("bridge.dashboard.ownership.resolve_owner",
+                   return_value=(ownership.MODE_AUTHORITATIVE, None)), \
+             patch("bridge.dashboard.config", cfg), \
+             patch("bridge.dashboard.AGENT_CONF_FILE", self._dir / "none.conf"), \
+             patch("bridge.dashboard._local_day", return_value=day):
+            asyncio.run(ds._tick())
+
+    def _request_fresh(self):
+        self._marker.write_text("{}")
+
+    def test_marker_rotates_same_day_and_is_consumed(self):
+        self._day1_board()
+        self._write("board v2 (brief card)")
+        self._request_fresh()
+        self._ds._last_recreate = time.monotonic()  # cooldown is skipped
+        self._tick(DAY1, reset_cooldown=False)
+        self._bot.edit_message_text.assert_not_awaited()
+        self._bot.send_message.assert_awaited_once()
+        self.assertTrue(
+            self._bot.send_message.await_args.kwargs["disable_notification"]
+        )
+        self._bot.pin_chat_message.assert_awaited_once_with(
+            chat_id=OWNER_ID, message_id=102, disable_notification=True
+        )
+        self._bot.delete_message.assert_awaited_once_with(
+            chat_id=OWNER_ID, message_id=101
+        )
+        self.assertFalse(self._marker.exists())
+        self.assertEqual(self._ds._message_id, 102)
+
+    def test_marker_consumed_once(self):
+        self._day1_board()
+        self._write("board v2")
+        self._request_fresh()
+        self._tick(DAY1)
+        self._bot.reset_mock()
+        self._write("board v3")
+        self._tick(DAY1)
+        self._tick(DAY1)
+        self._bot.send_message.assert_not_awaited()
+        self._bot.edit_message_text.assert_awaited_once()
+
+    def test_marker_rotates_unchanged_content(self):
+        self._day1_board()
+        self._request_fresh()  # no file change: the marker alone is dirty
+        self._tick(DAY1)
+        self._bot.send_message.assert_awaited_once()
+        self.assertFalse(self._marker.exists())
+
+    def test_marker_kept_when_send_fails(self):
+        self._day1_board()
+        self._bot.send_message = AsyncMock(
+            side_effect=telegram.error.TelegramError("internal error")
+        )
+        self._write("board v2")
+        self._request_fresh()
+        self._tick(DAY1)
+        self.assertTrue(self._marker.exists())
+        self.assertTrue(self._ds._dirty)
+        self._bot.send_message = AsyncMock(side_effect=self._send)
+        self._tick(DAY1)
+        self.assertFalse(self._marker.exists())
+        self.assertEqual(self._ds._message_id, 102)
+
+    def test_marker_on_empty_board_is_consumed(self):
+        self._day1_board()
+        self._write("")
+        self._request_fresh()
+        self._tick(DAY1)
+        self.assertFalse(self._marker.exists())
+        self._bot.send_message.assert_not_awaited()
+
+    def test_marker_without_board_sends_fresh(self):
+        self._write("board v1")
+        self._request_fresh()
+        self._tick(DAY1)
+        self._bot.send_message.assert_awaited_once()
+        self.assertEqual(self._ds._message_id, 101)
+        self.assertFalse(self._marker.exists())
+
+
+class TestFreshRequestExplicit(TestFreshRequest):
+    """DASHBOARD_ROTATE=explicit: the parent marker tests hold as-is; the
+    inherited r1 day-rotation tests that expect a day-change rotation are
+    overridden below with the explicit expectation (edit only)."""
+
+    MODE = "explicit"
+
+    def _assert_day_change_edits(self):
+        self._day1_board()
+        self._write("board v2 (morning brief schedule)")
+        self._tick(DAY2)
+        self._bot.send_message.assert_not_awaited()
+        self._bot.delete_message.assert_not_awaited()
+        self._bot.edit_message_text.assert_awaited_once()
+        self.assertEqual(self._ds._message_id, 101)
+        self.assertEqual(self._ds._sent_day, DAY1)
+
+    def test_day2_first_change_sends_pins_and_deletes_old(self):
+        self._assert_day_change_edits()
+
+    def test_same_day_second_change_edits_only(self):
+        self._assert_day_change_edits()
+
+    def test_delete_refused_unpins_only_no_crash(self):
+        self._assert_day_change_edits()
+
+    def test_delete_old_already_gone_skips_unpin(self):
+        self._assert_day_change_edits()
+
+    def test_rotation_send_failure_keeps_old_and_retries(self):
+        self._assert_day_change_edits()
+
+    def test_state_file_carries_send_day_across_restart(self):
+        self._assert_day_change_edits()
+
+    def test_legacy_state_without_day_rotates_on_next_real_change(self):
+        self._write("board v1")
+        self._state.write_text(json.dumps({"chat_id": OWNER_ID, "message_id": 55}))
+        ds = self._new_ds()
+        self._tick(DAY2, ds=ds)
+        self._write("board v2")
+        self._tick(DAY2, ds=ds)
+        self._bot.send_message.assert_not_awaited()
+        self.assertEqual(self._bot.edit_message_text.await_count, 2)
+
+    def test_explicit_clear_of_a_section_edits(self):
+        self._day1_board()
+        self._write("board v1 minus a cleared section")
+        self._tick(DAY2)
+        self._bot.send_message.assert_not_awaited()
+        self._bot.edit_message_text.assert_awaited_once()
+
+    def test_explicit_fresh_request_still_rotates_on_day_change(self):
+        self._day1_board()
+        self._write("board v2")
+        self._request_fresh()
+        self._tick(DAY2)
+        self._bot.send_message.assert_awaited_once()
+        self._bot.delete_message.assert_awaited_once_with(
+            chat_id=OWNER_ID, message_id=101
+        )
+        self.assertEqual(self._ds._sent_day, DAY2)
+
+
+class TestRotateMode(unittest.TestCase):
+    def _mode(self, env_value, conf_text=None):
+        with tempfile.TemporaryDirectory(prefix="dash-mode-") as td:
+            conf = Path(td) / "agent.conf"
+            if conf_text is not None:
+                conf.write_text(conf_text)
+            cfg = _fake_config(dashboard_rotate=env_value)
+            with patch("bridge.dashboard.config", cfg), \
+                 patch("bridge.dashboard.AGENT_CONF_FILE", conf):
+                return _rotate_mode()
+
+    def test_default_auto(self):
+        self.assertEqual(self._mode(""), "auto")
+
+    def test_env_explicit(self):
+        self.assertEqual(self._mode("explicit"), "explicit")
+
+    def test_agent_conf_explicit_quoted(self):
+        self.assertEqual(
+            self._mode("", 'X=1\nDASHBOARD_ROTATE="explicit"\n'), "explicit"
+        )
+
+    def test_env_wins_over_conf(self):
+        self.assertEqual(self._mode("auto", "DASHBOARD_ROTATE=explicit\n"), "auto")
+
+    def test_unknown_value_is_auto(self):
+        self.assertEqual(self._mode("sometimes"), "auto")
+
+
+# ---------------------------------------------------------------------------
+# DGN-1777: exactly one board pin (fake bot with a real pin set)
+# ---------------------------------------------------------------------------
+
+OWNER_PIN = 7  # a message the OWNER pinned; the bridge must never unpin it
+
+
+class _PinBot:
+    """Fake bot that models the chat's pin set.  unpin of an id listed in
+    fail_unpin raises; delete of an id listed in undeletable is refused with
+    Telegram's 48h age-limit error."""
+
+    def __init__(self):
+        self.pinned = {OWNER_PIN}
+        self.fail_unpin = set()
+        self.undeletable = set()
+        self.unpin_calls = []
+        self.pin_calls = []
+        self.get_chat_calls = 0
+        self._next_id = 100
+        self.send_message = AsyncMock(side_effect=self._send)
+        self.edit_message_text = AsyncMock()
+        self.pin_chat_message = AsyncMock(side_effect=self._pin)
+        self.unpin_chat_message = AsyncMock(side_effect=self._unpin)
+        self.delete_message = AsyncMock(side_effect=self._delete)
+        self.get_chat = AsyncMock(side_effect=self._get_chat)
+
+    async def _get_chat(self, chat_id):
+        # Bot API: pinned_message = most recent pin BY SENDING DATE, i.e.
+        # the highest pinned message id.
+        self.get_chat_calls += 1
+        top = max(self.pinned) if self.pinned else None
+        return types.SimpleNamespace(
+            pinned_message=(
+                None if top is None else types.SimpleNamespace(message_id=top)
+            )
+        )
+
+    async def _send(self, **kwargs):
+        self._next_id += 1
+        msg = MagicMock()
+        msg.message_id = self._next_id
+        return msg
+
+    async def _pin(self, chat_id, message_id, **kwargs):
+        self.pin_calls.append((message_id, kwargs.get("disable_notification")))
+        self.pinned.add(message_id)
+
+    async def _unpin(self, chat_id, message_id):
+        self.unpin_calls.append(message_id)
+        if message_id in self.fail_unpin:
+            raise telegram.error.TelegramError("Internal Server Error")
+        if message_id not in self.pinned:
+            raise telegram.error.BadRequest("Message to unpin not found")
+        self.pinned.discard(message_id)
+
+    async def _delete(self, chat_id, message_id):
+        if message_id in self.undeletable:
+            raise telegram.error.BadRequest(
+                "Message can't be deleted for everyone"
+            )
+        self.pinned.discard(message_id)
+
+
+class _PinChatCase(unittest.TestCase):
+    """Shared fixture: a DashboardSync over the _PinBot pin-set fake."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory(prefix="dash-onepin-")
+        self._dir = Path(self._td.name)
+        self._dash = self._dir / "dashboard.md"
+        self._state = self._dir / "state.json"
+        self._bot = _PinBot()
+        self._ds = self._new_ds()
+        self._mtime = 1000.0
+
+    def tearDown(self):
+        self._td.cleanup()
+
+    def _new_ds(self):
+        return DashboardSync(
+            bot=self._bot,
+            turn_active=lambda uid: False,
+            dashboard_path=self._dash,
+            state_path=self._state,
+        )
+
+    def _write(self, text):
+        self._dash.write_text(text)
+        self._mtime += 10.0
+        os.utime(self._dash, (self._mtime, self._mtime))
+
+    def _tick(self, day, ds=None, sweep_due=False):
+        ds = ds or self._ds
+        ds._last_edit = None
+        ds._last_recreate = None
+        if sweep_due:
+            ds._next_unpin_sweep = 0.0
+        cfg = _fake_config(allowed_user_ids=[OWNER_ID], bot_data_dir=self._dir)
+        with patch("bridge.dashboard.ownership.resolve_owner",
+                   return_value=(ownership.MODE_AUTHORITATIVE, None)), \
+             patch("bridge.dashboard.config", cfg), \
+             patch("bridge.dashboard.AGENT_CONF_FILE", self._dir / "none.conf"), \
+             patch("bridge.dashboard._local_day", return_value=day):
+            asyncio.run(ds._tick())
+
+    def _stale_ids(self, ds=None):
+        return [e["message_id"] for e in (ds or self._ds)._stale_pins]
+
+    def _rotate_with_failing_unpin(self):
+        """Day-1 board 101, day-2 rotation to 102: delete of 101 refused
+        (age limit) and its unpin raises."""
+        self._write("board v1")
+        self._tick(DAY1)
+        self.assertEqual(self._bot.pinned, {OWNER_PIN, 101})
+        self._bot.undeletable.add(101)
+        self._bot.fail_unpin.add(101)
+        self._write("board v2")
+        with self.assertLogs("bridge.dashboard", level="WARNING") as logs:
+            self._tick(DAY2)
+        return logs
+
+class TestOneBoardPin(_PinChatCase):
+    def test_failed_unpin_is_logged_not_silent(self):
+        logs = self._rotate_with_failing_unpin()
+        joined = "\n".join(logs.output)
+        self.assertIn("unpin of old board 101 failed", joined)
+        self.assertEqual(self._ds._message_id, 102)
+        self.assertFalse(self._ds._dirty)
+        self.assertEqual(self._stale_ids(), [101])
+
+    def test_state_carries_stale_ids_across_restart_then_converges(self):
+        self._rotate_with_failing_unpin()
+        data = json.loads(self._state.read_text())
+        self.assertEqual(data["message_id"], 102)
+        self.assertEqual(
+            [e["message_id"] for e in data["stale_pins"]], [101]
+        )
+        # Restart; Telegram now accepts the unpin.
+        self._bot.fail_unpin.clear()
+        ds2 = self._new_ds()
+        self.assertEqual(self._stale_ids(ds2), [101])
+        self._tick(DAY2, ds=ds2)  # a fresh process sweeps on its first tick
+        self.assertEqual(self._bot.pinned, {OWNER_PIN, 102})
+        self.assertEqual(self._stale_ids(ds2), [])
+        data = json.loads(self._state.read_text())
+        self.assertEqual(data["stale_pins"], [])
+
+    def test_retry_waits_for_the_interval(self):
+        self._rotate_with_failing_unpin()
+        calls = len(self._bot.unpin_calls)
+        self._tick(DAY2)  # interval not elapsed: no retry
+        self.assertEqual(len(self._bot.unpin_calls), calls)
+        self._bot.fail_unpin.clear()
+        self._tick(DAY2, sweep_due=True)
+        self.assertEqual(self._bot.pinned, {OWNER_PIN, 102})
+
+    def test_after_rotations_only_live_board_and_owner_pin_remain(self):
+        # Several rotations, some unpins failing transiently.
+        self._write("board v1")
+        self._tick(DAY1)
+        days = ["2026-09-29", "2026-09-30", "2026-10-01"]
+        for i, day in enumerate(days):
+            live = self._ds._message_id
+            self._bot.undeletable.add(live)
+            if i % 2 == 0:
+                self._bot.fail_unpin.add(live)
+            self._write("board day %d" % i)
+            with self.assertLogs("bridge.dashboard", level="INFO"):
+                self._tick(day)
+        self._bot.fail_unpin.clear()
+        self._tick(days[-1], sweep_due=True)
+        self.assertEqual(self._bot.pinned, {OWNER_PIN, self._ds._message_id})
+        self.assertEqual(self._stale_ids(), [])
+        self.assertNotIn(OWNER_PIN, self._bot.unpin_calls)
+        self.assertNotIn(self._ds._message_id, self._bot.unpin_calls)
+
+    def test_owner_pin_never_touched(self):
+        self._rotate_with_failing_unpin()
+        self._bot.fail_unpin.clear()
+        self._tick(DAY2, sweep_due=True)
+        self.assertIn(OWNER_PIN, self._bot.pinned)
+        self.assertNotIn(OWNER_PIN, self._bot.unpin_calls)
+
+    def test_gives_up_after_max_attempts_with_warning(self):
+        self._rotate_with_failing_unpin()  # attempt 1
+        for _ in range(STALE_UNPIN_MAX_ATTEMPTS - 2):
+            with self.assertLogs("bridge.dashboard", level="WARNING"):
+                self._tick(DAY2, sweep_due=True)
+        self.assertEqual(self._stale_ids(), [101])
+        with self.assertLogs("bridge.dashboard", level="WARNING") as logs:
+            self._tick(DAY2, sweep_due=True)
+        self.assertIn("giving up", "\n".join(logs.output))
+        self.assertEqual(self._stale_ids(), [])
+
+    def test_already_unpinned_converges(self):
+        self._rotate_with_failing_unpin()
+        self._bot.fail_unpin.clear()
+        self._bot.pinned.discard(101)  # e.g. owner unpinned it by hand
+        self._tick(DAY2, sweep_due=True)
+        self.assertEqual(self._stale_ids(), [])
+        self.assertEqual(self._bot.pinned, {OWNER_PIN, 102})
+
+    def test_live_board_is_never_unpinned_from_queue(self):
+        self._write("board v1")
+        self._tick(DAY1)
+        live = self._ds._message_id
+        self._ds._stale_pins = [
+            {"chat_id": OWNER_ID, "message_id": live, "attempts": 0}
+        ]
+        self._tick(DAY1, sweep_due=True)
+        self.assertNotIn(live, self._bot.unpin_calls)
+        self.assertIn(live, self._bot.pinned)
+        self.assertEqual(self._stale_ids(), [])
+
+    def test_empty_path_unpin_failure_on_undeletable_is_queued(self):
+        self._write("board v1")
+        self._tick(DAY1)
+        self._bot.undeletable.add(101)
+        self._bot.fail_unpin.add(101)
+        self._write("")
+        self._tick(DAY1)  # marks empty pending
+        self._ds._empty_since = time.monotonic() - EMPTY_DEBOUNCE_SECS - 1
+        with self.assertLogs("bridge.dashboard", level="WARNING"):
+            self._tick(DAY1)
+        self.assertIsNone(self._ds._message_id)
+        self.assertEqual(self._stale_ids(), [101])
+        self._bot.fail_unpin.clear()
+        self._tick(DAY1, sweep_due=True)
+        self.assertEqual(self._bot.pinned, {OWNER_PIN})
+        self.assertEqual(self._stale_ids(), [])
+
+    def test_clear_state_keeps_the_queue_on_disk(self):
+        self._rotate_with_failing_unpin()
+        self._ds._clear_state()
+        self.assertIsNone(self._ds._message_id)
+        data = json.loads(self._state.read_text())
+        self.assertIsNone(data["message_id"])
+        self.assertEqual(
+            [e["message_id"] for e in data["stale_pins"]], [101]
+        )
+        ds2 = self._new_ds()
+        self.assertIsNone(ds2._message_id)
+        self.assertEqual(self._stale_ids(ds2), [101])
+
+    def test_malformed_queue_entries_are_dropped_on_load(self):
+        self._state.write_text(json.dumps({
+            "chat_id": OWNER_ID, "message_id": 5,
+            "stale_pins": [
+                {"chat_id": OWNER_ID, "message_id": 4, "attempts": 2},
+                {"chat_id": True, "message_id": 3},
+                {"chat_id": OWNER_ID},
+                "junk",
+            ],
+        }))
+        ds = self._new_ds()
+        self.assertEqual(
+            ds._stale_pins,
+            [{"chat_id": OWNER_ID, "message_id": 4, "attempts": 2}],
+        )
+
+
+class TestOwnerUnpinRepin(_PinChatCase):
+    """DGN-1782 (dec-201): an owner-unpinned LIVE board is re-pinned silently;
+    owner pins and stale board ids are never touched."""
+
+    def _board(self):
+        self._write("board v1")
+        self._tick(DAY1)  # send + pin 101
+        self._bot.pin_calls.clear()
+        return self._ds._message_id
+
+    def _age_check(self, secs):
+        self._ds._last_pin_check = time.monotonic() - secs
+
+    def test_owner_unpinned_live_board_is_repinned_once(self):
+        live = self._board()
+        self._bot.pinned.discard(live)  # owner unpins the board
+        self._write("board v2")
+        self._tick(DAY1)  # real edit
+        self.assertEqual(self._bot.pin_calls, [])
+        self._age_check(PIN_CHECK_MIN_SECS + 1)
+        with self.assertLogs("bridge.dashboard", level="INFO"):
+            self._tick(DAY1)  # idle tick after the edit -> check -> re-pin
+        self.assertEqual(self._bot.pin_calls, [(live, True)])
+        self.assertIn(live, self._bot.pinned)
+        # Pinned again: later checks see it on top and do nothing.
+        for _ in range(3):
+            self._age_check(PIN_CHECK_IDLE_SECS + 1)
+            self._tick(DAY1)
+        self.assertEqual(self._bot.pin_calls, [(live, True)])
+
+    def test_repins_when_nothing_is_pinned_at_all(self):
+        live = self._board()
+        self._bot.pinned.clear()
+        self._age_check(PIN_CHECK_IDLE_SECS + 1)
+        with self.assertLogs("bridge.dashboard", level="INFO"):
+            self._tick(DAY1)
+        self.assertEqual(self._bot.pin_calls, [(live, True)])
+
+    def test_owner_pin_on_top_no_churn(self):
+        live = self._board()
+        newer_owner_pin = live + 50
+        self._bot.pinned.add(newer_owner_pin)
+        for _ in range(3):
+            self._write("board edit %f" % self._mtime)
+            self._tick(DAY1)
+            self._age_check(PIN_CHECK_IDLE_SECS + 1)
+            self._tick(DAY1)
+        self.assertGreater(self._bot.get_chat_calls, 0)
+        self.assertEqual(self._bot.pin_calls, [])
+        self.assertEqual(self._bot.unpin_calls, [])
+        self.assertEqual(self._bot.pinned, {OWNER_PIN, live, newer_owner_pin})
+
+    def test_older_owner_pin_on_top_means_board_unpinned(self):
+        # Only the owner's older pin remains: the board would outrank it if
+        # it were pinned, so it is not -> re-pin; the owner pin is untouched.
+        live = self._board()
+        self._bot.pinned.discard(live)
+        self._age_check(PIN_CHECK_IDLE_SECS + 1)
+        with self.assertLogs("bridge.dashboard", level="INFO"):
+            self._tick(DAY1)
+        self.assertEqual(self._bot.pin_calls, [(live, True)])
+        self.assertIn(OWNER_PIN, self._bot.pinned)
+        self.assertNotIn(OWNER_PIN, self._bot.unpin_calls)
+
+    def test_stale_ids_never_repinned(self):
+        # Rotation leaves 101 stuck pinned (queued); owner unpins live 102.
+        self._rotate_with_failing_unpin()
+        live = self._ds._message_id
+        self.assertEqual(self._stale_ids(), [101])
+        self._bot.pin_calls.clear()
+        self._bot.pinned.discard(live)
+        self._age_check(PIN_CHECK_IDLE_SECS + 1)
+        with self.assertLogs("bridge.dashboard", level="INFO"):
+            self._tick(DAY2)  # top = stale 101 < live -> re-pin live only
+        self.assertEqual(self._bot.pin_calls, [(live, True)])
+        # Once the stale unpin succeeds it stays unpinned; no pin ever hits it.
+        self._bot.fail_unpin.clear()
+        self._tick(DAY2, sweep_due=True)
+        self._age_check(PIN_CHECK_IDLE_SECS + 1)
+        self._tick(DAY2)
+        self.assertEqual(self._bot.pinned, {OWNER_PIN, live})
+        self.assertNotIn(101, [m for m, _ in self._bot.pin_calls])
+
+    def test_cadence_bounds_get_chat(self):
+        self._board()
+        calls = self._bot.get_chat_calls
+        for _ in range(20):
+            self._tick(DAY1)  # idle ticks right after the pinning send
+        self.assertEqual(self._bot.get_chat_calls, calls)
+        # A real edit alone does not bypass the minimum spacing.
+        self._write("board v2")
+        self._tick(DAY1)
+        self._tick(DAY1)
+        self.assertEqual(self._bot.get_chat_calls, calls)
+        self._age_check(PIN_CHECK_MIN_SECS + 1)
+        self._tick(DAY1)
+        self._tick(DAY1)
+        self.assertEqual(self._bot.get_chat_calls, calls + 1)
+        # No edit: the min spacing is not enough, the idle interval is.
+        self._age_check(PIN_CHECK_MIN_SECS + 1)
+        self._tick(DAY1)
+        self.assertEqual(self._bot.get_chat_calls, calls + 1)
+        self._age_check(PIN_CHECK_IDLE_SECS + 1)
+        self._tick(DAY1)
+        self.assertEqual(self._bot.get_chat_calls, calls + 2)
+
+    def test_turn_active_and_flood_defer_the_check(self):
+        live = self._board()
+        self._bot.pinned.discard(live)
+        busy = DashboardSync(
+            bot=self._bot,
+            turn_active=lambda uid: True,
+            dashboard_path=self._dash,
+            state_path=self._state,
+        )
+        busy._last_synced_mtime = self._mtime
+        busy._last_pin_check = time.monotonic() - PIN_CHECK_IDLE_SECS - 1
+        calls = self._bot.get_chat_calls
+        self._tick(DAY1, ds=busy)
+        self.assertEqual(self._bot.get_chat_calls, calls)
+        self._age_check(PIN_CHECK_IDLE_SECS + 1)
+        self._ds._flood_until = time.monotonic() + 999.0
+        cfg = _fake_config(allowed_user_ids=[OWNER_ID], bot_data_dir=self._dir)
+        with patch("bridge.dashboard.ownership.resolve_owner",
+                   return_value=(ownership.MODE_AUTHORITATIVE, None)), \
+             patch("bridge.dashboard.config", cfg):
+            asyncio.run(self._ds._tick())
+        self.assertEqual(self._bot.get_chat_calls, calls)
+        self.assertEqual(self._bot.pin_calls, [])
+
+    def test_repin_flood_wait_arms_guard_and_retries(self):
+        live = self._board()
+        self._bot.pinned.discard(live)
+        self._bot.pin_chat_message.side_effect = telegram.error.RetryAfter(30)
+        self._age_check(PIN_CHECK_IDLE_SECS + 1)
+        with self.assertLogs("bridge.dashboard", level="INFO"):
+            self._tick(DAY1)
+        self.assertGreater(self._ds._flood_until, time.monotonic())
+        self.assertIsNone(self._ds._last_pin_check)
+        self._bot.pin_chat_message.side_effect = self._bot._pin
+        self._ds._flood_until = 0.0
+        with self.assertLogs("bridge.dashboard", level="INFO"):
+            self._tick(DAY1)
+        self.assertIn(live, self._bot.pinned)
 
 
 # ---------------------------------------------------------------------------

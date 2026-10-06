@@ -687,36 +687,100 @@ def _pending_approval_session(user_id):
     }
 
 
+@pytest.mark.parametrize(
+    "locale,text,expect_grant",
+    [
+        (locale, text, grant)
+        for locale in ("en", "ko")
+        for text, grant in (
+            ("1", True),
+            ("1.", True),
+            ("1. Allow this access", True),
+            ("ALLOW_OUTSIDE_ONCE", True),
+            ("ALLOWOUTSIDEONCE", True),
+            ("allow_outside_once", True),
+            ("  Allow-Outside Once  ", True),
+            ("allow", True),
+            ("yes", True),
+            ("y", True),
+            ("2", False),
+            ("2.", False),
+            ("2. Deny this access", False),
+            ("DENY_OUTSIDE", False),
+            ("DENYOUTSIDE", False),
+            ("deny-outside", False),
+            ("deny", False),
+            ("no", False),
+            ("n", False),
+            ("ALLOW_OUTSIDE_ONCE DENY_OUTSIDE", False),
+            ("ALLOWOUTSIDEONCE DENYOUTSIDE", False),
+            ("1. DENY_OUTSIDE", False),
+            ("2. ALLOW_OUTSIDE_ONCE", False),
+            ("1. no", False),
+            ("2. yes", False),
+            ("hello", None),
+            ("1 more thing about the file", None),
+            ("There is 1 more thing about the file", None),
+            ("2 more things about the file", None),
+            ("11", None),
+            ("12. Allow this access", None),
+            ("21", None),
+            ("1.5", None),
+        )
+    ] + [
+        ("ko", "1. \uc774\ubc88\ub9cc \ud5c8\uc6a9", True),
+        ("ko", "2. \uac70\ubd80", False),
+        ("ko", "\ud5c8\uc6a9", True),
+        ("ko", "\uc774\ubc88\ub9cc \ud5c8\uc6a9", True),
+        ("ko", "\uc608", True),
+        ("ko", "\ub124", True),
+        ("ko", "\uac70\ubd80", False),
+        ("ko", "\uc544\ub2c8\uc694", False),
+        ("ko", "\uc544\ub2c8\uc624", False),
+        ("ko", "1. \uac70\ubd80", False),
+        ("ko", "2. \uc774\ubc88\ub9cc \ud5c8\uc6a9", False),
+    ],
+)
 @pytest.mark.asyncio
-async def test_capture_returns_true_while_prompt_pending():
-    # Unit: the capture helper reports "prompt was live" so the caller can skip
-    # fast-path. Allow token, deny token, and a non-decision message all count
-    # as "pending" while a fresh prompt exists.
+async def test_capture_returns_true_while_prompt_pending(
+    monkeypatch, locale, text, expect_grant
+):
+    # Every live prompt suppresses B4 fast-path, including non-decisions.
+    monkeypatch.setattr(config_mod.config, "locale", locale)
+    for name in ("OUTSIDE_APPROVAL_ALLOW_WORDS", "OUTSIDE_APPROVAL_DENY_WORDS"):
+        monkeypatch.setattr(messages, name, messages.t(name.lower()))
     b = _make_bot()
-    for text, expect_grant in (("1", True), ("2", False), ("hello", None)):
-        sm = _FakeSessionManager(_pending_approval_session(900))
-        import unittest.mock as _mock
+    sm = _FakeSessionManager(_pending_approval_session(900))
+    before = dict(sm._store[900])
+    monkeypatch.setattr(bot_mod, "session_manager", sm)
+    assert await b._maybe_capture_outside_approval(900, text) is True
+    session = sm._store[900]
+    if expect_grant is None:
+        assert session == before
+        return
+    assert session["outside_path_approved_once"] is expect_grant
+    assert "pending_outside_paths" not in session
+    assert "pending_outside_at" not in session
+    if expect_grant:
+        assert session["outside_path_approved_paths"] == before["pending_outside_paths"]
+        assert session["outside_path_approved_paths"] is not before["pending_outside_paths"]
+        assert before["pending_outside_at"] <= session["outside_path_approved_at"] <= time.time()
+    else:
+        assert "outside_path_approved_paths" not in session
+        assert "outside_path_approved_at" not in session
 
-        with _mock.patch.object(bot_mod, "session_manager", sm):
-            pending = await b._maybe_capture_outside_approval(900, text)
-        assert pending is True
-        if expect_grant is True:
-            assert sm._store[900].get("outside_path_approved_once") is True
-        elif expect_grant is False:
-            assert sm._store[900].get("outside_path_approved_once") is False
 
-
+@pytest.mark.parametrize("text", ["1", "1. \uc774\ubc88\ub9cc \ud5c8\uc6a9", "ALLOWOUTSIDEONCE", "\ub124"])
 @pytest.mark.asyncio
-async def test_capture_returns_false_when_no_prompt_or_expired():
+async def test_capture_returns_false_when_no_prompt_or_expired(monkeypatch, text):
     b = _make_bot()
-    import unittest.mock as _mock
-
     # No prompt pending.
     sm = _FakeSessionManager({901: {}})
-    with _mock.patch.object(bot_mod, "session_manager", sm):
-        assert await b._maybe_capture_outside_approval(901, "1") is False
+    monkeypatch.setattr(bot_mod, "session_manager", sm)
+    assert await b._maybe_capture_outside_approval(901, text) is False
+    assert sm._store[901] == {}
 
-    # Prompt pending but expired -> free to fast-path.
+    # Prompt pending but expired -> no grant and free to fast-path.
     sm = _FakeSessionManager(
         {
             902: {
@@ -725,8 +789,33 @@ async def test_capture_returns_false_when_no_prompt_or_expired():
             }
         }
     )
-    with _mock.patch.object(bot_mod, "session_manager", sm):
-        assert await b._maybe_capture_outside_approval(902, "1") is False
+    monkeypatch.setattr(bot_mod, "session_manager", sm)
+    assert await b._maybe_capture_outside_approval(902, text) is False
+    assert sm._store[902] == {}
+
+
+@pytest.mark.asyncio
+async def test_numbered_approval_stays_path_bound_and_single_use(monkeypatch):
+    b = _make_bot()
+    sm = _FakeSessionManager(_pending_approval_session(904))
+    monkeypatch.setattr(bot_mod, "session_manager", sm)
+    assert await b._maybe_capture_outside_approval(904, "1. Allow") is True
+    assert await b._consume_outside_approval_once(904, ["/etc/passwd"]) is False
+    assert sm._store[904]["outside_path_approved_once"] is True
+    assert await b._consume_outside_approval_once(904, ["/etc/hosts"]) is True
+    assert await b._consume_outside_approval_once(904, ["/etc/hosts"]) is False
+
+
+@pytest.mark.asyncio
+async def test_numbered_approval_grant_still_expires(monkeypatch):
+    b = _make_bot()
+    sm = _FakeSessionManager(_pending_approval_session(905))
+    monkeypatch.setattr(bot_mod, "session_manager", sm)
+    assert await b._maybe_capture_outside_approval(905, "1. Allow") is True
+    session = sm._store[905]
+    session["outside_path_approved_at"] -= bot_mod.OUTSIDE_APPROVAL_TTL + 1
+    assert await b._consume_outside_approval_once(905, ["/etc/hosts"]) is False
+    assert session == {"outside_path_approved_once": False}
 
 
 @pytest.mark.asyncio

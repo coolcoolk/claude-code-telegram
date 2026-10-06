@@ -26,7 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 # Always override, even when PROJECT_ROOT is already set in the environment.
 # The real project directory carries a live .env that pollutes module-level
 # constants (INTERIM_MODE, OUTPUT_LANG_GUARD, etc.) and flips assertions.
-_hermetic_root = tempfile.mkdtemp(prefix="bridge-test-")
+_hermetic_tmp = tempfile.TemporaryDirectory(prefix="bridge-test-")
+_hermetic_root = _hermetic_tmp.name
+
+def pytest_unconfigure(config):
+    _hermetic_tmp.cleanup()
+
 (Path(_hermetic_root) / ".telegram_bot").mkdir(parents=True, exist_ok=True)
 os.environ["PROJECT_ROOT"] = _hermetic_root
 

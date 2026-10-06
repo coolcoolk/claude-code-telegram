@@ -8,12 +8,14 @@ set in the environment before importing this module (done by __main__).
 
 import logging
 import os
+import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Dict, List, Optional
+from typing import Annotated, Dict, List, Optional, Tuple
 
-from dotenv import load_dotenv
-from pydantic import Field, field_validator
+from dotenv import dotenv_values, load_dotenv
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -37,6 +39,24 @@ CLAIM_CODE_PATH = BOT_DATA_DIR / "claim_code"
 CLAIMED_FLAG_PATH = BOT_DATA_DIR / ".claimed"
 
 _PLACEHOLDER_TOKENS = {"your_bot_token_here", ""}
+
+MACHINE_VOICE_PATH = None
+MACHINE_VOICE_DEFAULTS = (
+    dotenv_values(MACHINE_VOICE_PATH) if MACHINE_VOICE_PATH is not None else {}
+)
+# Read before the instance file: its override=True remains authoritative.
+for _key, _field in (("model", "LOCAL_WHISPER_MODEL"),
+                     ("language", "WHISPER_LANGUAGE")):
+    if MACHINE_VOICE_DEFAULTS.get(_key) is not None:
+        os.environ.setdefault(_field, MACHINE_VOICE_DEFAULTS[_key])
+
+
+def _vocabulary(value):
+    """Comma/newline-separated phrases; preserve spaces inside a phrase."""
+    if isinstance(value, str):
+        value = value.replace("\n", ",").split(",")
+    return [str(word).strip() for word in (value or []) if str(word).strip()]
+
 
 # Project .env first (higher priority). override=True so the project file wins
 # over inherited environment variables -- otherwise a TELEGRAM_BOT_TOKEN already
@@ -62,7 +82,10 @@ class Config(BaseSettings):
 
     # Telegram
     telegram_bot_token: str = Field(..., description="Telegram Bot API token")
-    allowed_user_ids: List[int] = Field(
+    # NoDecode (2026-10-02 rehearsal): a claim-mode install exports an EMPTY
+    # ALLOWED_USER_IDS; without NoDecode pydantic-settings JSON-decodes the
+    # env value before the validator runs and json.loads("") crashes boot.
+    allowed_user_ids: Annotated[List[int], NoDecode] = Field(
         default_factory=list,
         description=(
             "Allowed Telegram user IDs. When set, this list is AUTHORITATIVE and "
@@ -172,10 +195,15 @@ class Config(BaseSettings):
     # Voice (local faster-whisper only)
     transcription_provider: str = Field(default="local")
     local_whisper_model: str = Field(default="small")
-    whisper_language: Optional[str] = Field(default="ko")
+    whisper_language: Optional[str] = Field(default=None)
+    agent_lang: Optional[str] = Field(default=None)
+    whisper_vocabulary: Annotated[List[str], NoDecode] = Field(default_factory=list)
     voice_reply_enabled: bool = Field(default=False)
     # Dashboard sync (pinned live-dashboard message, activated by file presence)
     dashboard_enabled: bool = Field(default=True)
+    # DGN-1768 r2: pinned-board rotation mode, auto | explicit (empty ->
+    # config/agent.conf DASHBOARD_ROTATE -> auto; see bridge/dashboard.py).
+    dashboard_rotate: str = Field(default="")
     max_voice_duration: int = Field(default=300)
     ffmpeg_path: Optional[str] = Field(default=None)
 
@@ -314,11 +342,26 @@ class Config(BaseSettings):
                 policy[key] = False
         return policy
 
+    @model_validator(mode="before")
+    @classmethod
+    def _voice_defaults(cls, values):
+        values = dict(values)
+        if values.get("whisper_language") is None:
+            # Use the raw speech locale, before the UI's ko/en normalization.
+            language = values.get("locale") or values.get("agent_lang") or "en"
+            values["whisper_language"] = (
+                str(language).strip().lower().split("_")[0].split("-")[0]
+            )
+        machine = _vocabulary(MACHINE_VOICE_DEFAULTS.get("vocabulary"))
+        additions = _vocabulary(values.get("whisper_vocabulary"))
+        values["whisper_vocabulary"] = list(dict.fromkeys(machine + additions))
+        return values
+
     @field_validator("whisper_language", mode="before")
     @classmethod
     def _normalize_language(cls, v):
         if v is None:
-            return "ko"
+            return None
         value = str(v).strip().lower()
         if not value or value == "auto":
             return None
@@ -363,7 +406,9 @@ def notify_silent(notify_class: str) -> bool:
     return NOTIFY_CLASS_DEFAULT_SILENT.get(notify_class, False)
 
 # Raw env reads for timeout / resume knobs (not pydantic fields by spec).
-PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "600") or "600")
+# DGN-1650 / dec-159: the 20-minute turn budget is the canonical default, not a
+# per-instance setting; CLAUDE_PROCESS_TIMEOUT stays as an override only.
+PROCESS_TIMEOUT = int(os.getenv("CLAUDE_PROCESS_TIMEOUT", "1200") or "1200")
 AUTO_RESUME = os.getenv("CLAUDE_AUTO_RESUME", "0").strip().lower() not in (
     "0",
     "false",
@@ -372,6 +417,17 @@ AUTO_RESUME = os.getenv("CLAUDE_AUTO_RESUME", "0").strip().lower() not in (
     "",
 )
 AUTO_RESUME_MAX = max(0, int(os.getenv("CLAUDE_AUTO_RESUME_MAX", "2") or "2"))
+# DGN-1499: stop-before-kill for the turn timeout. This many seconds BEFORE
+# PROCESS_TIMEOUT expires, the bridge sends the turn a stop signal (the same
+# SDK control interrupt /stop uses) so the CLI concludes the turn itself:
+# streamed output is finalized and the CLI subprocess stays alive for the
+# resume path. Only when that signal fails does the hard teardown run, so
+# force-kill is the designed LAST resort again instead of the first. 0
+# disables the soft window (legacy timeout->teardown); a grace that does not
+# fit under PROCESS_TIMEOUT is ignored the same way.
+TIMEOUT_STOP_GRACE = max(
+    0, int(os.getenv("CLAUDE_TIMEOUT_STOP_GRACE", "60") or "60")
+)
 # DGN-460: SDK subprocess-transport JSON read buffer. The claude-agent-sdk
 # defaults to 1MB (_DEFAULT_MAX_BUFFER_SIZE); a single CLI->SDK message over
 # that (e.g. a base64 image in a tool result) crashes the reader loop with
@@ -459,6 +515,91 @@ DASH_NORMALIZE = os.getenv("DASH_NORMALIZE", "on").strip().lower() not in (
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH") or (
     str(config.claude_cli_path) if config.claude_cli_path else None
 )
+
+
+# DGN-1814 (dec-223): ONE Claude CLI resolver for every site that launches the
+# CLI (sdk_bridge send path, btw fork, options classifier, --selfcheck, boot
+# snapshot). Before this, the send path only passed cli_path when
+# CLAUDE_CLI_PATH was set, so an instance without the key silently ran the
+# SDK's BUNDLED CLI (which moves only with the SDK) while selfcheck and the boot
+# snapshot reported the PATH CLI -- two different CLIs, two different model
+# aliases. Ladder:
+#   1. explicit CLAUDE_CLI_PATH (env or .env) -- returned even when missing, so
+#      a typo fails loudly (selfcheck FAIL, SDK launch error) instead of being
+#      silently replaced by another binary
+#   2. shutil.which("claude") under the process env PATH
+#   3. ~/.local/bin/claude (the native installer target; launchd PATH may omit it)
+#   4. None -> the SDK's bundled CLI, last resort (logged loudly at startup)
+CLI_SOURCE_EXPLICIT = "explicit"
+CLI_SOURCE_PATH = "path"
+CLI_SOURCE_LOCAL_BIN = "local_bin"
+CLI_SOURCE_BUNDLED = "bundled"
+_CLI_VERSION_TIMEOUT_S = 5.0
+
+
+def resolve_claude_cli_source() -> Tuple[Optional[str], str]:
+    """(path, source) of the Claude CLI to launch. path None == SDK bundled.
+
+    Reads the module-level CLAUDE_CLI_PATH at call time (tests patch it)."""
+    explicit = CLAUDE_CLI_PATH
+    if explicit:
+        return str(Path(explicit).expanduser()), CLI_SOURCE_EXPLICIT
+    which = shutil.which("claude")
+    if which:
+        return which, CLI_SOURCE_PATH
+    local_bin = Path.home() / ".local" / "bin" / "claude"
+    if local_bin.exists():
+        return str(local_bin), CLI_SOURCE_LOCAL_BIN
+    return None, CLI_SOURCE_BUNDLED
+
+
+def resolve_claude_cli() -> Optional[str]:
+    """Path to pass as the SDK cli_path / to exec; None == SDK bundled CLI."""
+    return resolve_claude_cli_source()[0]
+
+
+def claude_cli_version(path: Optional[str]) -> Optional[str]:
+    """`<path> --version` stdout, or None (missing path / error / timeout)."""
+    if not path:
+        return None
+    try:
+        proc = subprocess.run(
+            [path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=_CLI_VERSION_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def log_claude_cli_resolution() -> Tuple[Optional[str], str]:
+    """Startup line naming the CLI every launch site will use (DGN-1814).
+
+    WARNING when falling back to the SDK-bundled CLI or when an explicit path
+    does not exist; INFO otherwise."""
+    log = logging.getLogger(__name__)
+    path, source = resolve_claude_cli_source()
+    if path is None:
+        log.warning(
+            "Claude CLI: NONE on PATH or ~/.local/bin and CLAUDE_CLI_PATH unset "
+            "-> falling back to the claude-agent-sdk BUNDLED CLI (it lags the "
+            "machine CLI; model aliases may resolve differently). Set "
+            "CLAUDE_CLI_PATH or install claude on PATH."
+        )
+    elif source == CLI_SOURCE_EXPLICIT and not Path(path).exists():
+        log.warning("Claude CLI: CLAUDE_CLI_PATH=%s does NOT exist -- launches will fail", path)
+    else:
+        log.info(
+            "Claude CLI: %s (source=%s, version=%s)",
+            path,
+            source,
+            claude_cli_version(path) or "unknown",
+        )
+    return path, source
 # DGN-426: expose as module-level constant so sdk_bridge.py can import once
 # rather than reaching into the Config object on every message.
 # DGN-682: kept as a DERIVED back-compat symbol (existing tests patch it and

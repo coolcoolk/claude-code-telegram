@@ -123,7 +123,7 @@ notify() {
   # that says nothing when it fires. The log is the floor under that.
   log "notify: $1"
   if [ -x "$PROJECT_ROOT/routines/push.sh" ]; then
-    "$PROJECT_ROOT/routines/push.sh" --text "$1" >/dev/null 2>&1 || true
+    "$PROJECT_ROOT/routines/push.sh" --text "$1" --audience owner >/dev/null 2>&1 || true
   fi
 }
 
@@ -312,6 +312,7 @@ if [ $(( now - strike_time )) -lt "$STRIKE_GRACE_S" ]; then
 fi
 
 # --- restart path ------------------------------------------------------------
+
 
 # GRILL FIX: never kick a service that is not actually registered (fresh
 # installs in manual mode, renamed labels). Verify the target exists first.

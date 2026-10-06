@@ -21,7 +21,9 @@ FALLBACK = "sonnet"
 
 class _Base(unittest.TestCase):
     def setUp(self):
-        self._dir = Path(tempfile.mkdtemp(prefix="model-state-test-"))
+        tmp = tempfile.TemporaryDirectory(prefix="model-state-test-")
+        self.addCleanup(tmp.cleanup)
+        self._dir = Path(tmp.name)
         self._last = self._dir / "last_model.json"
         self._ws = self._dir / "workspace_settings.json"
         self._global = self._dir / "global_settings.json"

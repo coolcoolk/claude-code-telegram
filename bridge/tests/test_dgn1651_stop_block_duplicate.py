@@ -479,7 +479,7 @@ class TestOwnerSurface(unittest.TestCase):
         # asks for a CHANGED answer. The live bubble must show the new answer
         # alone, and the delivered body is the DGN-1253 assembly (unchanged).
         response, live, final, _screen = hook_turn(
-            [TextBlock(text="이름을 알려드릴게요: 워그입니다.")],
+            [TextBlock(text="이름을 알려드릴게요: 하루입니다.")],
             [TextBlock(text="이름은 형님이 정해 주세요.")],
             interim_mode="inline",
         )
@@ -488,7 +488,7 @@ class TestOwnerSurface(unittest.TestCase):
         # DGN-1253 keeps BOTH segments in the body (no exact-paragraph match),
         # which is the assembly's judgment, not this seat's.
         self.assertIn("이름은 형님이 정해 주세요.", response.content)
-        self.assertIn("이름을 알려드릴게요: 워그입니다.", response.content)
+        self.assertIn("이름을 알려드릴게요: 하루입니다.", response.content)
         self.assertEqual(final[0], response.content)
 
     def test_single_segment_turn_is_unchanged(self):
@@ -544,8 +544,7 @@ class TestOwnerSurface(unittest.TestCase):
                     interim_mode=mode,
                 )
                 self.assertEqual(response.content, GREETING)
-                self.assertTrue(final)
-                self.assertTrue(all(t == GREETING for t in final))
+                self.assertEqual(final, [GREETING])
 
     def test_overflow_hook_turn_loses_nothing(self):
         # The first terminal answer overflows one bubble, so the accumulator

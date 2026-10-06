@@ -165,13 +165,14 @@ class LangGuardGatingTest(unittest.TestCase):
         # Source-level wiring check (test_dgn376 idiom): the finalize seat must
         # skip the register guard entirely on is_error results (DGN-686 split;
         # supersedes the DGN-429 lang_check=not msg.is_error form) so English
-        # error descriptions are never flagged as language slips.
+        # error descriptions are never flagged as language slips. DGN-1857:
+        # the seat reads a local is_error (msg.is_error or a CLI auth failure).
         import inspect
 
         src = inspect.getsource(sdk_bridge)
         self.assertRegex(
             src,
-            r"if not msg\.is_error:\s*"
+            r"if not (?:msg\.)?is_error:\s*"
             r"result_text = _register_guard\(_scaffold_guard\(result_text\)\)"
             r"\s*else:\s*"
             r"result_text = _scaffold_guard\(result_text\)",

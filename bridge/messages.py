@@ -37,14 +37,17 @@ MODEL_SWITCH_WARNING = t("model_switch_warning")
 MODEL_UNKNOWN = t("model_unknown")
 MODEL_STATE_FALLBACK = t("model_state_fallback")
 MODEL_ALREADY_ACTIVE = t("model_already_active")
+MODEL_VENDOR_NOT_WIRED = t("model_vendor_not_wired")
 STOP_PAUSED = t("stop_paused")
 STOP_NOTHING = t("stop_nothing")
 STOP_INTERRUPTED = t("stop_interrupted")
 # DGN-1015: fires ONLY when sdk_bridge.pop_interrupt_killed() confirms at
-# least one tracked background subagent actually died in this interrupt
-# (auto or /stop). {names} = comma-joined descriptions. Copy
-# owner-approved 2026-08-24 (see the i18n comment).
-BG_SUBAGENT_KILLED_NOTICE = t("bg_subagent_killed_notice")
+# least one tracked background task actually died in an AUTOMATIC
+# interrupt. Never after /stop (DGN-1593 B). {count} = how many, then one
+# BG_TASK_KILLED_ITEM bullet per job with an owner-facing name (DGN-1593
+# r2; internal labels never reach the owner). Owner-confirmed 2026-10-02.
+BG_TASK_KILLED_NOTICE = t("bg_task_killed_notice")
+BG_TASK_KILLED_ITEM = t("bg_task_killed_item")
 # DGN-1016 O1: dedicated copy for the AUTOMATIC in-flight interrupt notice
 # (BRIDGE_INFLIGHT_INTERRUPT_NOTICE opt-in; default stays OFF per the
 # 2026-08-17 owner decision). The flag previously reused STOP_INTERRUPTED,
@@ -170,13 +173,7 @@ EXTERNAL_FILE_CONFIRMED = t("external_file_confirmed")
 EXTERNAL_FILE_OMITTED_NONINTERACTIVE = t("external_file_omitted_noninteractive")
 
 # --- Timeout / resume (A4) ---
-# DGN-1523: the content a timed-out ChatResponse carries cannot itself know
-# whether a resume button will follow -- only bot.py._send_resume_notice
-# knows that, and it builds TIMEOUT_TAP_NOTICE fresh alongside the actual
-# button. So this reuses the still_working catalog entry (one source) rather
-# than its own template: a second, independently-worded string here could
-# describe a button that _send_resume_notice never ends up sending.
-TIMEOUT_PAUSED = t("still_working")
+TIMEOUT_PAUSED = t("timeout_paused")
 TIMEOUT_NO_RESUME = t("timeout_no_resume")
 TAP_TO_CONTINUE = t("tap_to_continue")
 TIMEOUT_TAP_NOTICE = t("timeout_tap_notice")
@@ -269,7 +266,14 @@ SYSTEM_PROMPT_FOLD_FRAGMENT = (
     "(what you are doing right now); the final message carries the "
     "SUBSTANTIVE RESULT ONLY. Do NOT restate or re-summarize in the "
     "final message what you already narrated as progress -- the user has "
-    "already seen it."
+    "already seen it. "
+    # DGN-1838: the bridge promotes a substantive interim block out of the
+    # fold (formatting.is_substantive_interim), so the fold is no longer
+    # the only fate of interim text.
+    "Exception: a substantive answer you write between tool calls (a list, "
+    "headings, or several paragraphs) is not folded -- it is delivered to "
+    "the user as its own normal message just before your final message, "
+    "so it is never lost and needs no repeat."
 )
 
 # DGN-429 hybrid leg 1: output-language rule template appended to the system
@@ -283,6 +287,10 @@ ASK_USER_QUESTION_DENY = t("ask_user_question_deny")
 
 # Denial message returned to Claude when an out-of-root path is detected.
 OUTSIDE_PATH_DENY = t("outside_path_deny")
+
+# Pipe-separated exact reply words for the active locale.
+OUTSIDE_APPROVAL_ALLOW_WORDS = t("outside_approval_allow_words")
+OUTSIDE_APPROVAL_DENY_WORDS = t("outside_approval_deny_words")
 
 # Denial returned to Claude for a protected/out-of-root path on a no-pending
 # (background/proactive) turn, where no interactive confirm is possible.

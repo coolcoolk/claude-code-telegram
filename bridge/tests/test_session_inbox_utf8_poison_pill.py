@@ -50,7 +50,7 @@ def _fake_self():
 class TestSessionInboxPoisonPill(unittest.TestCase):
     OWNER_ID = 1
 
-    def _run_loop(self, *, setup, max_ticks):
+    def _run_loop(self, *, setup, max_ticks, allowed_ids=None):
         """Drive the real loop body against a temp spool dir for max_ticks
         polls, then hand back the inbox dir + recorded injections/log calls.
 
@@ -77,7 +77,7 @@ class TestSessionInboxPoisonPill(unittest.TestCase):
         async def ensure_owner_stream(uid, model, chat_id, push):
             return True
 
-        async def inject_background_turn(uid, text):
+        async def inject_background_turn(uid, text, quiet=False):
             results["injected"].append((uid, text))
             return True
 
@@ -86,7 +86,9 @@ class TestSessionInboxPoisonPill(unittest.TestCase):
 
         fake_config = MagicMock()
         fake_config.bot_data_dir = data_dir
-        fake_config.allowed_user_ids = [self.OWNER_ID]
+        fake_config.allowed_user_ids = (
+            [self.OWNER_ID] if allowed_ids is None else allowed_ids
+        )
 
         fake_sessmgr = MagicMock()
         fake_sessmgr.get_session = AsyncMock(return_value={"model": "sonnet"})
@@ -175,6 +177,23 @@ class TestSessionInboxPoisonPill(unittest.TestCase):
             results["injected"], [(self.OWNER_ID, "[cron-inject] resume + verify")]
         )
         fake_logger.error.assert_not_called()
+
+    def test_claimed_owner_receives_inbox_with_empty_allowlist(self):
+        def setup(inbox):
+            (inbox.parent / "owner.lock").write_text("42\n", encoding="ascii")
+            (inbox / "notice.md").write_text("[cron-inject] ready", encoding="ascii")
+
+        inbox, results, _ = self._run_loop(setup=setup, max_ticks=2, allowed_ids=[])
+        self.assertEqual(results["injected"], [(42, "[cron-inject] ready")])
+        self.assertFalse((inbox / "notice.md").exists())
+
+    def test_unclaimed_inbox_stays_pending(self):
+        def setup(inbox):
+            (inbox / "notice.md").write_text("[cron-inject] ready", encoding="ascii")
+
+        inbox, results, _ = self._run_loop(setup=setup, max_ticks=2, allowed_ids=[])
+        self.assertEqual(results["injected"], [])
+        self.assertTrue((inbox / "notice.md").exists())
 
 
 if __name__ == "__main__":

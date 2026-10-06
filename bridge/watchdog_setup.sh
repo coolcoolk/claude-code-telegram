@@ -15,6 +15,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DATA_DIR="$PROJECT_ROOT/.telegram_bot"
 
+# DGN-1572: launchd unit install directory, overridable so a sandboxed test
+# instance can never register a real unit in the owner's live launchd domain.
+# Unset (the live default) resolves to the exact historical path.
+LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+
 # DGN-1210: explicit relocation declaration. update.sh:5633 / install.sh:3537
 # invoke this script with NO flags, so a clone's transitive self-update can
 # never acquire --relocate; only a human retiring the old root passes it.
@@ -41,6 +46,36 @@ WATCHDOG_UNIT="${DOGANY_WATCHDOG_UNIT:-}"
 
 info() { echo "[watchdog-setup] $*"; }
 warn() { echo "[watchdog-setup][WARN] $*" >&2; }
+
+# DGN-1717: persistent operator opt-out. update.sh runs this script on EVERY
+# update, so an operator who turned the watchdog off had it re-registered
+# (and loaded, every 120s) by the next update. Two OFF signals, both checked
+# BEFORE any cp/bootout/bootstrap (or systemd unit write):
+#   1. .instance.conf DOGANY_WATCHDOG=off (also: 0 / false / no / disabled)
+#      -- the primary, durable switch. Re-enable: delete the line or set on.
+#   2. macOS: a <plist>.disabled-* file next to where the live plist would
+#      go, with NO live plist there -- the shape an operator leaves when
+#      disabling by hand (rename + bootout). Honoured as "off" so an update
+#      never re-arms a watchdog that is currently absent-and-disabled.
+# A skip is logged and exits 0 (the DGN-140 non-fatal contract).
+# The config key is estate (the public bridge build has no instance conf):
+# there the function is a plain "not off" and only signal 2 applies.
+watchdog_conf_off() {
+  return 1
+}
+
+# watchdog_disabled_file <live plist dest> -> prints the first matching
+# <dest>.disabled-* when the live dest itself is absent; rc 0 when found.
+watchdog_disabled_file() {
+  local dest="$1" f
+  [ -e "$dest" ] && return 1
+  for f in "$dest".disabled-*; do
+    [ -e "$f" ] || continue
+    printf '%s' "$f"
+    return 0
+  done
+  return 1
+}
 
 # Read the launchd Label key from a plist (mirrors install.sh plist_label:
 # plutil, then PlistBuddy, then a grep fallback; empty on failure).
@@ -144,7 +179,7 @@ dgn1210_canon_dir() {
 # the two can diverge and only the loaded one fires. Unreadable output ==
 # no incumbent (a fresh install must stay registrable: fail-open on read).
 dgn1210_incumbent_script_macos() {
-  launchctl print "gui/$(id -u)/$1" 2>/dev/null \
+  wd_launchctl print "gui/$(id -u)/$1" 2>/dev/null \
     | sed -n 's#^[[:space:]]*\(/.*/bridge/watchdog\.sh\)$#\1#p' | head -n1
 }
 
@@ -268,7 +303,7 @@ write_service_marker() {
   if [ -z "$src" ]; then
     return 0
   fi
-  dest="$HOME/Library/LaunchAgents/$(basename "$src")"
+  dest="$LAUNCH_AGENTS_DIR/$(basename "$src")"
   if [ ! -f "$dest" ]; then
     warn "bridge service plist not installed ($dest), not writing service marker"
     return 0
@@ -292,6 +327,12 @@ write_service_marker() {
   info "service plist marker written: $SERVICE_PLIST_MARKER ($label)"
   return 0
 }
+
+# DGN-1718-BEGIN single launchctl seam -- every launchctl call in this
+# script goes through wd_launchctl.
+wd_launchctl() { launchctl "$@"; }
+wd_launchctl_preflight() { :; }
+# DGN-1718-END
 
 setup_macos() {
   local src="" label dest bridge_label
@@ -317,17 +358,33 @@ setup_macos() {
     return 0
   fi
   label="$(plist_label "$src")"
-  [ -n "$label" ] || label="$(basename "$src" .plist)"
+  if [ -z "$label" ]; then
+    warn "cannot determine launchd Label from $src, skipping registration"
+    return 1
+  fi
   case "$label" in
     *__*) warn "unsubstituted placeholders in label ($label), skipping registration"; return 0 ;;
   esac
+  dest="$LAUNCH_AGENTS_DIR/$(basename "$src")"
+  # DGN-1717: absent-and-disabled by hand == off. Checked under both the
+  # source basename and <label>.plist (the two names a hand-disable leaves).
+  local _dis=""
+  _dis="$(watchdog_disabled_file "$dest")" \
+    || _dis="$(watchdog_disabled_file "$LAUNCH_AGENTS_DIR/$label.plist")" \
+    || _dis=""
+  if [ -n "$_dis" ]; then
+    info "watchdog is disabled on this host ($_dis present, no live plist) -- skipping registration (DGN-1717). To re-enable: remove that file, then re-run bridge/watchdog_setup.sh"
+    return 0
+  fi
   # DGN-1210: identity gate BEFORE cp/repoint/bootout -- the bootout below
   # would erase the very incumbent registration this gate reads.
   if ! dgn1210_gate "$label" "$(dgn1210_incumbent_script_macos "$label")"; then
     return 3
   fi
-  dest="$HOME/Library/LaunchAgents/$(basename "$src")"
-  mkdir -p "$HOME/Library/LaunchAgents"
+  if ! mkdir -p "$LAUNCH_AGENTS_DIR"; then
+    warn "cannot create launchd directory: $LAUNCH_AGENTS_DIR, skipping registration"
+    return 1
+  fi
   cp -p "$src" "$dest"
   # DGN-480: repoint the registered plist at THIS instance's current location.
   # The source plist's ProgramArguments/log paths were baked at mint time and
@@ -340,12 +397,13 @@ setup_macos() {
   # the same value is a no-op, so this is idempotent on re-run. The launchd Label
   # is path-independent and is intentionally left untouched.
   repoint_plist_paths "$dest"
+  wd_launchctl_preflight
   # Idempotent re-register: bootout an existing instance first (may not exist).
-  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$dest" 2>/dev/null \
-    || launchctl load "$dest" 2>/dev/null \
+  wd_launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  wd_launchctl bootstrap "gui/$(id -u)" "$dest" 2>/dev/null \
+    || wd_launchctl load "$dest" 2>/dev/null \
     || warn "bootstrap/load reported an error for $label"
-  if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+  if wd_launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
     info "watchdog registered: $label (every 2 min)"
   else
     warn "could not verify watchdog registration: $label"
@@ -402,6 +460,11 @@ UNIT
 
 # DGN-1210: rc 3 (identity-conflict refusal) is the ONLY nonzero exit; every
 # ordinary failure above still returns 0 (DGN-140 non-fatal contract).
+# DGN-1717: the config opt-out wins before ANY platform work.
+if watchdog_conf_off; then
+  info "watchdog disabled by configuration -- skipping registration (no plist copy, no bootout/bootstrap)"
+  exit 0
+fi
 rc=0
 case "$(uname -s)" in
   Darwin) setup_macos || rc=$? ;;

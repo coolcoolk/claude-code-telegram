@@ -69,6 +69,12 @@ class _FakeMessage:
         self.replies.append(text)
 
 
+
+# Rendered copy (owner 2026-10-02): the window in minutes, no raw slots.
+_EXPIRED = messages.STALE_CALLBACK_EXPIRED.format(choice="", minutes=20)
+_EXPIRED_NOLABEL = messages.STALE_CALLBACK_EXPIRED_NOLABEL.format(minutes=20)
+assert "20" in _EXPIRED and "{" not in _EXPIRED
+
 def _keyboard(*pairs):
     """Minimal inline_keyboard stand-in: (text, callback_data) rows."""
     rows = [[SimpleNamespace(text=t, callback_data=cb)] for t, cb in pairs]
@@ -138,7 +144,7 @@ async def test_expired_owner_tap_gets_alert_and_log(caplog):
     # 확정 문구(오너 2026-09-10 07:42)는 만료 사실 하나만 말한다. 라벨을 본문에
     # 싣던 초안은 폐기됐다 -- 재타이핑 방법은 학습되는 조작이라 매번 재설명하지
     # 않는다. 여기서 지키는 불변식은 "침묵하지 않는다" 이지 "라벨을 담는다" 가 아니다.
-    assert text == messages.STALE_CALLBACK_EXPIRED
+    assert text == _EXPIRED
     assert text.strip(), "an empty alert is the silence this fix removes"
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
@@ -229,7 +235,7 @@ async def test_alert_degrades_when_label_is_unrecoverable():
         await b._check_access(upd)
 
     text = query.answer.await_args.args[0]
-    assert text == messages.STALE_CALLBACK_EXPIRED_NOLABEL
+    assert text == _EXPIRED_NOLABEL
     # 확정 문구는 라벨 유무로 갈리지 않는다. 지켜야 할 것은 콜백 id 가 새어나가지
     # 않는 것 하나다.
     assert "opt:1" not in text
@@ -245,7 +251,7 @@ async def test_alert_degrades_on_number_handle_label():
     with _as_owner():
         await b._check_access(upd)
 
-    assert query.answer.await_args.args[0] == messages.STALE_CALLBACK_EXPIRED_NOLABEL
+    assert query.answer.await_args.args[0] == _EXPIRED_NOLABEL
 
 
 @pytest.mark.asyncio
@@ -265,7 +271,7 @@ async def test_alert_is_label_independent():
         await b._check_access(upd)
 
     text = query.answer.await_args.args[0]
-    assert text == messages.STALE_CALLBACK_EXPIRED
+    assert text == _EXPIRED
     assert "로그부터" not in text, "라벨이 토스트로 새면 안 된다"
 
 

@@ -15,6 +15,7 @@ import os
 import re
 import signal
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,7 +32,9 @@ from claude_agent_sdk import (
     ServerToolUseBlock,
     SystemMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 
 # DGN-1016: task-lifecycle message types + the terminal-status vocabulary that
@@ -63,18 +66,22 @@ except ImportError:  # SDK predates the typed task-lifecycle messages
     TaskUpdatedMessage = _AbsentTaskMessage
     TASK_LIFECYCLE_AVAILABLE = False
 
+from bridge import live_model
 from bridge import messages
+from bridge import mint_gate
+from bridge import notice_spool
 from bridge.config import (
     BRIDGE_REGISTER_GUARD,
     BRIDGE_SCAFFOLD_GUARD,
-    CLAUDE_CLI_PATH,
     CLAUDE_MAX_BUFFER_SIZE,
     FOLD_UPDATE_INTERVAL,
     INTERIM_MODE,
     OUTPUT_LANG_GUARD,
     PROCESS_TIMEOUT,
     STREAM_INTERIM,
+    TIMEOUT_STOP_GRACE,
     config,
+    resolve_claude_cli,
 )
 from bridge.formatting import (
     FOLD_CAPTION_NORMAL,
@@ -83,8 +90,10 @@ from bridge.formatting import (
     INTERIM_FOLD_SEPARATOR,
     INTERRUPT_FOLD_CAPTION,
     compose_interim_fold,
+    split_promoted_interim,
     render_fold_final,
     render_fold_live,
+    strip_no_push_sentinel,
 )
 from bridge.options import (
     OPTIONS_MARKER,
@@ -92,6 +101,7 @@ from bridge.options import (
     has_numbered_list,
     has_options_marker,
     has_single_trailing_option,
+    subtract_delivered,
 )
 from bridge.permissions import extract_outside_paths, extract_protected_paths
 from bridge.session import session_manager
@@ -352,12 +362,60 @@ _ERR_TRANSIENT_MARKERS = (
 )
 
 
+# DGN-1857: Claude Code reports an auth failure as a SYNTHETIC assistant
+# message (model "<synthetic>", error="authentication_failed"), not as an
+# is_error result, so its text rode the normal answer path to the owner
+# verbatim ("Failed to authenticate: OAuth session expired and could not be
+# refreshed", 73 chars -- under the register guard's 80-char floor). The
+# prefixes are the CLI's own strings (claude 2.1.288 bundle): -p / SDK mode
+# opens every auth failure with "Failed to authenticate"; the interactive
+# forms are middle-dot pairs; the last two are the pre-2.1 API-error shapes.
+# Anchored at the START of a SHORT text so an answer that merely talks about
+# OAuth or /login never matches.
+_CLI_AUTH_FAILURE_PREFIXES = (
+    "Failed to authenticate",
+    "Login expired \u00b7",
+    "OAuth token revoked \u00b7",
+    "Not logged in \u00b7",
+    "Please run /login \u00b7",
+    "Invalid API key \u00b7",
+    "Invalid auth token \u00b7",
+    "Authentication required \u00b7",
+    "OAuth token has expired",
+    "API Error: 401",
+)
+_CLI_AUTH_FAILURE_MAX_LEN = 400
+
+
+def _is_cli_auth_failure_text(text: str) -> bool:
+    t = (text or "").strip()
+    return 0 < len(t) <= _CLI_AUTH_FAILURE_MAX_LEN and t.startswith(
+        _CLI_AUTH_FAILURE_PREFIXES
+    )
+
+
+def _cli_auth_failure(msg: Any) -> Optional[str]:
+    """DGN-1857: the raw text of a main-thread AssistantMessage that is the
+    CLI's auth-failure report, else None. The SDK's structural error flag
+    (newer SDKs) or the text signature (any SDK) is enough."""
+    text = "\n".join(
+        b.text for b in msg.content if isinstance(b, TextBlock)
+    ).strip()
+    if getattr(msg, "error", None) == "authentication_failed":
+        return text or "authentication_failed"
+    if _is_cli_auth_failure_text(text):
+        return text
+    return None
+
+
 def _classify_error_result(detail: str) -> str:
     """Classify a failure detail into 'auth' | 'transient' | 'other'.
 
     Auth takes precedence over transient (a 401 must never be retried). Match
     is substring/case-insensitive against the raw failure text.
     """
+    if _is_cli_auth_failure_text(detail):
+        return "auth"
     low = (detail or "").lower()
     if any(m in low for m in _ERR_AUTH_MARKERS):
         return "auth"
@@ -423,6 +481,63 @@ _SCAFFOLD_SIGNATURES = (
     "UserPromptSubmit hook additional context",
     "UserPromptSubmit hook success",
 )
+
+# DGN-1606: harness-owned injected-turn mark.  Every background injection
+# (session-inbox / cron-inject, the inject_background_turn choke point) OPENS
+# with this line.  An injected turn otherwise reaches the SDK through the
+# same client.query() as a real owner message and is indistinguishable in
+# the transcript (measured 2026-09-20: a session-inbox drop landed as a
+# plain user entry, isMeta unset) -- this mark is the machine signal that
+# says "no owner utterance opened this turn".
+INJECTED_TURN_MARK = "[bridge:injected-turn]"
+
+# DGN-1703: the CLI's Stop-hook re-prompt. When a Stop hook returns
+# decision:block the CLI keeps the turn and feeds the reason back to the model
+# as a main-thread user message whose text starts with this literal (measured
+# on SDK 0.2.110/CLI 2.1.191 and SDK 0.2.159/CLI 2.1.281, 2026-09-25; the raw
+# event also carries isSynthetic:true, which the SDK UserMessage drops). It is
+# the ONLY in-stream signal that the text streamed just before it was a
+# finished answer: both CLIs stream every AssistantMessage with
+# stop_reason=None (the end_turn value exists only on the ResultMessage and in
+# the rewritten transcript), so DGN-426's is_terminal never fires on a live
+# stream and the DGN-1651 terminal-span retraction never arms.
+STOP_HOOK_FEEDBACK_PREFIX = "Stop hook feedback:"
+
+
+def _is_stop_hook_feedback(msg: Any) -> bool:
+    """True iff `msg` is the CLI's Stop-block re-prompt (main thread only)."""
+    if getattr(msg, "parent_tool_use_id", None):
+        return False
+    content = getattr(msg, "content", None)
+    if isinstance(content, str):
+        return content.lstrip().startswith(STOP_HOOK_FEEDBACK_PREFIX)
+    if isinstance(content, list):
+        return any(
+            isinstance(b, TextBlock)
+            and b.text.lstrip().startswith(STOP_HOOK_FEEDBACK_PREFIX)
+            for b in content
+        )
+    return False
+
+
+def blocking_stop_gate_window(root: Optional[Path] = None) -> bool:
+    """Can a BLOCKING Stop gate fire for this instance right now?  While
+    True the bridge holds the turn's terminal answer off the owner surface
+    until the turn's outcome is known.  No gate opts in in this build."""
+    return False
+
+
+def _observe_live_model(msg: Any) -> None:
+    """DGN-1814 r2: record the model id the CLI reported in its system/init
+    message -- the only source of truth for "which model answered" (settings
+    can say the same alias while the CLI resolves a different model).
+    bridge/self_restart.sh reads the record to name a changed model in the
+    restart notice. Never raises."""
+    if getattr(msg, "subtype", None) != "init":
+        return
+    data = getattr(msg, "data", None)
+    if isinstance(data, dict):
+        live_model.observe(data.get("model"), live_model.state_path(config.bot_data_dir))
 
 
 def _scaffold_guard(text: str) -> str:
@@ -584,6 +699,48 @@ def _lang_slipped(text: str) -> bool:
     if hangul >= _LANG_MAX_HANGUL:
         return False
     return alpha / (alpha + hangul) > _LANG_EN_RATIO
+
+
+# Interim locale gate: an instance-language script per non-English locale
+# (config.locale is normalized to ko/en at load, so en has no entry and the
+# gate is a no-op there). Unlike the DGN-686 drop tier (_register_guard,
+# _LOCALE_MIN_LEN+ prose, every block) this judges INTERIM blocks only and
+# has no length floor: the live leaks were one-line step notes ("Run open
+# without --fit first to get packs.", 43 chars) that the 80-char floor lets
+# through. Terminal / final-answer text never passes through it.
+_LOCALE_SCRIPT_RE = {"ko": _HANGUL_RE}
+_INTERIM_QUOTED_RE = re.compile(
+    "\"[^\"\\n]{1,80}\"|\u201c[^\u201d\\n]{1,80}\u201d|\u2018[^\u2019\\n]{1,80}\u2019|'[^'\\n]{1,80}'")
+
+
+def _interim_off_locale(text: str) -> bool:
+    """True when an interim block on a non-English instance carries Latin
+    prose and no character of the instance's script.
+
+    Mixed blocks (any instance-script character) are kept. Code material is
+    recognized structurally, by the same exemptions the DGN-429 detector
+    uses (fenced code, inline code spans, URLs): a block made only of those
+    is kept, and so is a block with no Latin letter at all (emoji, digits,
+    punctuation) -- neither is English narration. A bare unfenced path or
+    command DOES count as Latin prose: on a live surface it is internal
+    plumbing (DGN-430), and a "looks like a command" guess would also pass
+    the leak shape itself, which quotes a flag. Pure function of the text and
+    config.locale.
+    """
+    locale = getattr(config, "locale", "") or ""
+    script_re = _LOCALE_SCRIPT_RE.get(locale)
+    if script_re is None or not text:
+        return False
+    # Quoted spans are the owner's own words echoed inside the narration
+    # (rehearsal 2026-10-05: "Name answer: \"<owner name>\". Record it in the identity
+    # file, then send q2.' passed because of the one quoted name). Judge the
+    # instance-script presence on the text OUTSIDE quotes.
+    if script_re.search(_INTERIM_QUOTED_RE.sub(" ", text)):
+        return False
+    prose = _LANG_CODE_FENCE_RE.sub(" ", text)
+    prose = _INLINE_CODE_RE.sub(" ", prose)
+    prose = _URL_RE.sub(" ", prose)
+    return bool(_ASCII_ALPHA_RE.search(prose))
 
 
 def _register_findings(text: str, lang_check: bool = True) -> List[str]:
@@ -971,6 +1128,135 @@ class ChatResponse:
     # (inter-segment dedup), so "draft already shows this text" cannot be
     # assumed.
     turn_assembled: bool = False
+    # DGN-1586 (spec 3.6): typed notice-carrier metadata. When the finalize
+    # seam synthesized an owner notice into the tail of `content`, these
+    # identify the spool record + reserved attempt so the bot seat can
+    # promote delivered from the SEND/EDIT SUCCESS of the message that
+    # actually carried the notice text -- ChatResponse completion is NOT
+    # delivery evidence, and an accidental identical string in the model
+    # body is never a receipt (only this typed metadata is).
+    notice_id: Optional[str] = None
+    notice_attempt: Optional[int] = None
+    notice_kind: Optional[str] = None
+    notice_version: Optional[str] = None
+    notice_text: Optional[str] = None
+    # Background jobs killed by a timeout soft stop or hard teardown
+    # (one owner-facing name or "" per job). The bot seat
+    # sends the same count + bullets notice as the auto-interrupt path.
+    killed_jobs: List[str] = field(default_factory=list)
+
+
+# --- Inbound turn context for tools (per-turn, plain context, no interception) ---
+# The CLI child's env is fixed at spawn, so the per-turn facts a tool needs to
+# address the SAME conversation (which chat / topic, which inbound message)
+# ride a small file the bridge rewrites at every owner turn and removes when
+# the turn ends. Tools read it; nothing here inspects or alters the owner's
+# message or the model's reply. A tool that finds no file is not inside an
+# owner turn (background / injected turn) and must not assume one.
+INBOUND_CONTEXT_FILENAME = "inbound-context.json"
+INBOUND_CONTEXT_SCHEMA = 1
+# DGN-1687: a dispatch-return turn is ownerless but must first surface the
+# completed dispatch result before it starts new work. The bridge owns this
+# short-lived record; the PreToolUse gate is only its reader.
+DISPATCH_RETURN_CONTEXT_FILENAME = "dispatch-return-context.json"
+DISPATCH_RETURN_CONTEXT_SCHEMA = 1
+# Bridge process start identity: changes on every restart, stable while alive.
+_RUNTIME_EPOCH = "%d.%d" % (os.getpid(), int(time.time()))
+
+
+def inbound_context_path() -> Path:
+    return PROJECT_ROOT / ".telegram_bot" / INBOUND_CONTEXT_FILENAME
+
+
+def dispatch_return_context_path() -> Path:
+    return PROJECT_ROOT / ".telegram_bot" / DISPATCH_RETURN_CONTEXT_FILENAME
+
+
+def _write_dispatch_return_context(turn_id: str, user_id: int, session_id: str,
+                                   visible: bool = False,
+                                   delivering: bool = False,
+                                   options_delivered: bool = False) -> None:
+    """Publish the narrow result-first latch for one injected turn.
+
+    A delivery acknowledgement, not model prose, flips ``visible``. This is
+    deliberately separate from inbound-context: injected turns have no owner
+    inbound message and must not masquerade as one.
+
+    DGN-1715: ``delivering`` is written the moment the first text reaches the
+    bridge, BEFORE the owner push is awaited. The CLI runs the next
+    PreToolUse hook without waiting for the bridge's Telegram round trip, so
+    the gate uses this mark to wait for the delivery verdict instead of
+    denying a tool whose result line is already on its way.
+
+    DGN-1732: ``options_delivered`` records that the delivered first text
+    already carried an [[OPTIONS]] keyboard, so the Stop forcing seat does
+    not ask the model for a second proposal + keyboard.
+    """
+    try:
+        path = dispatch_return_context_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": DISPATCH_RETURN_CONTEXT_SCHEMA,
+            "turn_id": turn_id,
+            "runtime_epoch": _RUNTIME_EPOCH,
+            "user_id": user_id,
+            "session_id": session_id,
+            "visible": bool(visible),
+            "delivering": bool(delivering) and not visible,
+            "options_delivered": bool(options_delivered) and bool(visible),
+            "ts": time.time(),
+        }
+        tmp = path.with_name(path.name + ".%d.tmp" % os.getpid())
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.warning("dispatch-return context write failed: %s", exc)
+
+
+def _clear_dispatch_return_context(turn_id: str) -> None:
+    try:
+        path = dispatch_return_context_path()
+        if json.loads(path.read_text(encoding="utf-8")).get("turn_id") == turn_id:
+            path.unlink()
+    except Exception:
+        pass
+
+
+def _write_inbound_context(request_id: str, user_id: int, inbound: Dict[str, Any]) -> None:
+    """Atomically publish this turn's context (fail-soft: a lost file only
+    means tools run without conversation binding, never a failed turn)."""
+    try:
+        path = inbound_context_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": INBOUND_CONTEXT_SCHEMA,
+            "request_id": request_id,
+            "runtime_epoch": _RUNTIME_EPOCH,
+            "user_id": user_id,
+            "chat_id": inbound.get("chat_id"),
+            "thread_id": inbound.get("thread_id"),
+            "message_id": inbound.get("message_id"),
+            "source": inbound.get("source", "message"),
+            "ts": time.time(),
+        }
+        tmp = path.with_name(path.name + ".%d.tmp" % os.getpid())
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.warning("inbound context write failed: %s", exc)
+
+
+def _clear_inbound_context(request_id: str) -> None:
+    """Remove the file only if it still belongs to this request (a queued next
+    turn may already have replaced it)."""
+    try:
+        path = inbound_context_path()
+        if json.loads(path.read_text(encoding="utf-8")).get("request_id") == request_id:
+            path.unlink()
+    except Exception:
+        pass
 
 
 @dataclass
@@ -984,7 +1270,16 @@ class _PendingRequest:
     future: asyncio.Future
     user_message: str = ""
     sent_session_id: str = "default"
+    # Inbound turn context (chat / thread / message id) published to tools.
+    inbound: Optional[Dict[str, Any]] = None
+    inbound_request_id: str = ""
     sent: bool = False
+    # DGN-1819 B: the reader consumed this turn's ResultMessage and is inside
+    # _finalize_result (which may await the options classifier for seconds).
+    # The turn is over on the CLI side: interrupt() must not drain it -- the
+    # drain would count a trailing result that never comes (discard_results
+    # leak) and the reader's popleft would then take the NEXT request.
+    finalizing: bool = False
     last_typing_at: float = 0.0
     last_assistant_texts: List[str] = field(default_factory=list)
     # DGN-1253: ordered per-TERMINAL-message capture for turn assembly. A
@@ -999,6 +1294,31 @@ class _PendingRequest:
     # Non-terminal (interim) text NEVER enters this list -- fold/inline
     # interim routing (DGN-682/699/947) is untouched.
     final_segments: List[str] = field(default_factory=list)
+    # DGN-1703: a Stop hook blocked this turn after its answer streamed; the
+    # next main-agent message carrying text retracts that answer from the live
+    # surface (StreamingMessageHandler.supersede_step). Cleared once consumed.
+    stop_block_superseded: bool = False
+    # DGN-1850: blocking_stop_gate_window() was open when this turn started.
+    # Main-thread text from a message with no tool call is HELD here instead
+    # of reaching the live/fold surfaces: a later tool call proves it was
+    # narration (released as usual); a Stop-hook re-prompt proves it was a
+    # blocked answer (discarded); the ResultMessage makes it the final answer
+    # (_finalize_result delivers it as one new message). Entries are
+    # (guarded text, raw text, is_terminal, mint_hold, message seq).
+    hold_terminal: bool = False
+    held_blocks: List[Tuple[str, str, bool, bool, int]] = field(default_factory=list)
+    held_seq: int = 0
+    # DGN-1850: the text a Stop block discarded. Delivered only when the turn
+    # ends with no replacement text (the DGN-1651/1703 rule: a text-less
+    # regeneration leaves the answer standing).
+    held_discarded: List[str] = field(default_factory=list)
+    # DGN-1850: final_segments index where the current model step began; a
+    # Stop block inside the hold drops the segments its step captured.
+    step_segment_start: int = 0
+    # DGN-1857: raw text of the CLI's auth-failure message this turn. Set at
+    # ingestion (the text never reaches a live surface); _finalize_result then
+    # finishes the turn exactly like an is_error auth result.
+    cli_auth_failure: Optional[str] = None
     synthetic_response: Optional[str] = None
     streaming_handler: Optional[Any] = None
     # DGN-086: count ToolUseBlocks in main-agent (non-subagent) messages for
@@ -1044,6 +1364,27 @@ class _PendingRequest:
     fold_last_edit_at: float = 0.0
     fold_retry_at: float = 0.0
     fold_finalized: bool = False
+    # DGN-1683: mint-verb turn mute (bridge/mint_gate.py). mint_call_ids holds
+    # the tool_use ids of main-agent Bash calls that ran the verb; their
+    # tool_result JSON sets mint_mute (latched, screen > n13). mint_spoke
+    # records that the agent produced owner-bound text after the verdict --
+    # the N13 fallback is only ever a replacement, never bridge-initiated.
+    mint_call_ids: set = field(default_factory=set)
+    mint_mute: Optional[str] = None
+    mint_spoke: bool = False
+    # DGN-1683 provisional hold: the CLI streams each block of one API
+    # message as its own event, so narration written before a verb call
+    # reaches the reader with no call in sight. Once the turn loads the mint
+    # skill or calls a verb (mint_gate.arms_hold) mint_armed latches and
+    # every block _route_text_block would put on a live surface is parked
+    # in mint_held instead -- (guarded text, raw text, is_terminal,
+    # mint_hold, mint_seq). The final assembly still sees the text. A
+    # verdict discards the parked blocks; a turn that ends without one
+    # releases them (_settle_mint_held). mint_seq numbers main-agent
+    # assistant messages so the last one (delivered by finalize) is known.
+    mint_armed: bool = False
+    mint_held: List[Tuple[str, str, bool, bool, int]] = field(default_factory=list)
+    mint_seq: int = 0
 
 
 @dataclass
@@ -1063,7 +1404,26 @@ class _UserStreamState:
     # Buffer for main-agent text blocks seen while pending is empty; flushed on
     # the trailing ResultMessage.
     proactive_texts: List[str] = field(default_factory=list)
+    # DGN-1842: the DGN-1703 supersede for no-pending turns. step_start is the
+    # proactive_texts index where the current model step began (a main-thread
+    # user message closes a step); superseded is the [start, end) span a
+    # Stop-hook re-prompt marked as a blocked answer. The span is dropped only
+    # when replacement text arrives, so a text-less regeneration leaves the
+    # earlier answer standing. Both reset with the buffer at every turn end.
+    proactive_step_start: int = 0
+    proactive_superseded: Optional[Tuple[int, int]] = None
+    # DGN-1857: a no-pending turn hit the CLI's auth failure; its result
+    # surfaces the re-login notice. Resets with the buffer.
+    proactive_auth_failure: bool = False
     last_proactive_sent: Optional[str] = None
+    # DGN-1687: set only while this stream is processing a dispatch-return
+    # injection. The bridge clears the shared latch when its Result arrives.
+    dispatch_return_turn_id: Optional[str] = None
+    dispatch_return_result_sent: bool = False
+    # DGN-1732: the text the result-first push already put on the owner's
+    # screen this turn. The turn's finalize subtracts it (options.
+    # subtract_delivered) so the final never repeats that bubble/keyboard.
+    dispatch_return_delivered: Optional[str] = None
     # DGN-581: count of trailing ResultMessages to swallow. A soft interrupt
     # drains the pending deque, but the CLI still emits a ResultMessage (and
     # possibly tail AssistantMessages) for each already-dispatched turn; with
@@ -1090,6 +1450,25 @@ class _UserStreamState:
     # kept in lockstep with active_tasks so a kill notice can name what died
     # instead of just counting it.
     task_descriptions: Dict[str, str] = field(default_factory=dict)
+    # DGN-1593 r2: task_id -> TaskStartedMessage.task_type, same lockstep.
+    # Only a subagent's description can be its owner-facing name (the Agent
+    # tool description); a shell task's may be the command line.
+    task_types: Dict[str, str] = field(default_factory=dict)
+    # DGN-1588/DGN-1591/DGN-1620: None means no injection in this turn;
+    # "quiet" suppresses by default and "loud" latches delivery when any
+    # injection demands a report. Consumed at every turn boundary.
+    injected_turn_mode: Optional[str] = None
+    # DGN-1689: Claude Code can open an ownerless turn solely to deliver a
+    # completed background-task notification.  Reset at every no-pending
+    # ResultMessage.
+    # DGN-1642: this flag no longer makes the turn quiet.  A wake-up is a
+    # turn that exists (the bridge cannot stop Claude Code creating it), and
+    # a turn worth creating is a turn worth delivering: the author cannot see
+    # a quiet default it was never told about, so it dropped real merge/push
+    # reports and pending owner questions (observed 2026-09-27 18:04).  Silence
+    # is the author's explicit NO_PUSH.  The flag now only feeds a
+    # measurement log line.
+    task_notification_wakeup: bool = False
     # DGN-1015: descriptions of background subagents killed by the MOST
     # RECENT interrupt() call for this user (see interrupt()). Root cause of
     # the 2026-08-22 09:33 silent death: an interrupt aborts the CLI's
@@ -1098,8 +1477,57 @@ class _UserStreamState:
     # terminal event for them -- so active_tasks would otherwise leak these
     # entries as phantom "still live" forever (no lifecycle event will ever
     # arrive to clear them). interrupt() clears them synchronously and
-    # stashes the descriptions here; pop_interrupt_killed() reads + clears.
+    # stashes one entry per killed task here -- its owner-facing name, or ""
+    # (DGN-1593 r2, _owner_task_name); pop_interrupt_killed() reads + clears.
     interrupt_killed_descriptions: List[str] = field(default_factory=list)
+
+
+def _bg_job_notice():
+    """The background-job name registry, or None: this build has none."""
+    return None
+
+
+def _owner_task_name(task_id: str, description: str, task_type: str) -> str:
+    """DGN-1593 r2 (owner 2026-10-02 08:47): the name the owner already
+    knows a killed background task by, or "" when none is recoverable.
+
+    1. A background Bash/Monitor/Workflow job: the name its START push and
+       workbench row used (DGN-1820: the launch description alone), read
+       from bg_job_notice's state, keyed by the same task id.  A launch
+       whose name the gate refused never got a START, so it has no name.
+    2. A subagent: its Agent description (the workbench row's label),
+       only when it passes the same owner-name gate (instance language, no
+       execution identifier).
+    Anything else -- a shell task outside the registry, whose SDK
+    description may be the command line -- stays nameless.  Fail-open to
+    "": a lookup problem costs the bullet, never the count line.
+    """
+    lib = _bg_job_notice()
+    if lib is None:
+        return ""
+    try:
+        rec = None
+        with open(lib.state_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            rec = data.get(task_id)
+        if isinstance(rec, dict):
+            if not rec.get("start_sent"):
+                return ""
+            # The slot (a CLI or tool name) is never a fallback here.
+            return lib._unlabelled(rec.get("name"), rec.get("slot") or "")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("bg name lookup failed for %s: %s", task_id, e)
+        return ""
+    try:
+        if "agent" in (task_type or "") and description:
+            if lib.name_problem(description) is None:
+                return description.strip()
+    except Exception as e:
+        logger.warning("subagent name gate failed: %s", e)
+    return ""
 
 
 class SdkBridge:
@@ -1114,7 +1542,7 @@ class SdkBridge:
             # Silence here would be the DGN-1015 failure mode: the guard is
             # off and nobody can tell. Say it once per boot.
             logger.warning(
-                "DGN-1016 auto-interrupt background guard INACTIVE: this "
+                "auto-interrupt background guard INACTIVE: this "
                 "claude-agent-sdk build has no task-lifecycle messages "
                 "(TaskStartedMessage/TERMINAL_TASK_STATUSES). Background "
                 "subagents remain killable by the DGN-911 auto-interrupt. "
@@ -1169,6 +1597,13 @@ class SdkBridge:
             # DGN-460: default SDK transport buffer (1MB) is too small for
             # tool results carrying inline base64 media; raise it (env-tunable).
             "max_buffer_size": CLAUDE_MAX_BUFFER_SIZE,
+            # DGN-1586 (spec 3.3): surface marker, owned by the session
+            # spawner. The SDK merges this into the CLI child env, so
+            # SessionStart hooks (version-check.py) fork their injection
+            # wording on it. Shared vars like TELEGRAM_BOT_TOKEN are NOT
+            # surface evidence (detached sessions carry them too); this
+            # dedicated marker is the ONLY discriminator, and non-bridge
+            # child launchers (dispatch-detached.sh) unset it.
             # DGN-670 F1: mechanical executor-contract injection on every Task
             # prompt (prevention). can_use_tool is NOT invoked for allowed_tools
             # calls, so this must ride the PreToolUse hook path.
@@ -1182,9 +1617,12 @@ class SdkBridge:
         }
         if model:
             opts["model"] = model
-        if CLAUDE_CLI_PATH:
-            # SDK >=0.2 exposes a supported cli_path option (no monkeypatch needed).
-            opts["cli_path"] = CLAUDE_CLI_PATH
+        # DGN-1814: always pass the machine CLI when one resolves (explicit
+        # CLAUDE_CLI_PATH > PATH > ~/.local/bin); omitting cli_path makes the
+        # SDK fall back to its BUNDLED CLI, which lags the machine CLI.
+        cli_path = resolve_claude_cli()
+        if cli_path:
+            opts["cli_path"] = cli_path
 
         logger.info(
             "Creating SDK stream for user %s (max_buffer_size=%d)",
@@ -1356,6 +1794,8 @@ class SdkBridge:
         if head.sent:
             return
         head.sent = True
+        if head.inbound:
+            _write_inbound_context(head.inbound_request_id, head.user_id, head.inbound)
         await state.client.query(head.user_message, session_id=head.sent_session_id)
 
     @staticmethod
@@ -1400,6 +1840,38 @@ class SdkBridge:
             )
 
     @staticmethod
+    def _observe_mint_results(user_id: int, req: _PendingRequest, msg: Any) -> None:
+        """DGN-1683: fold the mint verb's tool_result JSON into req.mint_mute.
+
+        Only results answering a tool_use id recorded in req.mint_call_ids
+        (a main-agent Bash call that ran the verb) are read. Never raises
+        into the reader loop.
+        """
+        try:
+            content = getattr(msg, "content", None)
+            if not req.mint_call_ids or not isinstance(content, list):
+                return
+            for block in content:
+                if not isinstance(block, ToolResultBlock):
+                    continue
+                if block.tool_use_id not in req.mint_call_ids:
+                    continue
+                verdict = mint_gate.verdict_from_result(block.content)
+                merged = mint_gate.merge(req.mint_mute, verdict)
+                if merged != req.mint_mute:
+                    # The pre-verdict text parked by the provisional hold
+                    # was narration of this mint flow: it never surfaces.
+                    req.mint_held = []
+                    logger.info(
+                        "mint turn mute armed for user %s: %s "
+                        "(tool_use %s)",
+                        user_id, merged, block.tool_use_id,
+                    )
+                    req.mint_mute = merged
+        except Exception as e:
+            logger.error("mint result observation failed: %s", e)
+
+    @staticmethod
     def _track_task_lifecycle(state: _UserStreamState, msg: Any) -> None:
         """DGN-1016: maintain state.active_tasks from stream lifecycle events.
 
@@ -1416,12 +1888,16 @@ class SdkBridge:
                 desc = getattr(msg, "description", None)
                 if desc:
                     state.task_descriptions[msg.task_id] = desc
+                ttype = getattr(msg, "task_type", None)
+                if ttype:
+                    state.task_types[msg.task_id] = ttype
             elif isinstance(msg, (TaskNotificationMessage, TaskUpdatedMessage)):
                 if msg.status in TERMINAL_TASK_STATUSES:
                     state.active_tasks.pop(msg.task_id, None)
                     state.task_descriptions.pop(msg.task_id, None)
+                    state.task_types.pop(msg.task_id, None)
         except Exception as e:
-            logger.warning("DGN-1016 task lifecycle tracking failed: %s", e)
+            logger.warning("task lifecycle tracking failed: %s", e)
 
     def live_task_count(self, user_id: int) -> int:
         """DGN-1016: number of tracked live (non-terminal) tasks for the user.
@@ -1435,9 +1911,27 @@ class SdkBridge:
             return 0
         return len(state.active_tasks)
 
+    @staticmethod
+    def _collect_killed_tasks(state: _UserStreamState) -> List[str]:
+        """Snapshot owner-facing names and clear tracked jobs without yielding."""
+        killed = [
+            _owner_task_name(
+                tid,
+                state.task_descriptions.get(tid, ""),
+                state.task_types.get(tid, ""),
+            )
+            for tid in state.active_tasks
+        ]
+        state.active_tasks = {}
+        state.task_descriptions = {}
+        state.task_types = {}
+        return killed
+
     def pop_interrupt_killed(self, user_id: int) -> List[str]:
-        """DGN-1015: descriptions of background subagents killed by the most
-        recent interrupt() call for this user; cleared on read.
+        """DGN-1015: one entry per background task killed by the most
+        recent interrupt() call for this user; cleared on read.  Each entry
+        is the job's owner-facing name (DGN-1593 r2, _owner_task_name) or ""
+        when none is recoverable -- never an internal label or a task id.
 
         Empty when no stream exists, or interrupt() found no live tasks at
         kill time. Best-effort/read-once: a caller that never polls this
@@ -1483,7 +1977,7 @@ class SdkBridge:
         client_stop = getattr(state.client, "stop_task", None)
         if client_stop is None:
             logger.warning(
-                "DGN-1016 stop_task unavailable: this claude-agent-sdk "
+                "stop_task unavailable: this claude-agent-sdk "
                 "build has no ClaudeSDKClient.stop_task -- per-task stop "
                 "degrades to unavailable (upgrade the SDK to enable it)"
             )
@@ -1494,7 +1988,7 @@ class SdkBridge:
             client_stop(task_id), timeout=INTERRUPT_SEND_TIMEOUT
         )
         logger.info(
-            "DGN-1016 stop_task sent for user %s (task_id=%s)",
+            "stop_task sent for user %s (task_id=%s)",
             user_id,
             task_id,
         )
@@ -1507,6 +2001,15 @@ class SdkBridge:
                 # including those routed to the proactive branch below.
                 self._track_task_lifecycle(state, msg)
                 if not state.pending:
+                    # DGN-1689: task_notification is a Claude Code turn
+                    # trigger, not owner input.  Mark only an otherwise
+                    # unclaimed no-pending turn: dispatch-return and other
+                    # injected turns retain their explicit loud/quiet mode.
+                    if (
+                        isinstance(msg, TaskNotificationMessage)
+                        and state.injected_turn_mode is None
+                    ):
+                        state.task_notification_wakeup = True
                     # No request to answer. This happens when a subagent/background
                     # task completion injects a new turn into the main session. We
                     # must NOT drop the main agent's proactive output; route it to a
@@ -1530,12 +2033,38 @@ class SdkBridge:
                         pass
 
                 if isinstance(msg, SystemMessage):
+                    _observe_live_model(msg)
                     data = getattr(msg, "data", None)
                     sid = data.get("session_id") if isinstance(data, dict) else None
                     if sid:
                         state.last_session_id = sid
                         # DGN-996: flow the init-time sid to sessions.json now.
                         await self._persist_session_id(user_id, state, sid)
+                    continue
+
+                if isinstance(msg, UserMessage):
+                    # DGN-1683: the mint verb's tool_result is the ONLY input
+                    # to the turn mute -- its JSON, never the agent's prose.
+                    if not getattr(msg, "parent_tool_use_id", None):
+                        self._observe_mint_results(user_id, req, msg)
+                        # DGN-1850: the held step's outcome is known now.
+                        if req.hold_terminal:
+                            if _is_stop_hook_feedback(msg):
+                                self._discard_held(user_id, req)
+                            else:
+                                await self._release_held(req)
+                            req.step_segment_start = len(req.final_segments)
+                        # DGN-1703: a main-thread user message closes a model
+                        # step. The Stop-block re-prompt additionally marks
+                        # the step it closes as a superseded answer.
+                        if req.streaming_handler is not None:
+                            try:
+                                if _is_stop_hook_feedback(msg):
+                                    if req.streaming_handler.supersede_step():
+                                        req.stop_block_superseded = True
+                                req.streaming_handler.begin_step()
+                            except Exception as e:
+                                logger.error("Step boundary failed: %s", e)
                     continue
 
                 if isinstance(msg, AssistantMessage):
@@ -1545,6 +2074,17 @@ class SdkBridge:
                     if getattr(msg, "parent_tool_use_id", None):
                         continue
                     req.last_assistant_texts = []
+                    # DGN-1857: the CLI's auth failure arrives as a synthetic
+                    # answer. Keep it off every owner surface (live stream,
+                    # fold, final assembly); finalize shows the notice.
+                    auth_fail = _cli_auth_failure(msg)
+                    if auth_fail is not None:
+                        req.cli_auth_failure = auth_fail
+                        logger.warning(
+                            "CLI auth failure for user %s held off "
+                            "the owner surface: %s", user_id, auth_fail,
+                        )
+                        continue
                     # DGN-426 C-strict: determine whether this message is terminal.
                     # stop_reason="end_turn" is the measured 100%-clean terminality
                     # signal (164 turns). "tool_use", None, or a ServerToolUseBlock
@@ -1560,7 +2100,6 @@ class SdkBridge:
                     )
                     is_terminal = stop_reason == "end_turn" and not has_server_tool
                     interim_mode = _effective_interim_mode()
-                    live_stream = interim_mode == "inline" or is_terminal
                     # DGN-1651: a Stop-hook block lets the model keep the turn
                     # and emit a SECOND terminal message. The first one already
                     # streamed onto the owner's screen, and the DGN-1253 turn
@@ -1577,14 +2116,67 @@ class SdkBridge:
                     # dedup is introduced here: the retraction is an exact
                     # span cut, and _subtract_paras stays the one judgment of
                     # what the final body says.
-                    superseding = bool(
+                    # Guard each text block once so the boundary decisions and
+                    # ingestion below cannot disagree about what survived.
+                    guarded_block_text = {
+                        id(b): _register_guard(_scaffold_guard(b.text))
+                        for b in msg.content
+                        if isinstance(b, TextBlock)
+                    }
+                    # DGN-1683: third ingestion stage -- the mint turn mute.
+                    # After a verb verdict every later text block is held off
+                    # the owner surface (live stream, fold, final assembly);
+                    # _finalize_result delivers what the verdict allows. Text
+                    # riding the SAME message as a verb call is held too: it
+                    # streams before the result exists, and it is narration
+                    # of the call, not an answer.
+                    mint_hold = req.mint_mute is not None or any(
+                        isinstance(b, ToolUseBlock)
+                        and mint_gate.is_verb_call(b.name, getattr(b, "input", None))
+                        for b in msg.content
+                    )
+                    if mint_hold:
+                        if req.mint_mute is not None and any(
+                            t.strip() for t in guarded_block_text.values()
+                        ):
+                            req.mint_spoke = True
+                        guarded_block_text = {k: "" for k in guarded_block_text}
+                    # DGN-1683 provisional hold: arm on the mint skill load or
+                    # a verb call (this message included -- text before the
+                    # call in the same message is narration too).
+                    req.mint_seq += 1
+                    if any(
+                        isinstance(b, ToolUseBlock)
+                        and mint_gate.arms_hold(b.name, getattr(b, "input", None))
+                        for b in msg.content
+                    ):
+                        req.mint_armed = True
+                    # A boundary only carries replacement text when some text
+                    # survives the ingestion guards. Besides driving DGN-1651
+                    # retraction, this keeps a text-less terminal continuation
+                    # from sealing the answer that is already live in drafts.
+                    terminal_has_text = bool(
                         is_terminal
-                        and req.final_segments
                         and any(
-                            isinstance(b, TextBlock) and b.text.strip()
+                            isinstance(b, TextBlock)
+                            and guarded_block_text[id(b)].strip()
                             for b in msg.content
                         )
                     )
+                    superseding = bool(
+                        terminal_has_text and req.final_segments
+                    )
+                    # DGN-1703: the live-stream shape. No message is terminal
+                    # (stop_reason=None), so the Stop-block re-prompt marked
+                    # the superseded span instead; retract it at the first
+                    # message that carries replacement text, terminal or not.
+                    if req.stop_block_superseded and any(
+                        isinstance(b, TextBlock)
+                        and guarded_block_text[id(b)].strip()
+                        for b in msg.content
+                    ):
+                        superseding = True
+                        req.stop_block_superseded = False
                     retracted = False
                     if req.streaming_handler is not None:
                         try:
@@ -1595,7 +2187,7 @@ class SdkBridge:
                             logger.error("Segment boundary failed: %s", e)
                     if retracted:
                         logger.info(
-                            "DGN-1651: retracted the superseded terminal segment "
+                            "retracted the superseded terminal segment "
                             "for user %s (segment %d, mode=%s) -- the Stop-hook "
                             "regeneration rewrites the live bubble",
                             user_id,
@@ -1618,6 +2210,7 @@ class SdkBridge:
                     if (
                         interim_mode == "inline"
                         and is_terminal
+                        and terminal_has_text
                         and req.streaming_handler is not None
                         and req.streaming_handler.drafts
                         and not (
@@ -1629,6 +2222,20 @@ class SdkBridge:
                             await req.streaming_handler.seal_segment()
                         except Exception as e:
                             logger.error("Interim seal failed: %s", e)
+                    # DGN-1850: inside the gated window a message with a tool
+                    # call is narration (the turn goes on), so text held from
+                    # earlier messages is released first, in order. A message
+                    # without one may be the terminal answer: its text is held.
+                    hold_message = False
+                    if req.hold_terminal:
+                        if any(
+                            isinstance(b, (ToolUseBlock, ServerToolUseBlock))
+                            for b in msg.content
+                        ):
+                            await self._release_held(req)
+                        else:
+                            hold_message = True
+                            req.held_seq += 1
                     for block in msg.content:
                         if isinstance(block, TextBlock):
                             # DGN-285: guard at ingestion so both the final
@@ -1638,27 +2245,45 @@ class SdkBridge:
                             # the scaffold guard, on the same ingestion path. A
                             # dropped block comes back empty and must not open
                             # an empty streaming draft.
-                            block_text = _register_guard(_scaffold_guard(block.text))
+                            block_text = guarded_block_text[id(block)]
                             req.last_assistant_texts.append(block_text)
-                            if interim_mode == "fold" and not is_terminal:
-                                # DGN-682 D4/D5: capture interim narration on the
-                                # scaffold-guarded block text (see
-                                # _PendingRequest.interim_texts).
-                                captured = _scaffold_guard(block.text)
-                                if captured.strip():
-                                    req.interim_texts.append(captured)
-                                    # DGN-699 D2: growing-fold dispatch rides the
-                                    # SAME captured text. Never raises into the
-                                    # reader loop.
-                                    await self._fold_dispatch(req, captured)
-                            if req.streaming_handler and live_stream and block_text:
-                                try:
-                                    await req.streaming_handler.update_if_needed(block_text)
-                                except Exception as e:
-                                    logger.error("Streaming update failed: %s", e)
+                            # DGN-1715: an owner message queued into a running
+                            # dispatch-return turn makes it pending, so its
+                            # text lands here, not in the proactive branch.
+                            # Deliver the first result line as its own owner
+                            # message regardless of interim mode; that push
+                            # opens the result-first latch before the next
+                            # ToolUse is evaluated. Already on screen, it is
+                            # kept off the live/fold surfaces. DGN-1732: a
+                            # terminal one stays in the final assembly only so
+                            # finalize can subtract it (subtract_delivered);
+                            # streaming it live was the second bubble.
+                            pushed_result = bool(
+                                state.dispatch_return_turn_id
+                                and not state.dispatch_return_result_sent
+                                and block_text.strip()
+                                and await self._send_dispatch_return_first_text(
+                                    user_id, state, block_text
+                                )
+                            )
+                            if pushed_result:
+                                continue
+                            if hold_message:
+                                req.held_blocks.append(
+                                    (block_text, block.text, is_terminal,
+                                     mint_hold, req.held_seq)
+                                )
+                                continue
+                            await self._route_text_block(
+                                req, block_text, block.text, is_terminal, mint_hold
+                            )
                         elif isinstance(block, ToolUseBlock):
                             # DGN-086: track main-agent tool uses for flake detection.
                             req.tool_use_count += 1
+                            if mint_gate.is_verb_call(
+                                block.name, getattr(block, "input", None)
+                            ):
+                                req.mint_call_ids.add(block.id)
                             # DGN-670 M1: a Task tool call is subagent
                             # activity; run_in_background marks a legitimate
                             # background launch (its status report must never
@@ -1685,6 +2310,16 @@ class SdkBridge:
 
                 if isinstance(msg, ResultMessage):
                     state.last_session_id = msg.session_id or state.last_session_id
+                    # DGN-1715: the dispatch-return turn may end on this
+                    # (pending) path when an owner message was folded into
+                    # it. Close its latch here too; left behind, a closed
+                    # latch denied every later turn until its 1h expiry.
+                    if state.dispatch_return_turn_id:
+                        _clear_dispatch_return_context(state.dispatch_return_turn_id)
+                        state.dispatch_return_turn_id = None
+                        state.dispatch_return_result_sent = False
+                    delivered = state.dispatch_return_delivered
+                    state.dispatch_return_delivered = None
                     # DGN-581 M1: a soft-interrupted turn's trailing ResultMessage
                     # must be discarded even when a new request is already pending.
                     # Without this gate, the race (interrupt -> drain -> new message
@@ -1695,7 +2330,8 @@ class SdkBridge:
                     # so the turn boundary is always request-scoped, not pending-queue-scoped.
                     if state.discard_results > 0:
                         state.discard_results -= 1
-                        state.proactive_texts = []
+                        self._reset_proactive_buffer(state)
+                        state.injected_turn_mode = None  # Never leak past a turn boundary.
                         logger.debug(
                             "Discarded stale trailing ResultMessage for user %s"
                             " (pending=%d, discard_results remaining=%d)",
@@ -1709,10 +2345,31 @@ class SdkBridge:
                     # then STAYS at the head of the deque so this loop
                     # attributes all retry output to it; every other exit
                     # returns False and pops as before.
-                    retried = await self._finalize_result(user_id, state, req, msg)
+                    req.finalizing = True
+                    await self._settle_held_for_result(req)
+                    await self._settle_mint_held(user_id, req)
+                    retried = await self._finalize_result(
+                        user_id, state, req, msg, delivered=delivered
+                    )
                     if retried:
+                        # DGN-670 retry re-dispatched the turn: it is live
+                        # (and interruptible) again.
+                        req.finalizing = False
                         continue
-                    state.pending.popleft()
+                    # DGN-1819 B (defense): pop only the request finalized
+                    # here. Anything else at the head (or an empty deque) means
+                    # the queue changed under the await -- popping blindly
+                    # orphaned the next request's future or crashed the reader
+                    # (IndexError on an empty deque).
+                    if state.pending and state.pending[0] is req:
+                        state.pending.popleft()
+                    else:
+                        logger.warning(
+                            "finalized request for user %s is no "
+                            "longer the queue head (pending=%d) -- not popping",
+                            user_id,
+                            len(state.pending),
+                        )
                     try:
                         await self._dispatch_next_query(state)
                     except Exception as e:
@@ -1748,6 +2405,134 @@ class SdkBridge:
                             session_id=state.last_session_id,
                         )
                     )
+
+    async def _route_text_block(
+        self, req: _PendingRequest, block_text: str, raw_text: str,
+        is_terminal: bool, mint_hold: bool,
+    ) -> None:
+        """Put one main-thread text block on the interim surfaces: the fold
+        capture (DGN-682) and the live draft stream (DGN-426 gating)."""
+        if req.mint_armed and req.mint_mute is None:
+            # DGN-1683 provisional hold: parked until the turn's verdict is
+            # known (_observe_mint_results / _settle_mint_held).
+            req.mint_held.append(
+                (block_text, raw_text, is_terminal, mint_hold, req.mint_seq)
+            )
+            return
+        await self._route_live(req, block_text, raw_text, is_terminal, mint_hold)
+
+    async def _route_live(
+        self, req: _PendingRequest, block_text: str, raw_text: str,
+        is_terminal: bool, mint_hold: bool,
+    ) -> None:
+        if not is_terminal and _interim_off_locale(raw_text):
+            # Interim locale gate: an interim step note with no instance-
+            # language character (English working narration on a ko
+            # instance) stays off every live surface -- stream, fold capture
+            # and fold bubble. The final assembly (last_assistant_texts /
+            # final_segments) is untouched, so a text-only event that turns
+            # out to be the answer is still delivered by _finalize_result.
+            logger.info(
+                "Interim locale gate dropped a %d-char interim block "
+                "(no %s-script character)",
+                len(raw_text), getattr(config, "locale", ""),
+            )
+            return
+        interim_mode = _effective_interim_mode()
+        if interim_mode == "fold" and not is_terminal and not mint_hold:
+            # DGN-682 D4/D5: capture interim narration on the scaffold-guarded
+            # block text (see _PendingRequest.interim_texts).
+            captured = _scaffold_guard(raw_text)
+            if captured.strip():
+                req.interim_texts.append(captured)
+                # DGN-699 D2: growing-fold dispatch rides the SAME captured
+                # text. Never raises into the reader loop.
+                await self._fold_dispatch(req, captured)
+        live_stream = interim_mode == "inline" or is_terminal
+        if req.streaming_handler and live_stream and block_text:
+            try:
+                await req.streaming_handler.update_if_needed(block_text)
+            except Exception as e:
+                logger.error("Streaming update failed: %s", e)
+
+    async def _release_held(
+        self, req: _PendingRequest, keep_seq: Optional[int] = None
+    ) -> None:
+        """DGN-1850: held text turned out to be narration -- route it, in
+        order, exactly as it would have been routed live. Entries of message
+        `keep_seq` stay held."""
+        held = req.held_blocks
+        req.held_blocks = [h for h in held if h[4] == keep_seq]
+        for block_text, raw_text, is_terminal, mint_hold, seq in held:
+            if seq != keep_seq:
+                await self._route_text_block(
+                    req, block_text, raw_text, is_terminal, mint_hold
+                )
+
+    def _discard_held(self, user_id: int, req: _PendingRequest) -> None:
+        """DGN-1850: a Stop hook blocked the held answer. It never reached the
+        owner; drop it (and the turn segments its step captured) so the
+        regeneration is the turn's answer."""
+        texts = [h[0] for h in req.held_blocks if h[0].strip()]
+        req.held_blocks = []
+        del req.final_segments[req.step_segment_start:]
+        if texts:
+            req.held_discarded = texts
+        logger.info(
+            "Stop block inside the gated window for user %s -- "
+            "discarded %d held block(s) (%d chars) that never reached the owner",
+            user_id, len(texts), sum(len(t) for t in texts),
+        )
+
+    async def _settle_held_for_result(self, req: _PendingRequest) -> None:
+        """DGN-1850: the ResultMessage arrived inside the gated window. Held
+        text of earlier messages was narration (routed now); the last held
+        message is the final answer, which _finalize_result delivers. Live
+        drafts (inline narration) are sealed as standing bubbles so the
+        final answer goes out as one NEW message, never as an edit of a
+        bubble the owner already read."""
+        if not req.hold_terminal:
+            return
+        last = req.held_blocks[-1][4] if req.held_blocks else None
+        await self._release_held(req, keep_seq=last)
+        req.held_blocks = []
+        handler = req.streaming_handler
+        if handler is not None and handler.drafts:
+            try:
+                await handler.seal_segment()
+            except Exception as e:
+                logger.error("Held-answer seal failed: %s", e)
+
+    async def _settle_mint_held(self, user_id: int, req: _PendingRequest) -> None:
+        """DGN-1683 provisional hold: the ResultMessage arrived. With a
+        verdict the parked text stays off the owner surface (the verdict
+        branch of _finalize_result decides the owner text). Without one the
+        turn was an ordinary answer: earlier messages' interim text is routed
+        now, in order, as it would have been live; terminal text and the last
+        message's text are already in the final assembly, which
+        _finalize_result delivers as one new message (the DGN-1850 settle
+        shape) -- routing them too would show them twice."""
+        held, req.mint_held = req.mint_held, []
+        if not req.mint_armed or req.mint_mute is not None or not held:
+            return
+        released = 0
+        for block_text, raw_text, is_terminal, mint_hold, seq in held:
+            if seq != req.mint_seq and not is_terminal:
+                await self._route_live(
+                    req, block_text, raw_text, is_terminal, mint_hold
+                )
+                released += 1
+        logger.info(
+            "mint hold released for user %s: no verdict, %d of %d "
+            "parked block(s) routed, the rest is the final answer",
+            user_id, released, len(held),
+        )
+        handler = req.streaming_handler
+        if released and handler is not None and handler.drafts:
+            try:
+                await handler.seal_segment()
+            except Exception as e:
+                logger.error("Mint-hold seal failed: %s", e)
 
     @staticmethod
     def _is_placeholder_flake(content: str) -> bool:
@@ -1804,13 +2589,69 @@ class SdkBridge:
             return content, False
         try:
             is_choice = await asyncio.to_thread(
-                classify_is_choice, prev_message, content, CLAUDE_CLI_PATH
+                classify_is_choice, prev_message, content, resolve_claude_cli()
             )
             if is_choice:
                 return f"{content}\n\n{OPTIONS_MARKER}", True
         except Exception as e:
             logger.warning("Option classifier failed (no buttons): %s", e)
         return content, False
+
+    async def _send_dispatch_return_first_text(
+        self, user_id: int, state: _UserStreamState, text: str
+    ) -> bool:
+        """Deliver the first dispatch-return text immediately, then open tools.
+
+        Injected turns have no request streaming handler, so fold/suppress
+        interim modes cannot make this acknowledgement owner-invisible. The
+        latch changes only after the push succeeds; a delivery failure keeps
+        the tool gate closed instead of treating generated-but-hidden prose as
+        a result.
+        """
+        turn_id = state.dispatch_return_turn_id
+        if state.dispatch_return_result_sent or not turn_id or not text.strip() or state.last_chat_id is None \
+                or state.proactive_push is None:
+            return False
+        sid = state.last_session_id or "default"
+        # DGN-1732: the delivery seat (bot._send_smart / machine-line gate)
+        # strips NO_PUSH on its own; the same recognizer runs here only for
+        # latch bookkeeping. A sentinel-only first text sends nothing and
+        # counts as delivered-quiet so the result-first tool gate cannot
+        # deadlock waiting for a result that was deliberately withheld.
+        body, had_sentinel = strip_no_push_sentinel(text.strip())
+        body = body.strip()
+        if had_sentinel and not body:
+            logger.info(
+                "Dispatch-return first text was NO_PUSH only for user %s; "
+                "latched delivered-quiet", user_id,
+            )
+            if state.dispatch_return_turn_id == turn_id:
+                state.dispatch_return_result_sent = True
+                _write_dispatch_return_context(turn_id, user_id, sid, visible=True)
+            return True
+        # DGN-1715: announce the in-flight delivery before awaiting it, so a
+        # PreToolUse hook racing this push waits for the verdict below.
+        _write_dispatch_return_context(turn_id, user_id, sid, delivering=True)
+        try:
+            # DGN-1732: same canonical recognizer as _flush_proactive, so an
+            # owner-authored [[OPTIONS]] menu in the first text keeps its
+            # buttons (a hard-coded False made _send_smart drop the keyboard).
+            has_options = has_options_marker(body) or has_numbered_list(body)
+            await state.proactive_push(state.last_chat_id, body, has_options, False)
+            state.last_proactive_sent = body
+            if state.dispatch_return_turn_id == turn_id:
+                state.dispatch_return_result_sent = True
+                state.dispatch_return_delivered = body
+                _write_dispatch_return_context(
+                    turn_id, user_id, sid, visible=True,
+                    options_delivered=has_options_marker(body),
+                )
+            return True
+        except Exception as exc:
+            logger.error("Dispatch-return first result push failed for user %s: %s", user_id, exc)
+        if state.dispatch_return_turn_id == turn_id:
+            _write_dispatch_return_context(turn_id, user_id, sid)
+        return False
 
     async def _handle_proactive_message(
         self, user_id: int, state: _UserStreamState, msg: Any
@@ -1823,6 +2664,7 @@ class SdkBridge:
         - ResultMessage: flush the buffered main-agent text as a proactive push.
         """
         if isinstance(msg, SystemMessage):
+            _observe_live_model(msg)
             data = getattr(msg, "data", None)
             sid = data.get("session_id") if isinstance(data, dict) else None
             if sid:
@@ -1835,23 +2677,66 @@ class SdkBridge:
                 await self._persist_session_id(user_id, state, sid)
             return
 
+        if isinstance(msg, UserMessage):
+            # DGN-1842: a main-thread user message closes a model step; the
+            # Stop-block re-prompt additionally marks the step it closes as a
+            # superseded answer (the DGN-1703 semantics of the pending path).
+            # Text already sent directly (dispatch-return first text) never
+            # entered the buffer, so it is neither retracted nor re-sent.
+            if not getattr(msg, "parent_tool_use_id", None):
+                end = len(state.proactive_texts)
+                if _is_stop_hook_feedback(msg) and state.proactive_superseded is None:
+                    start = state.proactive_step_start
+                    if 0 <= start < end and "".join(
+                        state.proactive_texts[start:end]
+                    ).strip():
+                        state.proactive_superseded = (start, end)
+                state.proactive_step_start = end
+            return
+
         if isinstance(msg, AssistantMessage):
             if getattr(msg, "session_id", None):
                 state.last_session_id = msg.session_id
             # Subagent inner output must never leak to the user.
             if getattr(msg, "parent_tool_use_id", None):
                 return
+            auth_fail = _cli_auth_failure(msg)
+            if auth_fail is not None:
+                # DGN-1857: never buffered; the result surfaces the notice.
+                state.proactive_auth_failure = True
+                logger.warning(
+                    "CLI auth failure in a no-pending turn for user "
+                    "%s held off the owner surface: %s", user_id, auth_fail,
+                )
+                return
             for block in msg.content:
                 if isinstance(block, TextBlock):
                     # DGN-376 T2 seat 2/3: proactive push bypasses
                     # _finalize_result, so the register guard must ride here or
                     # briefing/routine pushes escape it entirely (grill M3).
-                    state.proactive_texts.append(
-                        _register_guard(_scaffold_guard(block.text))
-                    )
+                    block_text = _register_guard(_scaffold_guard(block.text))
+                    if state.proactive_superseded is not None and block_text.strip():
+                        self._retract_proactive_superseded(user_id, state)
+                    state.proactive_texts.append(block_text)
+                    # A dispatch-return must become owner-visible before the
+                    # next ToolUse can run. Send this first text directly;
+                    # terminal flush later carries any follow-up without
+                    # depending on interim fold/suppress behavior.
+                    if state.dispatch_return_turn_id:
+                        if await self._send_dispatch_return_first_text(user_id, state, block_text):
+                            # It is already a separate owner message. Keep
+                            # later turn text for terminal flush, but never
+                            # duplicate this result line into it.
+                            state.proactive_texts.pop()
             return
 
         if isinstance(msg, ResultMessage):
+            if state.dispatch_return_turn_id:
+                _clear_dispatch_return_context(state.dispatch_return_turn_id)
+                state.dispatch_return_turn_id = None
+                state.dispatch_return_result_sent = False
+            delivered = state.dispatch_return_delivered
+            state.dispatch_return_delivered = None
             state.last_session_id = msg.session_id or state.last_session_id
             # DGN-996: injected-turn completion analog of bot._save_session_id
             # (which only real user turns reach).  Dedupe makes this a no-op
@@ -1862,15 +2747,48 @@ class SdkBridge:
                 # Swallow it -- and any tail text it buffered -- instead of
                 # pushing the aborted turn's remains as a proactive message.
                 state.discard_results -= 1
-                state.proactive_texts = []
+                self._reset_proactive_buffer(state)
+                state.injected_turn_mode = None  # Never leak past a turn boundary.
+                state.task_notification_wakeup = False
                 return
-            if getattr(msg, "is_error", False):
+            if getattr(msg, "is_error", False) or state.proactive_auth_failure:
                 # A no-pending turn ended in an error (e.g. model overloaded /
                 # api_error after retries). No assistant text was buffered, so the
                 # normal flush would silently drop it. Surface a notice instead.
                 await self._flush_proactive_error(user_id, state)
             else:
-                await self._flush_proactive(user_id, state)
+                await self._flush_proactive(user_id, state, delivered=delivered)
+
+    @staticmethod
+    def _reset_proactive_buffer(state: _UserStreamState) -> List[str]:
+        """Empty the no-pending text buffer and its DGN-1842 step marks;
+        returns what the buffer held."""
+        texts = state.proactive_texts
+        state.proactive_texts = []
+        state.proactive_step_start = 0
+        state.proactive_superseded = None
+        state.proactive_auth_failure = False
+        return texts
+
+    def _retract_proactive_superseded(
+        self, user_id: int, state: _UserStreamState
+    ) -> None:
+        """DGN-1842: replacement text arrived after a Stop-hook block in a
+        no-pending turn; drop the blocked answer from the buffer so the flush
+        delivers the regeneration only."""
+        span = state.proactive_superseded
+        state.proactive_superseded = None
+        if span is None:
+            return
+        start, end = span
+        dropped = state.proactive_texts[start:end]
+        del state.proactive_texts[start:end]
+        state.proactive_step_start = len(state.proactive_texts)
+        logger.info(
+            "retracted the superseded proactive segment for user %s "
+            "(%d block(s), %d chars) -- the Stop-hook regeneration replaces it",
+            user_id, len(dropped), sum(len(t) for t in dropped),
+        )
 
     async def _flush_proactive_error(self, user_id: int, state: _UserStreamState) -> None:
         """Surface a failed no-pending (background/proactive) turn.
@@ -1878,13 +2796,30 @@ class SdkBridge:
         Mirrors _flush_proactive's delivery guards but sends a fixed failure
         notice instead of buffered text (which is empty on an error result).
         """
-        state.proactive_texts = []
+        auth_failure = state.proactive_auth_failure
+        self._reset_proactive_buffer(state)
+        # A turn holding nothing but quiet records did not ask the owner for
+        # a report, so its failure notice is the same noise class to suppress.
+        # DGN-1642: a task-notification wake-up is not in that class (see
+        # _UserStreamState.task_notification_wakeup).
+        quiet = state.injected_turn_mode == "quiet"
+        state.injected_turn_mode = None
+        state.task_notification_wakeup = False
+        if quiet:
+            logger.warning(
+                "Quiet injected turn for user %s ended in error; "
+                "failure notice suppressed (quiet default)", user_id,
+            )
+            return
         if state.last_chat_id is None or state.proactive_push is None:
             logger.warning(
                 "Proactive error for user %s dropped: no chat_id/push callback", user_id
             )
             return
-        notice = messages.PROACTIVE_TURN_FAILED
+        notice = (
+            messages.ERROR_AUTH_RELOGIN if auth_failure
+            else messages.PROACTIVE_TURN_FAILED
+        )
         if notice == state.last_proactive_sent:
             return
         try:
@@ -1893,17 +2828,34 @@ class SdkBridge:
         except Exception as e:
             logger.error("Proactive error push failed for user %s: %s", user_id, e)
 
-    async def _flush_proactive(self, user_id: int, state: _UserStreamState) -> None:
+    async def _flush_proactive(
+        self, user_id: int, state: _UserStreamState, delivered: Optional[str] = None
+    ) -> None:
         """Deliver buffered main-agent text that arrived with no pending request.
 
         Called on a ResultMessage when state.pending is empty. Noise guards:
         empty/whitespace-only text is dropped; an identical consecutive push is
-        suppressed. Missing chat_id or callback degrades to a logged skip (never
+        suppressed; ``delivered`` (the result-first push of this turn,
+        DGN-1732) is subtracted so it never goes out twice. Missing chat_id or callback degrades to a logged skip (never
         crashes the reader loop). The normal request-response path never reaches
         here (it has a pending request), so this is regression-safe.
         """
-        texts = state.proactive_texts
-        state.proactive_texts = []
+        texts = self._reset_proactive_buffer(state)
+        # Consume the injected-turn mode unconditionally: this flush is the
+        # turn boundary, so it cannot silence a later proactive turn.
+        # DGN-1642: a task-notification wake-up delivers by default; only an
+        # explicit quiet injection inverts the default.
+        quiet = state.injected_turn_mode == "quiet"
+        wakeup_for_log = (
+            state.injected_turn_mode is None and state.task_notification_wakeup
+        )
+        # DGN-1642: captured before the reset below so the NO_PUSH log line
+        # can still report which turn source (loud/quiet/real) suppressed
+        # itself -- state.injected_turn_mode is None again by the time that
+        # branch runs otherwise.
+        turn_mode_for_log = state.injected_turn_mode
+        state.injected_turn_mode = None
+        state.task_notification_wakeup = False
         if not texts:
             return
         content = self._clean_response("\n".join(texts))
@@ -1921,14 +2873,68 @@ class SdkBridge:
         # sentinel line ("... details in the ticket.\nNO_PUSH") -- the
         # instruction prose says "end your output with NO_PUSH", so accept
         # a trailing sentinel line too. Intent is silence either way.
+        # DGN-1732: recognition is the shared seat recognizer
+        # (machine_gate.strip_no_push_sentinel); whole-turn silence on a
+        # found sentinel stays this finalize's policy.
         stripped = content.strip()
         lines = [ln.strip() for ln in stripped.splitlines() if ln.strip()]
-        if (
-            stripped == "NO_PUSH"
-            or stripped.startswith("NO_PUSH\n")
-            or (lines and lines[-1] == "NO_PUSH")
-        ):
+        if strip_no_push_sentinel(stripped)[1]:
+            # DGN-1642: measurement hook only, not a filter -- counts the
+            # sole surviving silence path (4.5 of the design). Length and
+            # mode only, never content (owner-sensitive).
+            logger.info(
+                "NO_PUSH suppression: injected_turn_mode=%s, %d chars",
+                turn_mode_for_log, len(stripped),
+            )
             return
+        # DGN-1619: PUSH is a delivery opt-in only for quiet turns, but its
+        # trailing sentinel must never reach the owner on either path.
+        body_lines = stripped.splitlines()
+        while body_lines and not body_lines[-1].strip():
+            body_lines.pop()
+        if body_lines and body_lines[-1].strip() == "PUSH":
+            body_lines.pop()
+        content = "\n".join(body_lines).strip()
+        if not content:
+            return
+        # DGN-1732: the result-first push already delivered part of this turn
+        # (maybe with its keyboard). Send only what is new; a final that
+        # fully reproduces it sends nothing (the DGN-947 lossless rule).
+        if delivered:
+            content = subtract_delivered(content, delivered)
+            if not content:
+                logger.info(
+                    "final dropped for user %s: fully reproduces the "
+                    "result-first push (lossless)", user_id,
+                )
+                return
+        # DGN-1627: a decision menu must reach the owner even from a quiet
+        # injected turn. Recognize it before quiet suppression, but after the
+        # PUSH sentinel is stripped so the canonical recognizers see its body.
+        has_options = has_options_marker(content) or has_numbered_list(content)
+        # DGN-1588/DGN-1591: a QUIET injected turn (outbound-record /
+        # operator-alert) inverts the delivery default. The model always
+        # emits text when given a turn -- "응답 불필요" in prose produced
+        # "기록만 확인했습니다" on the owner's screen (measured 2026-09-19).
+        # So silence is enforced HERE: the turn's output is dropped unless
+        # the model explicitly opts in by ending with the bare line PUSH or
+        # emits a decision menu.
+        if quiet:
+            if not (has_options or (lines and lines[-1] == "PUSH")):
+                logger.info(
+                    "Quiet injected turn for user %s suppressed "
+                    "(no PUSH sentinel; %d chars dropped)",
+                    user_id, len(stripped),
+                )
+                return
+        if wakeup_for_log:
+            # DGN-1642: measurement hook only, not a filter -- counts
+            # task-notification wake-ups that reach the owner so the noise
+            # DGN-1689 saw stays countable. Length only, never content.
+            logger.info(
+                "Task-notification wake-up for user %s delivered (%d chars)",
+                user_id, len(content),
+            )
         if content == state.last_proactive_sent:
             return
         if state.last_chat_id is None or state.proactive_push is None:
@@ -2222,7 +3228,7 @@ class SdkBridge:
                 # cause so the three fold-absence reasons are separable in
                 # bot.log.
                 logger.info(
-                    "DGN-947 fold deleted for user %s (msg %s): final fully "
+                    "fold deleted for user %s (msg %s): final fully "
                     "reproduces narration (lossless)",
                     req.user_id, req.fold_msg_id,
                 )
@@ -2235,6 +3241,55 @@ class SdkBridge:
         except Exception as e:
             logger.error("Fold delete failed for user %s: %s", req.user_id, e)
             return False
+
+    async def _promote_interim_answers(
+        self,
+        user_id: int,
+        state: _UserStreamState,
+        req: _PendingRequest,
+        promoted: List[str],
+        is_streamed: bool,
+    ) -> List[str]:
+        """DGN-1838: deliver promoted interim answers ahead of the final answer.
+
+        Each block goes out as its own normal message through the proactive
+        delivery seat (bot._send_smart: same formatting as a reply), in turn
+        order, BEFORE the final answer resolves -- so the chat reads
+        [progress fold] -> [answer] -> [final status]. Only an authored
+        [[OPTIONS]] marker builds buttons; a numbered answer list stays body
+        text. Returns the blocks NOT delivered here: the caller prepends them
+        to the final body, so a promoted answer is never lost and never sent
+        twice. That fallback is also the path when the final answer already
+        streamed into a draft (a separate push would land BELOW it). Never
+        raises.
+        """
+        if not promoted:
+            return []
+        if (
+            is_streamed
+            or state.proactive_push is None
+            or req.chat_id is None
+        ):
+            return list(promoted)
+        for i, block in enumerate(promoted):
+            body = block.strip()
+            try:
+                await state.proactive_push(
+                    req.chat_id, body, has_options_marker(body), False
+                )
+            except Exception as e:
+                logger.error(
+                    "promoted interim answer push failed for user %s: "
+                    "%s -- %d block(s) ride the final body instead",
+                    user_id, e, len(promoted) - i,
+                )
+                return list(promoted[i:])
+        logger.info(
+            "promoted %d interim answer block(s) out of the fold for "
+            "user %s (%s chars)",
+            len(promoted), user_id, ",".join(str(len(b)) for b in promoted),
+        )
+        return []
 
     async def _scrub_flake_drafts(self, req: _PendingRequest) -> None:
         """DGN-670 M2: delete already-streamed placeholder draft bubbles.
@@ -2253,7 +3308,7 @@ class SdkBridge:
         try:
             await handler.cancel()
         except Exception as e:
-            logger.error("DGN-670: placeholder draft scrub failed: %s", e)
+            logger.error("placeholder draft scrub failed: %s", e)
         try:
             from bridge.streaming import StreamingMessageHandler
 
@@ -2285,7 +3340,7 @@ class SdkBridge:
         """
         req.flake_retry_count += 1
         logger.warning(
-            "DGN-670 flake recovery: blocking placeholder for user %s, "
+            "flake recovery: blocking placeholder for user %s, "
             "re-dispatching once (tool_use_count=%d, num_turns=%d)",
             user_id,
             req.tool_use_count,
@@ -2298,6 +3353,10 @@ class SdkBridge:
         # DGN-1253: the retry is a fresh attempt -- the flaked attempt's
         # terminal segments are scrubbed with its drafts.
         req.final_segments = []
+        req.step_segment_start = 0
+        req.held_blocks = []
+        req.held_discarded = []
+        req.mint_held = []
         req.tool_use_count = 0
         req.synthetic_response = None
         req.subagent_activity = False
@@ -2311,7 +3370,7 @@ class SdkBridge:
                 )
         except Exception as e:
             logger.error(
-                "DGN-670 flake retry send FAILED for user %s: %s", user_id, e
+                "flake retry send FAILED for user %s: %s", user_id, e
             )
             if not req.future.done():
                 req.future.set_result(
@@ -2326,7 +3385,8 @@ class SdkBridge:
         return True
 
     async def _finalize_result(
-        self, user_id: int, state: _UserStreamState, req: _PendingRequest, msg: ResultMessage
+        self, user_id: int, state: _UserStreamState, req: _PendingRequest,
+        msg: ResultMessage, delivered: Optional[str] = None,
     ) -> bool:
         """Finalize a turn. Returns True ONLY when a DGN-670 flake retry was
         dispatched (the reader loop then keeps the request at the deque head);
@@ -2353,6 +3413,9 @@ class SdkBridge:
         # send_file:: paths, and extract_marker_labels / extract_options give
         # the LAST [[OPTIONS]] declaration the keyboard. Single-segment turns
         # (every non-hook turn) keep the legacy expression byte-identical.
+        # DGN-1857: a CLI auth failure on the non-error path finishes the
+        # turn exactly like an is_error auth result.
+        is_error = msg.is_error or req.cli_auth_failure is not None
         turn_assembled = len(req.final_segments) >= 2
         if turn_assembled:
             assembled = [req.final_segments[0]]
@@ -2372,7 +3435,11 @@ class SdkBridge:
                 # the untrusted msg.result (DGN-285). Non-empty buffers are
                 # never touched -- the plain turn stays byte-identical.
                 block_text = req.final_segments[0]
-        if msg.is_error or not block_text.strip():
+            if not block_text.strip() and req.held_discarded:
+                # DGN-1850: the regeneration after a gated Stop block carried
+                # no text; the held answer it did not replace stands.
+                block_text = "\n".join(req.held_discarded)
+        if is_error or not block_text.strip():
             result_text = msg.result or block_text
         else:
             result_text = block_text
@@ -2386,7 +3453,7 @@ class SdkBridge:
         # a LOCKED ko notice, so the English detail never reaches the user
         # (it goes to the stderr log only). Guarding it would be redundant and
         # could swallow a detail we intend to log.
-        if not msg.is_error:
+        if not is_error:
             result_text = _register_guard(_scaffold_guard(result_text))
         else:
             result_text = _scaffold_guard(result_text)
@@ -2396,13 +3463,67 @@ class SdkBridge:
         else:
             content = self._clean_response(result_text)
 
+        # DGN-1683: mint turn mute. The verb already sent the owner screen
+        # (screen) or reported a delivery failure (n13); the owner-bound text
+        # is what mint_gate allows and nothing else -- no footer, notice,
+        # options or classifier rides it. The future is resolved explicitly
+        # with the GATED text (which may be non-empty even when the agent's
+        # own content is empty), so this cannot defer to the DGN-519 drop.
+        if not is_error and req.mint_mute is not None:
+            spoke = req.mint_spoke or bool(content.strip())
+            gated = mint_gate.gate_text(req.mint_mute, content if spoke else "")
+            logger.info(
+                "mint turn mute for user %s: verdict=%s, agent text "
+                "%d chars -> owner text %d chars",
+                user_id, req.mint_mute, len(content), len(gated),
+            )
+            if req.streaming_handler:
+                try:
+                    await req.streaming_handler.finalize_all()
+                except Exception as e:
+                    logger.error("Streaming finalization failed: %s", e)
+            await self._fold_finalize(req, FOLD_CAPTION_NORMAL)
+            if not req.future.done():
+                req.future.set_result(
+                    ChatResponse(
+                        content=gated,
+                        success=True,
+                        session_id=msg.session_id,
+                    )
+                )
+            return False
+
+        # DGN-1732: a dispatch-return turn that absorbed this owner message
+        # already pushed its first text (maybe with its keyboard). Subtract it
+        # (the DGN-947 lossless rule); when nothing new remains the turn is
+        # complete on screen, so resolve with an empty body here (own log
+        # line; skips the flake gate and classifier the DGN-519 path reaches).
+        if delivered and not is_error and req.synthetic_response is None and content:
+            content = subtract_delivered(content, delivered)
+            if not content:
+                logger.info(
+                    "final dropped for user %s: fully reproduces the "
+                    "result-first push (lossless)", user_id,
+                )
+                if req.streaming_handler:
+                    try:
+                        await req.streaming_handler.finalize_all()
+                    except Exception as e:
+                        logger.error("Streaming finalization failed: %s", e)
+                await self._fold_finalize(req, FOLD_CAPTION_NORMAL)
+                if not req.future.done():
+                    req.future.set_result(
+                        ChatResponse(content="", success=True, session_id=msg.session_id)
+                    )
+                return False
+
         # DGN-670: placeholder-flake gate, HOISTED before draft finalization --
         # finalize_all() makes StreamingMessageHandler.cancel() a no-op, so
         # deciding after it would permanently finalize the placeholder bubble.
         # Firing condition (M1): flake regex AND subagent activity observed
         # this turn AND short content AND no legitimate background Task launch.
         # Detection (DGN-086 warning) still logs on every regex match.
-        if not msg.is_error and req.synthetic_response is None and content:
+        if not is_error and req.synthetic_response is None and content:
             flake = self._is_placeholder_flake(content)
             if flake:
                 logger.warning(
@@ -2420,7 +3541,7 @@ class SdkBridge:
                     # Loop guard: the single retry flaked again. Explicit
                     # failure notice -- never the placeholder, never silence.
                     logger.error(
-                        "DGN-670 flake recovery FAILED after 1 retry for user %s",
+                        "flake recovery FAILED after 1 retry for user %s",
                         user_id,
                     )
                     await self._scrub_flake_drafts(req)
@@ -2452,7 +3573,7 @@ class SdkBridge:
                 # pattern (background-launch status, long report, main-agent
                 # prose with no subagent this turn). Deliver as today.
                 logger.info(
-                    "DGN-670: flake pattern matched but recovery gates not met "
+                    "flake pattern matched but recovery gates not met "
                     "(subagent_activity=%s, background_task_launched=%s, "
                     "len=%d, retry_count=%d) -- delivering as-is",
                     req.subagent_activity,
@@ -2480,10 +3601,10 @@ class SdkBridge:
         # DGN-670: an EMPTY retry result must resolve to the failure notice
         # instead -- silently dropping it would leave the original request's
         # future unresolved until timeout.
-        if not msg.is_error and not content:
+        if not is_error and not content:
             if req.flake_retry_count >= 1:
                 logger.error(
-                    "DGN-670 flake retry returned empty content for user %s",
+                    "flake retry returned empty content for user %s",
                     user_id,
                 )
                 # DGN-699 D7: termination via failure notice -- confirm a
@@ -2500,10 +3621,52 @@ class SdkBridge:
                     )
                 return False
             logger.info("empty-final turn dropped for user %s", user_id)
+            # DGN-1838: an empty final after a substantive mid-turn answer
+            # must not bury that answer in the fold (or, with no grown
+            # bubble, drop it with the narration). Promote it on its own.
+            unsent: List[str] = []
+            if _effective_interim_mode() == "fold" and not req.fold_finalized:
+                grown = req.fold_msg_id is not None
+                promoted, kept = split_promoted_interim(
+                    req.fold_buf if grown else req.interim_texts, ""
+                )
+                if grown:
+                    req.fold_buf = kept
+                    if promoted and not kept:
+                        await self._fold_delete(req)
+                unsent = await self._promote_interim_answers(
+                    user_id, state, req, promoted, is_streamed
+                )
             # DGN-699 D7 (empty-final drop): the answer body is silently
             # dropped, but a grown fold is CONFIRMED in place (caption +
             # collapse) -- the caption is then the turn's only signal.
             await self._fold_finalize(req, FOLD_CAPTION_NORMAL)
+            if unsent and not req.future.done():
+                req.future.set_result(
+                    ChatResponse(
+                        content=INTERIM_FOLD_SEPARATOR.join(unsent),
+                        success=True,
+                        session_id=msg.session_id,
+                        streamed=is_streamed,
+                        draft_message_ids=draft_ids,
+                        turn_assembled=True,
+                    )
+                )
+                return False
+            # DGN-1819 A: "dropped" means nothing rendered, NOT an orphaned
+            # future. The reader pops this request next; a pending future
+            # then waits out the soft budget, finds nothing to interrupt and
+            # surfaces a false time-limit notice. Resolve with a no-render
+            # shape: empty body (as DGN-1732) + streamed=True (as interrupt).
+            if not req.future.done():
+                req.future.set_result(
+                    ChatResponse(
+                        content="",
+                        success=True,
+                        session_id=msg.session_id,
+                        streamed=True,
+                    )
+                )
             return False
 
         # DGN-777 final-sacred (supersedes the DGN-699 D5 content-side
@@ -2512,7 +3675,7 @@ class SdkBridge:
         # subtracted from the FOLD (the progress record), never from the
         # final content.
         if (
-            not msg.is_error
+            not is_error
             and req.synthetic_response is None
             and req.fold_msg_id is not None
             and _effective_interim_mode() == "fold"
@@ -2528,7 +3691,7 @@ class SdkBridge:
             else:
                 req.fold_buf = trimmed
 
-        if msg.is_error:
+        if is_error:
             # DGN-699 D7 (is_error): DGN-682 D9 stays -- no fold is ever
             # ATTACHED to an error notice -- but an already-grown fold bubble
             # is confirmed collapsed with the stop marker (the user saw it;
@@ -2547,10 +3710,14 @@ class SdkBridge:
             # is_error (e.g. 529/overloaded_error arriving as a result, not a
             # raised exception). Raised transient exceptions stay covered by
             # process_message -> _reconnect_and_retry.
-            kind = _classify_error_result(content)
+            detail = content or req.cli_auth_failure or ""
+            kind = (
+                "auth" if req.cli_auth_failure is not None
+                else _classify_error_result(detail)
+            )
             logger.warning(
                 "is_error result for user %s classified as %s: %s",
-                user_id, kind, content,
+                user_id, kind, detail,
             )
             if kind == "auth":
                 notice = messages.ERROR_AUTH_RELOGIN
@@ -2565,7 +3732,7 @@ class SdkBridge:
                 ChatResponse(
                     content=notice,
                     success=False,
-                    error=content,
+                    error=detail,
                     session_id=msg.session_id,
                     streamed=is_streamed,
                     draft_message_ids=draft_ids,
@@ -2613,6 +3780,60 @@ class SdkBridge:
             or has_numbered_list(content)
         )
 
+        # DGN-1586 (spec 3.5): owner-notice synthesis, owned by THIS seam --
+        # the finalize of an owner-request turn, right after footer
+        # consumption and AFTER the has_options judgment (a machine-appended
+        # notice body may carry numbered release-note lines; they must never
+        # read as a choice menu). Automatic turns never reach here (this
+        # method only runs with a pending request, and pending requests are
+        # created solely by owner Telegram actions; injected/cron output
+        # flows through _flush_proactive), so the owner protocol "never
+        # speak the update notice on an automatic turn" holds mechanically.
+        #
+        # reserve_for_synthesis re-reads the freshest spool state under the
+        # spool lock, applies the kind-specific validity predicates, picks
+        # at most ONE oldest pending and PRE-PERSISTS its attempt before we
+        # append anything; on any failure it returns None and this turn
+        # keeps the original response (spec 5). The notice rides the TAIL of
+        # the final content; downstream fold/options processing prepends or
+        # strips other material but never relocates the tail.
+        notice_id = notice_attempt = None
+        notice_kind = notice_version = notice_text = None
+        if req.synthetic_response is None:
+            try:
+                reservation = await asyncio.to_thread(
+                    notice_spool.reserve_for_synthesis, PROJECT_ROOT
+                )
+            except Exception as e:
+                logger.error("notice reservation failed: %s", e)
+                reservation = None
+            if reservation:
+                for ex_rec in reservation.get("exhausted") or []:
+                    # Spec 5 MINOR-1: exhaustion converts to an operator
+                    # alarm. Network runs outside the spool lock, as its
+                    # own task so a slow push never delays this finalize.
+                    try:
+                        asyncio.get_running_loop().create_task(
+                            notice_spool.send_exhausted_alarm(
+                                PROJECT_ROOT, ex_rec
+                            )
+                        )
+                    except Exception:
+                        logger.exception(
+                            "exhausted-alarm scheduling failed"
+                        )
+                rec = reservation.get("record")
+                if rec:
+                    body = (rec.get("body_fold")
+                            or rec.get("body_oneline") or "").strip()
+                    if body:
+                        notice_id = rec.get("id")
+                        notice_attempt = reservation.get("attempt")
+                        notice_kind = rec.get("kind")
+                        notice_version = rec.get("version")
+                        notice_text = body
+                        content = content + "\n" + body
+
         # DGN-682 D2/D5/D10: fold-mode interim synthesis, at the finalize
         # TAIL END -- after the final guards (D5), the DGN-519 empty-drop,
         # and _maybe_mark_options / has_options (so quoted narration numbering
@@ -2629,9 +3850,29 @@ class SdkBridge:
         # duplicate what the user already watched grow). Turns that never
         # passed the D8 creation gate keep the finalize-time compose
         # synthesis below unchanged.
+        # DGN-1838: substantive answers written mid-turn are lifted out of the
+        # fold first and delivered as their own message ahead of this final
+        # answer (see _promote_interim_answers). A block the final restates
+        # stays in the fold; the final body itself is never edited.
+        promoted_inline = False
         if _effective_interim_mode() == "fold":
             if req.fold_msg_id is not None:
+                promoted: List[str] = []
+                if not req.fold_finalized:
+                    promoted, req.fold_buf = split_promoted_interim(
+                        req.fold_buf, prefooter_content
+                    )
+                if promoted and not req.fold_buf:
+                    # The live bubble held nothing but the promoted answer:
+                    # collapsing it would show the answer a second time.
+                    await self._fold_delete(req)
                 await self._fold_finalize(req, FOLD_CAPTION_NORMAL)
+                unsent = await self._promote_interim_answers(
+                    user_id, state, req, promoted, is_streamed
+                )
+                if unsent:
+                    content = INTERIM_FOLD_SEPARATOR.join(unsent + [content])
+                    promoted_inline = True
             else:
                 # DGN-876: always subtract final overlap from the interim capture, then
                 # compose the fold from whatever survives. Full duplication -> empty fold
@@ -2643,6 +3884,15 @@ class SdkBridge:
                 interim_trimmed = self._subtract_paras(
                     req.interim_texts, prefooter_content
                 )
+                promoted, interim_trimmed = split_promoted_interim(
+                    interim_trimmed, prefooter_content
+                )
+                unsent = await self._promote_interim_answers(
+                    user_id, state, req, promoted, is_streamed
+                )
+                if unsent:
+                    content = INTERIM_FOLD_SEPARATOR.join(unsent + [content])
+                    promoted_inline = True
                 fold = compose_interim_fold(interim_trimmed, content)
                 if fold:
                     content = fold + INTERIM_FOLD_SEPARATOR + content
@@ -2679,14 +3929,14 @@ class SdkBridge:
                         )
                         if mid is not None:
                             logger.info(
-                                "DGN-947 fold budget-drop rescued for user %s: "
+                                "fold budget-drop rescued for user %s: "
                                 "%d interim block(s) emitted as own bubble",
                                 user_id,
                                 len(req.interim_texts),
                             )
                         else:
                             logger.error(
-                                "DGN-947 fold rescue send failed for user %s: "
+                                "fold rescue send failed for user %s: "
                                 "%d interim block(s), narration lost "
                                 "(over budget, send returned no message)",
                                 user_id,
@@ -2699,13 +3949,13 @@ class SdkBridge:
                         # through to the echo branch and get mislabeled
                         # "lossless".
                         logger.error(
-                            "DGN-947 fold budget-drop for user %s: %d interim "
+                            "fold budget-drop for user %s: %d interim "
                             "block(s) dropped, no streaming handler to rescue "
                             "(background turn, narration lost)",
                             user_id,
                             len(req.interim_texts),
                         )
-                elif req.interim_texts:
+                elif req.interim_texts and not promoted:
                     # DGN-947 FOLD-2: interim WAS captured but nothing survived
                     # subtraction (interim_trimmed empty) -- lossLESS. The final
                     # answer fully reproduces the narration paragraph-for-
@@ -2713,7 +3963,7 @@ class SdkBridge:
                     # separate lossy budget-drop cause is handled above and can
                     # no longer reach here.)
                     logger.info(
-                        "DGN-876 fold dropped for user %s: %d captured "
+                        "fold dropped for user %s: %d captured "
                         "interim block(s) fully subtracted as final-answer "
                         "overlap (lossless)",
                         user_id,
@@ -2730,7 +3980,14 @@ class SdkBridge:
                     options_classifier_injected=classifier_injected,
                     streamed=is_streamed,
                     draft_message_ids=draft_ids,
-                    turn_assembled=turn_assembled,
+                    # DGN-1838: a promoted answer prepended to a streamed
+                    # body differs from the draft; force the real edit.
+                    turn_assembled=turn_assembled or promoted_inline,
+                    notice_id=notice_id,
+                    notice_attempt=notice_attempt,
+                    notice_kind=notice_kind,
+                    notice_version=notice_version,
+                    notice_text=notice_text,
                 )
             )
         return False
@@ -2774,7 +4031,9 @@ class SdkBridge:
             logger.error("ensure_owner_stream failed for user %s: %s", user_id, e)
             return False
 
-    async def inject_background_turn(self, user_id: int, text: str) -> bool:
+    async def inject_background_turn(
+        self, user_id: int, text: str, quiet: bool = False
+    ) -> bool:
         """DGN-217: inject a background/cron notification as a turn into the
         user's LIVE session, with no pending request attached.
 
@@ -2783,6 +4042,12 @@ class SdkBridge:
         SEES the notification in-session and controls what (if anything)
         reaches the owner -- ending the turn with the bare sentinel NO_PUSH
         suppresses the push.
+
+        quiet=True (DGN-1588/DGN-1591) INVERTS that default for this one
+        turn: the output is suppressed unless the model explicitly ends it
+        with the bare sentinel line PUSH. Used for self-record injections
+        (outbound-record, operator-alert) whose useful case is "the agent
+        acts on the record", not "the agent narrates receipt to the owner".
 
         Returns False (caller retries later) when:
         - no live stream exists for this user yet (bot just started); the
@@ -2801,9 +4066,58 @@ class SdkBridge:
             # we were waiting for the lock.
             if state.pending:
                 return False
-            await state.client.query(
-                text, session_id=state.last_session_id or "default"
-            )
+            # DGN-1606: open every injected turn with the harness-owned mark
+            # so transcript readers can tell a machine-opened turn from a
+            # real owner message (identical plain-text user entries
+            # otherwise).  Callers keep passing the RAW spool text -- quiet
+            # detection (bot.py QUIET_INJECT_PREFIXES) runs on the original
+            # content before this method is reached.
+            is_dispatch_return = text.startswith("[dispatch-return]")
+            # DGN-1688: the dispatching session intentionally canceled this
+            # run.  It still receives the durable return record to recover
+            # artifacts, but its response is quiet by default.  Do not create
+            # the DGN-1687 owner-visible-result latch for this exempt turn.
+            quiet_recovery = is_dispatch_return and "\n- cancel_by: self" in text
+            turn_id = ""
+            injected_text = INJECTED_TURN_MARK + "\n" + text
+            if is_dispatch_return and not quiet_recovery:
+                # The model receives an explicit instruction, while the
+                # durable latch below is what actually governs tool use.
+                injected_text += (
+                    "\n\n[bridge:result-first] Before any follow-up work, "
+                    "send one concise owner-visible result line about this "
+                    "dispatch return."
+                )
+                turn_id = uuid.uuid4().hex
+                state.dispatch_return_turn_id = turn_id
+                state.dispatch_return_result_sent = False
+                state.dispatch_return_delivered = None
+                _write_dispatch_return_context(
+                    turn_id, user_id, state.last_session_id or "default"
+                )
+            elif quiet_recovery:
+                injected_text += (
+                    "\n\n[bridge:quiet-recovery] This dispatch was canceled by "
+                    "this session. Recover any useful artifacts, but end with "
+                    "NO_PUSH unless there is a new owner-actionable fact. End "
+                    "with PUSH only when that new fact must be delivered."
+                )
+            try:
+                await state.client.query(
+                    injected_text, session_id=state.last_session_id or "default",
+                )
+            except Exception:
+                if turn_id:
+                    _clear_dispatch_return_context(turn_id)
+                    state.dispatch_return_turn_id = None
+                    state.dispatch_return_result_sent = False
+                raise
+            # DGN-1620: a report-requesting injection latches delivery for
+            # this turn; a later quiet record cannot silence it.
+            if not (quiet or quiet_recovery):
+                state.injected_turn_mode = "loud"
+            elif state.injected_turn_mode is None:
+                state.injected_turn_mode = "quiet"
         return True
 
     async def process_message(
@@ -2818,6 +4132,7 @@ class SdkBridge:
         typing_callback: Optional[TypingCallback] = None,
         bot: Optional[Any] = None,
         proactive_push: Optional[ProactivePushCallback] = None,
+        inbound: Optional[Dict[str, Any]] = None,
     ) -> ChatResponse:
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
@@ -2838,6 +4153,9 @@ class SdkBridge:
             future=future,
             user_message=user_message,
             streaming_handler=streaming_handler,
+            inbound=inbound,
+            inbound_request_id=uuid.uuid4().hex if inbound else "",
+            hold_terminal=blocking_stop_gate_window(),
         )
         state: Optional[_UserStreamState] = None
         try:
@@ -2852,7 +4170,7 @@ class SdkBridge:
                 request.sent_session_id = session_id or state.last_session_id or "default"
                 state.pending.append(request)
                 await self._dispatch_next_query(state)
-            return await asyncio.wait_for(future, timeout=PROCESS_TIMEOUT)
+            return await asyncio.wait_for(future, timeout=self._soft_turn_budget())
 
         except asyncio.CancelledError:
             if streaming_handler:
@@ -2867,10 +4185,21 @@ class SdkBridge:
             raise
 
         except asyncio.TimeoutError:
+            # DGN-1499 stop-before-kill: the soft budget (PROCESS_TIMEOUT minus
+            # the grace) expired. First send the turn a stop signal so the CLI
+            # concludes it cleanly and the subprocess survives for the resume;
+            # only when that fails does the legacy preserve+teardown below run
+            # (whose force-kill is the designed last resort).
+            soft_response = await self._timeout_stop_then_preserve(user_id)
+            if soft_response is not None:
+                return soft_response
             logger.warning("Query timed out for user %s after %ss", user_id, PROCESS_TIMEOUT)
-            resume_sid, partial = await self.handle_timeout_preserve(user_id)
+            killed: List[str] = []
+            resume_sid, partial = await self.handle_timeout_preserve(
+                user_id, killed_jobs=killed
+            )
             return ChatResponse(
-                content=messages.TIMEOUT_PAUSED,
+                content=messages.TIMEOUT_PAUSED.format(timeout=PROCESS_TIMEOUT),
                 success=False,
                 error="timeout",
                 session_id=resume_sid,
@@ -2878,6 +4207,7 @@ class SdkBridge:
                 resume_session_id=resume_sid,
                 partial_preserved=partial,
                 streamed=partial,
+                killed_jobs=killed,
             )
 
         except Exception as e:
@@ -2901,6 +4231,10 @@ class SdkBridge:
                 content=messages.GENERIC_ERROR.format(error=e), success=False, error=str(e)
             )
 
+        finally:
+            if request.inbound_request_id:
+                _clear_inbound_context(request.inbound_request_id)
+
     async def _reconnect_and_retry(
         self, user_id, chat_id, user_message, session_id, model,
         permission_callback, typing_callback, bot, loop,
@@ -2922,6 +4256,7 @@ class SdkBridge:
             future=retry_future,
             user_message=user_message,
             streaming_handler=retry_handler,
+            hold_terminal=blocking_stop_gate_window(),
         )
         try:
             retry_state = await self._get_or_create_stream(user_id, model, new_session=False)
@@ -2964,10 +4299,13 @@ class SdkBridge:
 
         DGN-1016: `trigger` tags the interrupt origin in the INFO log
         ("stop" = explicit /stop command, "auto" = DGN-911 in-flight
-        debounce). Purely observational -- behavior is identical for every
-        trigger value. Before this tag the two origins were
-        indistinguishable in the log, which is why the 2026-08-22 09:33
-        subagent-death incident could not be attributed.
+        debounce). Before this tag the two origins were indistinguishable
+        in the log, which is why the 2026-08-22 09:33 subagent-death
+        incident could not be attributed. DGN-1499 adds "timeout" (the
+        stop-before-kill path, _timeout_stop_then_preserve); it is the one
+        trigger that changes behavior, and only in one detail: a grown fold
+        is confirmed with the timeout caption instead of the stop caption,
+        matching what handle_timeout_preserve stamps on the hard path.
 
         Sends the SDK control-protocol interrupt (ClaudeSDKClient.interrupt()
         -> Query.interrupt() -> control request {"subtype": "interrupt"}) so
@@ -2985,9 +4323,10 @@ class SdkBridge:
         dispatch-detached.sh runs in its own setsid session and is NOT
         killed by this path. Since the two coexist, the /stop reply
         (messages.STOP_INTERRUPTED) makes no blanket background-work claim
-        either way (2026-09-03 owner decision, DGN-991); when a tracked
-        in-session subagent is actually confirmed dead,
-        bg_subagent_killed_notice names it instead. Root fix (background
+        either way (2026-09-03 owner decision, DGN-991); when tracked
+        background work is confirmed dead by an AUTOMATIC interrupt,
+        bg_task_killed_notice counts it (DGN-1593: not after /stop, and
+        never by its internal description). Root fix (background
         work outside the session process) is the DGN-991 v2.0 relocation,
         out of scope here.
 
@@ -3000,7 +4339,8 @@ class SdkBridge:
         only message the user sees.
 
         Returns False when there is nothing to interrupt: no live stream, no
-        dispatched in-flight turn, or a client without a connected streaming
+        dispatched in-flight turn, a head turn that already ended and is
+        being finalized (DGN-1819), or a client without a connected streaming
         query (interrupt() is only valid in streaming mode). The caller falls
         back to the legacy hard-stop semantics. Raises (e.g. TimeoutError,
         CLIConnectionError) when the interrupt send fails on a stuck turn so
@@ -3017,6 +4357,16 @@ class SdkBridge:
             return False
         head = state.pending[0] if state.pending else None
         if head is None or not head.sent:
+            return False
+        # DGN-1819 B: the head turn already ended (its result is being
+        # finalized). Nothing to stop; the caller's fallback applies (auto:
+        # DGN-616 coalescing sends the new message after this turn settles).
+        if head.finalizing:
+            logger.info(
+                "Interrupt (%s) skipped for user %s: head turn is finalizing",
+                trigger,
+                user_id,
+            )
             return False
         # interrupt() is only valid on a connected streaming client; the SDK
         # raises CLIConnectionError when _query is absent. Treat that as
@@ -3037,11 +4387,18 @@ class SdkBridge:
         # "still live" entries forever. Snapshot + clear here, the one place
         # that synchronously knows the kill just happened, and stash
         # descriptions for the caller (pop_interrupt_killed) to notify with.
-        state.interrupt_killed_descriptions = [
-            state.task_descriptions.get(tid, tid) for tid in state.active_tasks
-        ]
-        state.active_tasks = {}
-        state.task_descriptions = {}
+        # DGN-1593 r2: resolved to owner-facing names now, while the type
+        # map still exists ("" = counted without a name).
+        # DGN-1593 r3: extend, never overwrite -- two overlapping interrupts
+        # (timeout stop + auto-interrupt) each snapshot active_tasks after
+        # their own await, and the later one sees it already empty. An
+        # overwrite let that empty snapshot erase the earlier kill list;
+        # extend + read-once pop means whichever caller pops first reports
+        # every killed job exactly once.
+        state.interrupt_killed_descriptions += self._collect_killed_tasks(state)
+        fold_caption = (
+            FOLD_CAPTION_TIMEOUT if trigger == "timeout" else FOLD_CAPTION_STOPPED
+        )
         drained: List[_PendingRequest] = []
         while state.pending:
             drained.append(state.pending.popleft())
@@ -3051,6 +4408,12 @@ class SdkBridge:
                 # dispatched turn; its request is drained now, so mark the
                 # result for a one-shot swallow in the reader loop.
                 state.discard_results += 1
+            # DGN-1850: an interrupted turn reaches no Stop gate; text held
+            # for one goes to the surfaces it would have streamed to.
+            try:
+                await self._release_held(req)
+            except Exception as e:
+                logger.error("Held-text release failed for user %s: %s", user_id, e)
             if req.streaming_handler:
                 try:
                     if trigger == "auto":
@@ -3073,9 +4436,10 @@ class SdkBridge:
                         "Interrupt finalize failed for user %s: %s", user_id, e
                     )
             # DGN-699 D7 (soft interrupt): a grown fold is confirmed
-            # collapsed with the stop marker -- the progress the user
-            # watched is preserved, never deleted.
-            await self._fold_finalize(req, FOLD_CAPTION_STOPPED)
+            # collapsed with the stop marker (or, for the DGN-1499 timeout
+            # trigger, the timeout marker) -- the progress the user watched
+            # is preserved, never deleted.
+            await self._fold_finalize(req, fold_caption)
             if not req.future.done():
                 req.future.set_result(
                     ChatResponse(
@@ -3094,8 +4458,130 @@ class SdkBridge:
         )
         return True
 
-    async def handle_timeout_preserve(self, user_id: int) -> Tuple[Optional[str], bool]:
-        """Preserve (finalize, not delete) partial drafts + capture resume sid."""
+    @staticmethod
+    def _soft_turn_budget() -> float:
+        """DGN-1499: dispatch budget before the stop signal fires (T-N).
+
+        PROCESS_TIMEOUT stays the total turn budget (T); the grace is carved
+        out of it, not added on top. Disabled grace (0) or one that does not
+        fit under PROCESS_TIMEOUT degrades to the legacy single deadline.
+        """
+        if 0 < TIMEOUT_STOP_GRACE < PROCESS_TIMEOUT:
+            return PROCESS_TIMEOUT - TIMEOUT_STOP_GRACE
+        return PROCESS_TIMEOUT
+
+    async def _timeout_stop_then_preserve(
+        self, user_id: int
+    ) -> Optional[ChatResponse]:
+        """DGN-1499: stop-before-kill for the turn timeout (the T-N hard rule).
+
+        The order used to be timeout -> disconnect (3s budget, which loses to
+        the SDK's own ~10s graceful sequence whenever the CLI is busy mid-turn)
+        -> force-kill, so the designed last resort fired as the FIRST resort on
+        every long turn (measured: bot.log 2026-09-15 18:31:45 / 18:40:55,
+        "Error disconnecting" then "Force-killed orphan CLI subprocess").
+
+        Now the turn gets a stop signal BEFORE expiry: the same SDK control
+        interrupt /stop uses (interrupt(), trigger="timeout"). On success the
+        CLI concludes the turn itself -- streamed drafts are finalized in
+        place, a grown fold is confirmed with the timeout caption, and the
+        stream state AND the CLI subprocess stay alive. The returned response
+        carries timed_out=True, so bot._auto_resume_loop resumes the session
+        on the SAME live client (no respawn). This response's own `content`
+        (messages.TIMEOUT_PAUSED) is a plain statement of fact, not an
+        instruction -- every caller must route it through
+        bot._auto_resume_loop first, and its STILL_WORKING / tap-to-continue
+        notices are the ONLY layer allowed to tell the owner to act (DGN-1523:
+        a caller that skips that gate and forwards this content verbatim
+        leaks a fact-only string with no button behind it). Nothing here
+        restarts the bridge process: self_restart.sh's owner-notify contract
+        is untouched by design.
+
+        Returns None whenever the soft path cannot run -- grace disabled, no
+        live stream, nothing dispatched, or the interrupt send failed / was
+        not acked within INTERRUPT_SEND_TIMEOUT (the stuck-CLI case). The
+        caller then falls back to the legacy preserve+teardown, where
+        force-kill remains the last resort.
+        """
+        if not (0 < TIMEOUT_STOP_GRACE < PROCESS_TIMEOUT):
+            return None
+        state = self._streams.get(user_id)
+        if state is None:
+            return None
+        resume_sid = state.last_session_id
+        if not resume_sid and state.pending:
+            head = state.pending[0]
+            if head.requested_session_id not in (None, "default"):
+                resume_sid = head.requested_session_id
+            elif head.sent_session_id not in (None, "default"):
+                resume_sid = head.sent_session_id
+        # DGN-1523: neither the live state nor the pending head is guaranteed
+        # to carry a sid at this exact instant (e.g. a stream still waiting on
+        # its first SystemMessage, or a request built before
+        # _runtime_active_sessions admitted it). The disk copy DGN-996
+        # pre-persists on every session_id sighting is the durable fallback --
+        # read it here, at the source, instead of leaving auto-resume to
+        # depend on bot.py re-deriving the same value a second time.
+        if not resume_sid:
+            try:
+                persisted = await session_manager.get_session(user_id)
+                resume_sid = persisted.get("session_id")
+            except Exception as e:
+                logger.warning(
+                    "resume sid disk fallback failed for user %s: %s", user_id, e
+                )
+        if not resume_sid:
+            logger.warning(
+                "Soft stop for user %s has no resume sid anywhere (live state, "
+                "pending head, and session store all empty) -- auto-resume "
+                "cannot fire this turn",
+                user_id,
+            )
+        # Capture the partial-output flag BEFORE interrupt() finalizes the
+        # drafts (finalize empties the draft list this predicate reads).
+        partial = self.user_has_streamed_output(user_id)
+        logger.warning(
+            "Query hit soft stop for user %s after %ss -- sending stop signal "
+            "(%ss grace before hard teardown)",
+            user_id,
+            self._soft_turn_budget(),
+            TIMEOUT_STOP_GRACE,
+        )
+        try:
+            stopped = await self.interrupt(user_id, trigger="timeout")
+        except Exception as e:
+            logger.warning(
+                "Stop signal failed for user %s: %s -- falling back to hard teardown",
+                user_id,
+                e,
+            )
+            return None
+        if not stopped:
+            return None
+        logger.info(
+            "Stop signal landed for user %s -- session kept alive for resume",
+            user_id,
+        )
+        # DGN-1593 r3: the stop signal kills background jobs exactly like an
+        # auto-interrupt does. Drain the kill list now (read-once) and hand
+        # it to the bot seat on the response, which owns the owner notice.
+        killed = self.pop_interrupt_killed(user_id)
+        return ChatResponse(
+            content=messages.TIMEOUT_PAUSED.format(timeout=PROCESS_TIMEOUT),
+            success=False,
+            error="timeout",
+            session_id=resume_sid,
+            timed_out=True,
+            resume_session_id=resume_sid,
+            partial_preserved=partial,
+            streamed=partial,
+            killed_jobs=killed,
+        )
+
+    async def handle_timeout_preserve(
+        self, user_id: int, *, killed_jobs: Optional[List[str]] = None
+    ) -> Tuple[Optional[str], bool]:
+        """Preserve drafts/sid and collect timeout kills for the bot notice."""
         state = self._streams.get(user_id)
         resume_session_id: Optional[str] = None
         partial_preserved = False
@@ -3132,6 +4618,14 @@ class SdkBridge:
         # queued future (pre-existing behavior, unchanged by this fix) --
         # silent=True only changes what that termination says: content=""
         # instead of a user-facing string, so nothing is emitted for it.
+        # Capture at teardown, after draft finalization may have yielded to
+        # another interrupt or task completion. No await separates this drain
+        # from disconnect popping the stream: overlapping soft/hard paths
+        # consume each job once, including unreported soft-interrupt kills.
+        state = self._streams.get(user_id)
+        if state is not None and killed_jobs is not None:
+            killed_jobs.extend(self.pop_interrupt_killed(user_id))
+            killed_jobs.extend(self._collect_killed_tasks(state))
         await self._disconnect_user_stream(user_id, silent=True)
         return resume_session_id, partial_preserved
 

@@ -14,9 +14,10 @@ path only kills the CLI subprocess, the bridge stays up and keeps the user's
 session_id live, so the owner's next message resumes the same conversation
 either way -- there is no honest basis for different copy on the two paths.
 
-bg_subagent_killed_notice (DGN-1015, owner-approved 2026-08-24) is the
-surviving fact-based signal: it fires ONLY when a tracked in-session
-subagent is confirmed dead, and stays wired in _cmd_stop unchanged.
+bg_task_killed_notice (DGN-1015; renamed + count-only by DGN-1593) is the
+surviving fact-based signal: it fires ONLY when tracked background work is
+confirmed dead by an AUTOMATIC interrupt. DGN-1593 B unwired it from
+_cmd_stop -- the owner ordered that stop, so /stop stays one sentence.
 
 Root fix (background work outside the session process) is v2.0 -- out of
 scope here by ticket lock.
@@ -106,14 +107,14 @@ class TestStopCopyKeys:
         assert ko.STRINGS["stop_interrupted"] == "진행하던 작업을 멈췄습니다."
         assert en.STRINGS["stop_interrupted"] == "Stopped what was running."
 
-    def test_bg_subagent_killed_notice_survives(self):
+    def test_bg_task_killed_notice_survives(self):
         """This is the load-bearing premise of the DGN-991 simplification:
-        the fact-based kill notice stays, so dropping the standing warning
-        does not remove all signal when something actually died."""
+        the fact-based kill notice stays (automatic interrupts), so dropping
+        the standing warning does not remove all signal when something
+        actually died unseen. DGN-1593 A: count slot, not names."""
         for loc in (ko.STRINGS, en.STRINGS):
-            assert loc["bg_subagent_killed_notice"].strip()
-        assert "{names}" in ko.STRINGS["bg_subagent_killed_notice"]
-        assert "{names}" in en.STRINGS["bg_subagent_killed_notice"]
+            assert loc["bg_task_killed_notice"].strip()
+            assert "{count}" in loc["bg_task_killed_notice"]
 
     def test_no_raw_markdown_or_headers(self):
         """Telegram contract: no # headers, no raw md tables in the copy."""
@@ -169,7 +170,7 @@ class TestStopWiring:
 
         asyncio.run(scenario())
 
-    def test_first_stop_with_confirmed_kill_appends_kill_notice(self):
+    def test_first_stop_with_confirmed_kill_stays_one_sentence(self):
         async def scenario():
             mock_sdk = self._mock_sdk(interrupt_result=True)
             mock_sdk.pop_interrupt_killed = MagicMock(
@@ -180,13 +181,11 @@ class TestStopWiring:
                 bot = TelegramBot()
                 update = self._make_update()
                 await bot._cmd_stop(update, None)
-            expected = (
-                f"{messages.STOP_INTERRUPTED}\n"
-                + messages.BG_SUBAGENT_KILLED_NOTICE.format(
-                    names="DGN-991 test build"
-                )
+            # DGN-1593 B: the owner's own stop gets no kill notice.
+            update.message.reply_text.assert_awaited_once_with(
+                messages.STOP_INTERRUPTED
             )
-            update.message.reply_text.assert_awaited_once_with(expected)
+            mock_sdk.pop_interrupt_killed.assert_called_once_with(USER_ID)
 
         asyncio.run(scenario())
 

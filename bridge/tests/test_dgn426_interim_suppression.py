@@ -11,6 +11,9 @@ Tests that:
 7. Error-result path: no sealed interim drafts left behind.
 """
 
+import pytest
+
+from bridge import sdk_bridge as _locale_bridge
 import asyncio
 import unittest
 from dataclasses import dataclass, field
@@ -35,6 +38,16 @@ from bridge.sdk_bridge import SdkBridge, _PendingRequest, _UserStreamState
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _en_instance(monkeypatch):
+    # These fixtures narrate in English: pin an en instance so the interim
+    # locale gate (sdk_bridge._interim_off_locale) stays out of the interim
+    # mechanics under test, whatever LOCALE the shell exports. The ko side
+    # is covered by test_interim_locale_gate.py.
+    monkeypatch.setattr(_locale_bridge.config, "locale", "en")
+
 
 
 def _make_text_block(text: str) -> TextBlock:

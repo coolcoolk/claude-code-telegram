@@ -50,13 +50,11 @@ process tree). Three values:
               undeclared rail, so the missing declaration is a work item
               that drains itself (declare -> alert stops)
 
-ALERT READER. A log line is not a reader (DGN-1208: a control with no reader
-is the defect this ticket is about). The alert sink is set by the host: the
-bridge (bot.py) sends a Telegram notice to the owner chat and records a
-durable marker AFTER the send succeeds; the push.sh hop appends the notice to
-the outgoing body. Dedup key is (rail, token, day) -- token-only would bury
-the first appearance of a known token on a NEWLY opened rail, which is
-exactly the event the detector exists for.
+ALERT READER (DGN-1756). Hygiene discoveries are ledger/log-only on every
+instance, even with STEWARD_ENV_FILE configured: that channel is still an
+owner chat. The existing /health technical details and durable markers give
+operators a query-time reader without unsolicited chat or session injection.
+Dedup remains (rail, token, day), with markers purged after 14 days.
 
 This module is telegram-free and importable outside the bridge venv (the
 push.sh sanitize hop runs it there, DGN-822): stdlib only; bridge.config is
@@ -105,6 +103,14 @@ SEED_MACHINE_TOKENS: Dict[str, str] = {
 _TOKEN_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 # P1 (grill 깨진 전제 4): kept as-is -- recall over precision, detection only.
 _MACHINE_SHAPE_RE = re.compile(r"^([A-Z][A-Z0-9_]{2,})(?: |$)")
+# DGN-1585 S4: two auxiliary shapes (observed on the owner's real feed --
+# "[pack lag] ..." / "... age=1234"). AUXILIARY defense only: the primary
+# defense against a notification reaching the wrong audience is the
+# --audience axis (push.sh S1-S3), not this detector -- do NOT widen these
+# into a tone/register heuristic (judgment already recorded above the ALL-CAPS
+# regex: recall over precision, detection only, never a censor).
+_BRACKET_PREFIX_SHAPE_RE = re.compile(r"^\[[^\]]+\]")
+_KEY_DIGITS_SHAPE_RE = re.compile(r"\w+=\d+")
 # Line-anchored fence toggle (same shape as sdk_bridge._CODE_FENCE_RE). NOT
 # `text.find("```")`: an inline ``` in prose must not open a code region and
 # hide the machine line behind it (grill 깨진 전제 3).
@@ -199,6 +205,25 @@ def _classify_line(
     m = _MACHINE_SHAPE_RE.match(stripped)
     if m is not None:
         return "unregistered", m.group(1), None
+    m = _BRACKET_PREFIX_SHAPE_RE.match(stripped)
+    if m is not None:
+        # DGN-1756: natural-language section labels need no pack registry.
+        # Non-ASCII punctuation/emoji alone is not language. Mixed labels
+        # still alert when they carry explicit machine syntax/identifiers.
+        label = m.group(0)[1:-1]
+        natural = any(c.isalpha() and not c.isascii() for c in label)
+        machine = (
+            MACHINE_SIGNAL_MARKER in stripped
+            or re.search(r"(?<![A-Za-z0-9_])[A-Z][A-Z0-9_]{2,}(?![A-Za-z0-9_])", label)
+            or re.search(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+", label)
+            or find_execution_identifiers(stripped)
+            or _KEY_DIGITS_SHAPE_RE.search(stripped)
+        )
+        if not natural or machine:
+            return "unregistered", m.group(0), None
+    m = _KEY_DIGITS_SHAPE_RE.search(stripped)
+    if m is not None:
+        return "unregistered", m.group(0), None
     return "pass", None, None
 
 
@@ -247,6 +272,44 @@ def gate_machine_lines(text: str, rail: str = RAIL_UNKNOWN) -> GateResult:
 
 
 # --------------------------------------------------------------------------
+# NO_PUSH delivery sentinel (DGN-1732)
+# --------------------------------------------------------------------------
+
+NO_PUSH_SENTINEL = "NO_PUSH"
+
+
+def strip_no_push_sentinel(text: str) -> Tuple[str, bool]:
+    """DGN-1732: the ONE recognizer for the NO_PUSH delivery sentinel.
+
+    Returns (owner_body, sentinel_found). NO_PUSH is a delivery directive to
+    the bridge, never owner prose, so every owner-bound render strips it here
+    (apply_machine_line_gate) instead of each delivery path remembering to.
+    DGN-1732 incident: the result-first push (DGN-1687/1715) sent a first
+    text ending in "NO_PUSH" before the finalize-side suppression ever ran.
+
+      bare "NO_PUSH"                     -> ("", True)
+      first non-blank line is NO_PUSH    -> ("", True)   (DGN-217: harness
+                                            footer lines after the sentinel)
+      last non-blank line is NO_PUSH     -> (body above it, True) (DGN-234)
+      anything else                      -> (text unchanged, False)
+
+    Whole-turn silence for an injected turn (DGN-217/234) stays a finalize
+    policy in sdk_bridge._flush_proactive; this function only recognizes.
+    """
+    if not text or NO_PUSH_SENTINEL not in text:
+        return text, False
+    lines = text.splitlines()
+    nonblank = [i for i, ln in enumerate(lines) if ln.strip()]
+    if not nonblank:
+        return text, False
+    if lines[nonblank[0]].strip() == NO_PUSH_SENTINEL:
+        return "", True
+    if lines[nonblank[-1]].strip() == NO_PUSH_SENTINEL:
+        return "\n".join(lines[:nonblank[-1]]).rstrip(), True
+    return text, False
+
+
+# --------------------------------------------------------------------------
 # alert sink (host-provided reader) + the apply wrapper the choke points call
 # --------------------------------------------------------------------------
 
@@ -267,8 +330,7 @@ _alert_sink: AlertSink = _default_alert_sink
 
 
 def set_machine_line_alert_sink(sink: Optional[AlertSink]) -> None:
-    """Install the host's reader (bot.py: owner-chat notice; push.sh hop:
-    body trailer). None restores the log-only default."""
+    """Install the host's ledger/log reader. None restores the log-only default."""
     global _alert_sink
     _alert_sink = sink or _default_alert_sink
 
@@ -281,7 +343,16 @@ def apply_machine_line_gate(text: str, rail: str = RAIL_UNKNOWN) -> str:
     / model sends). Logs every DROP/STRIP (no silent drops -- a false positive
     must be visible to the owner and to the maintainer), and hands unregistered
     machine-shape hits to the alert sink on non-model rails.
+
+    DGN-1732: the NO_PUSH sentinel is stripped first, on every rail, so no
+    current or future delivery path can show it to the owner.
     """
+    text, had_sentinel = strip_no_push_sentinel(text)
+    if had_sentinel:
+        logger.info(
+            "NO_PUSH sentinel stripped at delivery seat: rail=%s, %d chars remain",
+            rail, len(text),
+        )
     if rail not in RAILS:
         logger.warning("machine-line gate: unknown rail %r -> treated as %s", rail, RAIL_UNKNOWN)
         rail = RAIL_UNKNOWN
@@ -424,8 +495,8 @@ _MARKER_TTL_DAYS = 14
 class MachineLineAlertLedger:
     """One marker file per (rail, token, day) under `<BOT_DATA_DIR>/machine-line-alerts`.
 
-    The marker is written AFTER the alert reached its reader (bot.py) -- a
-    failed send leaves no marker, so the next hit retries. It is also the
+    The marker is the durable record for query-time readers, regardless of
+    steward configuration. push.sh retains render-time marking. It is also the
     durable trace the maintainer's audits read (DGN-1210 "durable marker" shape)."""
 
     def __init__(self, directory: Path) -> None:
@@ -481,16 +552,22 @@ class MachineLineAlertLedger:
 
 
 # --------------------------------------------------------------------------
-# alert copy (owner-facing -- WORDING PENDING OWNER CONFIRMATION, DGN-1209)
+# alert copy (framework operator only)
 # --------------------------------------------------------------------------
 
 # Placeholder copy. The final wording is a UX gate (owner confirmation
 # pending); the i18n catalogs carry the same placeholder under
 # machine_line_alert / machine_line_alert_undeclared. Do not treat this text
 # as approved.
+# DGN-1589/DGN-1591: the alert's reader is the FRAMEWORK OPERATOR, never the
+# end-user (audience routing below). The copy must NOT itself look machine-
+# shaped -- no leading bracket (_BRACKET_PREFIX_SHAPE_RE is ^-anchored), no
+# leading ALL-CAPS token -- or the alert re-triggers itself on the operator
+# rail.
 _ALERT_FALLBACK = (
-    "[bridge] machine-shaped line(s) passed to the owner surface without "
-    "registration: {tokens} (rail={rail})"
+    "Framework hygiene notice: unregistered machine-shaped line(s) passed "
+    "the user surface unchanged: {tokens} (rail: {rail}). Nothing was "
+    "dropped; this fires once per day per token."
 )
 _ALERT_UNDECLARED_FALLBACK = (
     " -- this rail is UNDECLARED (call site passes no rail); declare it."
@@ -498,7 +575,7 @@ _ALERT_UNDECLARED_FALLBACK = (
 
 
 def format_alert_text(rail: str, tokens: Iterable[str]) -> str:
-    """Owner-facing notice text for the sink. Guarded i18n (hop-safe)."""
+    """Operator notice text for the sink. Guarded i18n (hop-safe)."""
     try:
         from bridge.formatting import _i18n  # noqa: WPS433
         template = _i18n("machine_line_alert", _ALERT_FALLBACK)
@@ -512,3 +589,29 @@ def format_alert_text(rail: str, tokens: Iterable[str]) -> str:
     if rail == RAIL_UNKNOWN:
         text += undeclared
     return text
+
+
+# --------------------------------------------------------------------------
+# Steward configuration resolver (retained for callers outside the alert sink).
+# Hygiene alerts never use this channel: it can be an owner chat (DGN-1756).
+# --------------------------------------------------------------------------
+
+
+def steward_env_file(agent_conf: Path) -> Optional[Path]:
+    """Resolve config/agent.conf's STEWARD_ENV_FILE (DGN-1585 S2 key).
+
+    Returns the path only when the key is set AND the file exists --
+    the same resolvability push.sh's own operator routing requires.
+    Any read failure resolves to None (never raises on config)."""
+    try:
+        for raw in Path(agent_conf).read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line.startswith("STEWARD_ENV_FILE="):
+                continue
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            if value and Path(value).is_file():
+                return Path(value)
+            return None
+    except OSError:
+        return None
+    return None

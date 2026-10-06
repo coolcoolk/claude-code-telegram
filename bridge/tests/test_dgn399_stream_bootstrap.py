@@ -119,7 +119,7 @@ class TestSessionInboxLoopBootstrap(unittest.TestCase):
 
             ticks = {"n": 0}
 
-            async def inject_background_turn(uid, text):
+            async def inject_background_turn(uid, text, quiet=False):
                 # Mirrors the real contract: only injects when a stream exists.
                 if not state["has_stream"]:
                     return False

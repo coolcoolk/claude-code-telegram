@@ -233,12 +233,16 @@ class ErrorClassifyTest(unittest.TestCase):
                 "401 unauthorized after connection timeout"))
 
     def test_locked_messages_present(self):
+        # ERROR_AUTH_RELOGIN: DGN-1857 re-login guide, owner-confirmed dec-256.
         from bridge import messages
         self.assertEqual(
             messages.ERROR_TRANSIENT_RETRY, "일시적으로 처리에 실패했어요. 다시 시도할까요?")
         self.assertEqual(
             messages.ERROR_AUTH_RELOGIN,
-            "클로드에 다시 로그인 하신 후 알려주시면 복구하겠습니다.")
+            "Claude 로그인이 만료됐어요. 이 맥의 터미널에서 `claude auth login` 을 "
+            "실행한 뒤 /restart 를 보내 주세요. 원격(SSH)으로 접속했다면 그 전에 "
+            "`security unlock-keychain ~/Library/Keychains/login.keychain-db` 를 "
+            "먼저 실행해 주세요.")
         self.assertEqual(
             messages.ERROR_GENERIC_RETRY, "처리 실패했어요. 다시 시도할까요?")
 

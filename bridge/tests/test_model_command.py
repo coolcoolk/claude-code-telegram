@@ -71,15 +71,21 @@ class TestKnownModels(unittest.TestCase):
         self.assertIn("opus", known)
 
     def test_model_labels_map_all_builtin_names(self):
+        # DGN-1814 r3: labels are derived from the model table (no bridge map).
+        from bridge import model_picker
+        table = model_picker.chat_table()
         for name in ("sonnet", "opus", "haiku", "fable"):
-            self.assertIn(name, _bot._MODEL_LABELS)
+            self.assertIn(name.capitalize(), model_picker.full_name(name, table))
+        self.assertFalse(hasattr(_bot, "_MODEL_LABELS"))
 
 
 class TestModelSwitch(unittest.TestCase):
     """Session mutation on model switch matches what _cmd_model does."""
 
     def setUp(self):
-        self._tmpdir = Path(tempfile.mkdtemp(prefix="model-cmd-test-"))
+        tmp = tempfile.TemporaryDirectory(prefix="model-cmd-test-")
+        self.addCleanup(tmp.cleanup)
+        self._tmpdir = Path(tmp.name)
         self._saved_path = model_state.LAST_MODEL_PATH
         model_state.LAST_MODEL_PATH = self._tmpdir / "last_model.json"
 

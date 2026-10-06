@@ -62,5 +62,10 @@
 # meant to send, and adds no surface. Landed canonically 2026-09-14 (the fix
 # had lived only in the public clone, which the generated line makes a dead
 # end). Owner approval for the cut: 형님 2026-09-14 21:01.
-__oss_base__ = "2.0.2"
+# DGN-1880 (OSS 2.1.0, dec-261): the first emission after three weeks of
+# canonical-only growth (model picker, notice spool, Stop-block retraction,
+# owner-send belt, ...). MINOR: it adds public surface. Set here first because
+# gate V refuses a tree that misreports itself; landing and pushing the OSS
+# commit remain separate owner-gated acts.
+__oss_base__ = "2.1.0"
 __version__ = __oss_base__

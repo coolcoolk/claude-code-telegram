@@ -6,15 +6,62 @@ text is fed back into the normal text pipeline prefixed with a microphone glyph.
 """
 
 import asyncio
+import inspect
+import json
 import logging
 import shutil
 import time
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from bridge.config import config
+from bridge.config import BOT_DATA_DIR, config
 
 logger = logging.getLogger(__name__)
+
+# DGN-1694: derived vocabulary cache (schema 1: {"terms": [{"term": ...}]},
+# ordered by priority). Written outside the bridge; absent = no derived terms.
+VOCAB_CACHE_PATH = BOT_DATA_DIR / "voice-vocab.json"
+# faster-whisper keeps max_length // 2 - 1 prompt tokens (448 -> 223): the
+# FIRST ones for hotwords, the LAST ones for initial_prompt -- an overflow
+# would silently drop the highest-priority terms, so the cut happens here.
+DEFAULT_MAX_LENGTH = 448
+
+
+def load_derived_vocabulary(path: Optional[Path] = None) -> List[str]:
+    """Terms from the derived-vocabulary cache; any problem -> []."""
+    try:
+        data = json.loads(Path(path or VOCAB_CACHE_PATH).read_text(encoding="utf-8"))
+        if data.get("schema") != 1:
+            return []
+        return [t["term"] for t in data.get("terms", [])
+                if isinstance(t, dict) and isinstance(t.get("term"), str)]
+    except (OSError, ValueError, AttributeError, TypeError):
+        return []
+
+
+def fit_vocabulary(phrases: Sequence[str], count_tokens, budget: int) -> List[str]:
+    """Priority-ordered, case-insensitively deduplicated phrases whose joined
+    hint (" " + ", ".join(...), as the recognizer encodes it) fits budget.
+    A phrase that does not fit is skipped; shorter later phrases may still."""
+    kept: List[str] = []
+    seen = set()
+    for phrase in phrases:
+        phrase = str(phrase).strip()
+        if not phrase or phrase.casefold() in seen:
+            continue
+        seen.add(phrase.casefold())
+        if count_tokens(" " + ", ".join(kept + [phrase])) <= budget:
+            kept.append(phrase)
+    return kept
+
+
+def _token_counter(model):
+    """The loaded model's own tokenizer; else UTF-8 bytes, a strict upper
+    bound for a byte-level BPE (never more tokens than bytes)."""
+    tokenizer = getattr(model, "hf_tokenizer", None)
+    if tokenizer is not None and callable(getattr(tokenizer, "encode", None)):
+        return lambda text: len(tokenizer.encode(text, add_special_tokens=False).ids)
+    return lambda text: len(text.encode("utf-8"))
 
 
 class TranscriptionError(RuntimeError):
@@ -142,11 +189,14 @@ class LocalWhisperTranscriber:
         language: Optional[str] = None,
         device: str = "cpu",
         compute_type: str = "int8",
+        vocabulary: Optional[Sequence[str]] = None,
     ) -> None:
         self.model_name = (model or "small").strip() or "small"
         self.language = (language or "").strip() or None
         self.device = device
         self.compute_type = compute_type
+        self.vocabulary = list(vocabulary or [])
+        self._hint: Optional[str] = None
         self._model = None
 
     def ensure_available(self) -> None:
@@ -170,8 +220,24 @@ class LocalWhisperTranscriber:
 
     def _run(self, audio_path: Path) -> str:
         model = self._ensure_model()
+        hints = {}
+        if self._hint is None:
+            max_length = getattr(model, "max_length", None)
+            if not isinstance(max_length, int):
+                max_length = DEFAULT_MAX_LENGTH
+            kept = fit_vocabulary(self.vocabulary, _token_counter(model),
+                                  max_length // 2 - 1)
+            self._hint = ", ".join(kept)
+            if len(kept) < len(self.vocabulary):
+                logger.info("voice vocabulary cut to budget: %d of %d phrases",
+                            len(kept), len(self.vocabulary))
+        if self._hint:
+            parameters = inspect.signature(model.transcribe).parameters
+            key = "hotwords" if "hotwords" in parameters else "initial_prompt"
+            hints[key] = self._hint
         segments, _info = model.transcribe(
-            str(audio_path), language=self.language, beam_size=5, vad_filter=True
+            str(audio_path), language=self.language, beam_size=5, vad_filter=True,
+            **hints,
         )
         return "".join(segment.text for segment in segments)
 
@@ -190,6 +256,8 @@ class LocalWhisperTranscriber:
 
 
 def build_transcriber() -> LocalWhisperTranscriber:
+    # Explicit machine/instance vocabulary first, then the derived cache.
     return LocalWhisperTranscriber(
-        model=config.local_whisper_model, language=config.whisper_language
+        model=config.local_whisper_model, language=config.whisper_language,
+        vocabulary=list(config.whisper_vocabulary) + load_derived_vocabulary()
     )

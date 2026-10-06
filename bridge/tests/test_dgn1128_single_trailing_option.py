@@ -283,7 +283,7 @@ class TestFinalizeEndToEnd:
         kb = _keyboard_sends(sent)
         assert len(kb) == 1, f"no keyboard attached: {sent}"
         rows = kb[0]["reply_markup"].inline_keyboard
-        assert [r[0].text for r in rows] == ["1. 완료"]
+        assert [r[0].text for r in rows] == ["완료"]
         bodies = [e for e in sent if e["reply_markup"] is None]
         assert any("1. 완료" in b["text"] for b in bodies), (
             "classifier-injected marker must keep the body list"
@@ -340,7 +340,7 @@ class TestFinalizeEndToEnd:
         kb = _keyboard_sends(sent)
         assert len(kb) == 1
         rows = kb[0]["reply_markup"].inline_keyboard
-        assert [r[0].text for r in rows] == ["1. 완료"]
+        assert [r[0].text for r in rows] == ["완료"]
 
 
 # ---------------------------------------------------------------------------

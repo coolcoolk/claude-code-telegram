@@ -21,14 +21,13 @@ def _selfcheck() -> int:
       3. cross-module constant resolution (DGN-762) -- every static
          `messages.<NAME>` / `from bridge.messages import <NAME>` reference
          in bridge/*.py must resolve against the actual messages module
-      4. resolve the Claude CLI -- explicit CLAUDE_CLI_PATH wins, else PATH
-         lookup, else ~/.local/bin/claude (same rule as start.sh / the
-         launchd plist PATH, DGN-674 F9)
+      4. resolve the Claude CLI via bridge.config.resolve_claude_cli_source
+         (DGN-1814: the one resolver every launch site uses) -- explicit
+         CLAUDE_CLI_PATH wins, else PATH lookup, else ~/.local/bin/claude
     Prints "selfcheck ok" on success, "selfcheck FAIL: <reason>" line(s) on
     failure.
     """
     import ast
-    import shutil
 
     try:
         from bridge import config as _config
@@ -89,16 +88,15 @@ def _selfcheck() -> int:
                 "which is undefined"
             )
         return 1
-    cli = _config.CLAUDE_CLI_PATH
-    if cli:
-        if not Path(cli).expanduser().exists():
+    # DGN-1814: the SAME resolver the send path uses (bridge.config).
+    cli, source = _config.resolve_claude_cli_source()
+    if source == _config.CLI_SOURCE_EXPLICIT:
+        if not Path(cli).exists():
             print(f"selfcheck FAIL: CLAUDE_CLI_PATH not found ({cli})")
             return 1
-    else:
-        local_bin = Path.home() / ".local" / "bin" / "claude"
-        if not (shutil.which("claude") or local_bin.exists()):
-            print("selfcheck FAIL: claude CLI not found (PATH or ~/.local/bin)")
-            return 1
+    elif cli is None:
+        print("selfcheck FAIL: claude CLI not found (PATH or ~/.local/bin)")
+        return 1
     print("selfcheck ok")
     return 0
 

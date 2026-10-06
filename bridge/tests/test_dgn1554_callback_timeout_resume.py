@@ -3,18 +3,21 @@
 even though the two "normal" paths (plain text turn, tap-to-continue resume
 callback) already did the right thing.
 
-Fix shape: every SDK-turn call site now routes its response through ONE
-seam, `TelegramBot._finish_turn` (built on `_make_resume_caller`), instead of
-hand-checking `timed_out` at the call site. `_finish_turn` runs
-`_auto_resume_loop` and, if the turn is still timed out afterwards (AUTO_RESUME
-off, or resumes exhausted), sends the tap-to-continue notice and returns
-`None` -- the caller must stop. A call site that skips this seam cannot
-special-case timeout at all, because it never sees `timed_out` directly.
+Fix shape: every SDK-turn call site routes its response through ONE seam
+instead of hand-checking `timed_out` at the call site. In this tree that seam
+is `TelegramBot._finish_turn_with_auto_resume` (DGN-1523 closed the same three
+bypass paths first; an earlier public cut named the seam `_finish_turn`). The
+seam runs `_auto_resume_loop` and, if the turn is still timed out afterwards
+(AUTO_RESUME off, or resumes exhausted), sends the tap-to-continue notice and
+returns `None` -- the caller must stop. A call site that skips this seam
+cannot special-case timeout at all, because it never sees `timed_out`
+directly. Here the session id is persisted by the caller right after the seam
+returns a live response (DGN-1523 shape), not inside the seam.
 
 This file pins:
   1. the structural invariant (exactly one seam, no call site hand-rolls the
      `timed_out` check any more -- DGN-1554's own coming-back clause);
-  2. behavioral coverage for `_finish_turn` in isolation (success passthrough,
+  2. behavioral coverage for the seam in isolation (success passthrough,
      AUTO_RESUME off, resumes exhausted);
   3. end-to-end coverage that each of the three previously-broken call sites
      (`_exec_slash_command`, the `opt:` callback, `_handle_retry_callback`)
@@ -73,29 +76,31 @@ def _enclosing_funcs_with_timed_out_check(tree):
 
 
 def test_timed_out_is_only_checked_inside_the_seam():
-    """Only `_auto_resume_loop` (the loop condition) and `_finish_turn` (the
-    seam itself) may check `timed_out`. A sixth call site that hand-rolls its
-    own check instead of calling `_finish_turn` would show up here."""
+    """Only `_auto_resume_loop` (the loop condition) and
+    `_finish_turn_with_auto_resume` (the seam itself) may check `timed_out`. A
+    sixth call site that hand-rolls its own check instead of calling the seam
+    would show up here."""
     owners = set(_enclosing_funcs_with_timed_out_check(_bot_tree()))
-    assert owners == {"_auto_resume_loop", "_finish_turn"}, (
-        f"timed_out is checked outside the single seam: {owners - {'_auto_resume_loop', '_finish_turn'}}"
+    allowed = {"_auto_resume_loop", "_finish_turn_with_auto_resume"}
+    assert owners == allowed, (
+        f"timed_out is checked outside the single seam: {owners - allowed}"
     )
 
 
 def test_five_call_sites_route_through_the_seam():
     """Every SDK-turn call site (2 previously-working + 3 previously-broken)
-    calls `self._finish_turn(...)` exactly once each -- 5 total. This is the
-    DGN-665 TestCallSiteWiring count (5 request-response seats), reused here
-    to pin that each of those 5 now shares the timeout seam too."""
+    calls `self._finish_turn_with_auto_resume(...)` exactly once each -- 5
+    total. This is the DGN-665 TestCallSiteWiring count (5 request-response
+    seats), reused here to pin that each of those 5 now shares the timeout seam too."""
     tree = _bot_tree()
     calls = [
         node
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_finish_turn"
+        and node.func.attr == "_finish_turn_with_auto_resume"
     ]
-    assert len(calls) == 5, f"expected 5 _finish_turn call sites, got {len(calls)}"
+    assert len(calls) == 5, f"expected 5 seam call sites, got {len(calls)}"
 
 
 # ---------------------------------------------------------------------------
@@ -196,12 +201,12 @@ def _final_response(text="all done", session_id="final-sess"):
 
 
 # ---------------------------------------------------------------------------
-# 2. `_finish_turn` in isolation.
+# 2. The seam in isolation.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_finish_turn_success_passthrough_saves_session(monkeypatch):
+async def test_finish_turn_success_passthrough(monkeypatch):
     b = _make_bot()
     user_id = 1554
 
@@ -212,19 +217,21 @@ async def test_finish_turn_success_passthrough_saves_session(monkeypatch):
     monkeypatch.setattr(
         b, "_save_session_id", AsyncMock(side_effect=lambda uid, r: saved.append((uid, r)))
     )
+    # In this tree the CALLER persists the session id after the seam hands
+    # back a live response (DGN-1523 shape); the seam itself only settles.
 
     response = _final_response()
-    result = await b._finish_turn(
+    result = await b._finish_turn_with_auto_resume(
         user_id=user_id, chat_id=user_id, response=response, resume_caller=resume_caller
     )
     assert result is response
-    assert saved == [(user_id, response)]
+    assert saved == []
 
 
 @pytest.mark.asyncio
 async def test_finish_turn_auto_resume_off_sends_button_exactly_once(monkeypatch):
     """AUTO_RESUME off: _auto_resume_loop's while-condition short-circuits
-    immediately (never calls resume_caller), and _finish_turn falls straight
+    immediately (never calls resume_caller), and the seam falls straight
     to the button notice -- sent exactly once, no STILL_WORKING at all."""
     b = _make_bot()
     user_id = 1555
@@ -234,7 +241,7 @@ async def test_finish_turn_auto_resume_off_sends_button_exactly_once(monkeypatch
         raise AssertionError("resume must not be attempted while AUTO_RESUME is off")
 
     response = _timed_out_response()
-    result = await b._finish_turn(
+    result = await b._finish_turn_with_auto_resume(
         user_id=user_id, chat_id=user_id, response=response, resume_caller=resume_caller
     )
     assert result is None
@@ -262,7 +269,7 @@ async def test_finish_turn_resumes_exhausted_falls_through_to_button(monkeypatch
         return _timed_out_response()
 
     response = _timed_out_response()
-    result = await b._finish_turn(
+    result = await b._finish_turn_with_auto_resume(
         user_id=user_id, chat_id=user_id, response=response, resume_caller=resume_caller
     )
     assert result is None
@@ -277,7 +284,7 @@ async def test_finish_turn_resumes_exhausted_falls_through_to_button(monkeypatch
 @pytest.mark.asyncio
 async def test_finish_turn_resume_succeeds_no_button(monkeypatch):
     """AUTO_RESUME on, the first resume attempt returns a live response: no
-    button notice, `_finish_turn` hands back the resumed response."""
+    button notice, the seam hands back the resumed response."""
     b = _make_bot()
     user_id = 1557
     monkeypatch.setattr(bot_mod, "AUTO_RESUME", True)
@@ -287,7 +294,7 @@ async def test_finish_turn_resume_succeeds_no_button(monkeypatch):
         return _final_response(text="resumed!")
 
     response = _timed_out_response()
-    result = await b._finish_turn(
+    result = await b._finish_turn_with_auto_resume(
         user_id=user_id, chat_id=user_id, response=response, resume_caller=resume_caller
     )
     assert result is not None

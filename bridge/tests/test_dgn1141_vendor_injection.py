@@ -36,9 +36,15 @@ from bridge.i18n import en, ko
 VENDOR_TEXT = "# telegram.md -- vendor contract\n\n## Sample fidelity\n\n- rule\n"
 
 
-def _tmp_vendors(create_file=True, text=VENDOR_TEXT):
+def _temp_root(owner, prefix):
+    tmp = tempfile.TemporaryDirectory(prefix=prefix)
+    owner.addCleanup(tmp.cleanup)
+    return Path(tmp.name)
+
+
+def _tmp_vendors(owner, create_file=True, text=VENDOR_TEXT):
     """Fresh temp dir standing in for PROJECT_ROOT/vendors."""
-    d = Path(tempfile.mkdtemp(prefix="dgn1141-vendors-"))
+    d = _temp_root(owner, "dgn1141-vendors-")
     if create_file:
         (d / "telegram.md").write_text(text, encoding="utf-8")
     return d
@@ -104,7 +110,7 @@ class VendorSelectorTest(unittest.TestCase):
     """(b) fail-open without the layer, fail-closed for a declared vendor."""
 
     def test_no_vendors_dir_injects_nothing(self):
-        missing = Path(tempfile.mkdtemp(prefix="dgn1141-root-")) / "vendors"
+        missing = _temp_root(self, "dgn1141-root-") / "vendors"
         with patch.object(sdk_bridge, "_VENDOR_DIR", missing):
             self.assertEqual("", sdk_bridge._load_vendor_contract())
             with patch.object(sdk_bridge, "OUTPUT_LANG_GUARD", False):
@@ -113,7 +119,7 @@ class VendorSelectorTest(unittest.TestCase):
                 )
 
     def test_vendor_file_present_prepends_contract(self):
-        vendors = _tmp_vendors()
+        vendors = _tmp_vendors(self)
         with patch.object(sdk_bridge, "_VENDOR_DIR", vendors):
             with patch.object(sdk_bridge, "OUTPUT_LANG_GUARD", False):
                 prompt = sdk_bridge._compose_system_prompt()
@@ -125,7 +131,7 @@ class VendorSelectorTest(unittest.TestCase):
         )
 
     def test_vendor_file_missing_raises(self):
-        vendors = _tmp_vendors(create_file=False)
+        vendors = _tmp_vendors(self, create_file=False)
         with patch.object(sdk_bridge, "_VENDOR_DIR", vendors):
             with self.assertRaises(sdk_bridge.VendorContractMissing):
                 sdk_bridge._load_vendor_contract()
@@ -133,13 +139,13 @@ class VendorSelectorTest(unittest.TestCase):
                 sdk_bridge._compose_system_prompt()
 
     def test_vendor_file_empty_raises(self):
-        vendors = _tmp_vendors(text="   \n\n")
+        vendors = _tmp_vendors(self, text="   \n\n")
         with patch.object(sdk_bridge, "_VENDOR_DIR", vendors):
             with self.assertRaises(sdk_bridge.VendorContractMissing):
                 sdk_bridge._load_vendor_contract()
 
     def test_info_line_logged_on_load(self):
-        vendors = _tmp_vendors()
+        vendors = _tmp_vendors(self)
         with patch.object(sdk_bridge, "_VENDOR_DIR", vendors):
             with self.assertLogs("bridge.sdk_bridge", level="INFO") as cm:
                 sdk_bridge._load_vendor_contract()
@@ -152,7 +158,7 @@ class VendorSelectorTest(unittest.TestCase):
         # A vendor doc restating a machine-fragment section trips the
         # compose-time duplicate lint (log-warn, never a failure).
         colliding = "# v\n\n## Sending Images and Files\n\n- dup rule\n"
-        vendors = _tmp_vendors(text=colliding)
+        vendors = _tmp_vendors(self, text=colliding)
         with patch.object(sdk_bridge, "_VENDOR_DIR", vendors):
             with self.assertLogs("bridge.sdk_bridge", level="WARNING") as cm:
                 sdk_bridge._compose_system_prompt()
@@ -163,7 +169,7 @@ class VendorSelectorTest(unittest.TestCase):
         self.assertIn("Sending Images and Files", joined)
 
     def test_disjoint_headings_do_not_warn(self):
-        vendors = _tmp_vendors()
+        vendors = _tmp_vendors(self)
         with patch.object(sdk_bridge, "_VENDOR_DIR", vendors):
             with self.assertNoLogs("bridge.sdk_bridge", level="WARNING"):
                 sdk_bridge._compose_system_prompt()
@@ -188,7 +194,7 @@ class BootDieSubprocessTest(unittest.TestCase):
         )
 
     def _fresh_root(self):
-        root = Path(tempfile.mkdtemp(prefix="dgn1141-boot-"))
+        root = _temp_root(self, "dgn1141-boot-")
         (root / ".telegram_bot").mkdir()
         return root
 

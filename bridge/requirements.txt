@@ -7,8 +7,9 @@ claude-agent-sdk>=0.1.72
 pydantic>=2
 pydantic-settings>=2
 python-dotenv
-# --- optional: voice input (heavy; installed only when voice is enabled) ---
+# Voice is a required bridge capability, including core-only installs.
 faster-whisper
+# --- optional: development/test extras ---
 # --- dev/test only (never installed by mint.sh --core-only) ---
 # pytest-asyncio: async tests (turn_death, DGN-616 coalescing) use
 # @pytest.mark.asyncio and fail to run without the plugin.

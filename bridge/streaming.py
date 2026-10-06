@@ -274,6 +274,11 @@ class StreamingMessageHandler:
         self._segment_start: Optional[int] = 0
         self._segment_terminal = False
         self._terminal_span: Optional[Tuple[int, int]] = None
+        # DGN-1703: where the current model STEP's text starts (a step ends at
+        # every main-thread user message: tool result or Stop-hook re-prompt).
+        # The live stream carries no terminal flag, so the step is the unit a
+        # Stop block supersedes. Same invalidation rules as the offsets above.
+        self._step_start: Optional[int] = 0
 
     async def _retry_with_backoff(self, operation, max_retries: int = 3):
         for attempt in range(max_retries):
@@ -461,6 +466,7 @@ class StreamingMessageHandler:
         """
         self._segment_start = None
         self._terminal_span = None
+        self._step_start = None
 
     def _track_segment(self) -> None:
         """DGN-1651: keep the live TERMINAL segment's span in sync.
@@ -496,9 +502,13 @@ class StreamingMessageHandler:
         (inline narration) sits outside the span and survives.
 
         Returns True when a span was actually retracted.
+
+        DGN-1703: retract no longer requires `terminal` -- the live stream
+        marks nothing terminal, and the span may come from supersede_step().
+        The caller only passes retract=True for a message carrying text.
         """
         retracted = False
-        if terminal and retract and self._terminal_span is not None:
+        if retract and self._terminal_span is not None:
             start, end = self._terminal_span
             if 0 <= start <= end <= len(self.accumulated_text):
                 head = self.accumulated_text[:start]
@@ -515,10 +525,39 @@ class StreamingMessageHandler:
                     # than what is on screen, which never meets min_chars).
                     self.drafts[-1].last_update_time = 0.0
                 retracted = True
+                if self._step_start is not None:
+                    self._step_start = len(self.accumulated_text)
             self._terminal_span = None
         self._segment_start = len(self.accumulated_text)
         self._segment_terminal = terminal
         return retracted
+
+    def begin_step(self) -> None:
+        """DGN-1703: a main-thread user message closed the model step; the
+        next step's text starts at the current end of the live surface."""
+        if self._step_start is not None:
+            self._step_start = len(self.accumulated_text)
+
+    def supersede_step(self) -> bool:
+        """DGN-1703: a Stop hook blocked the turn; the step that just ended
+        was a finished answer the regeneration will replace.
+
+        Records that step's text as the retractable span (begin_message with
+        retract=True cuts it once replacement text arrives, so a regeneration
+        with no text leaves the answer standing). An existing terminal span
+        (DGN-1651, stop_reason-bearing streams) is kept as is. Returns True
+        when a span is armed.
+        """
+        if self._terminal_span is not None:
+            return True
+        start = self._step_start
+        end = len(self.accumulated_text)
+        if start is None or not (0 <= start < end):
+            return False
+        if not self.accumulated_text[start:end].strip():
+            return False
+        self._terminal_span = (start, end)
+        return True
 
     async def update_if_needed(self, new_chunk: str) -> bool:
         if self._finalized:
@@ -644,6 +683,7 @@ class StreamingMessageHandler:
         # earlier terminal span is retractable.
         self._segment_start = 0
         self._terminal_span = None
+        self._step_start = 0
 
     async def finalize_all(self) -> bool:
         if self._finalized:

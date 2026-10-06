@@ -28,7 +28,8 @@ Locked list history:
     rewrite to consult, not as a currently-true count.
 
 Asserts that:
-  1. COMMAND_MENU_SPEC contains exactly the 10 locked commands in the right order.
+  1. COMMAND_MENU_SPEC matches the explicit ordered list (11 canonical,
+     10 public after stripping the DGN-1417 estate-only /update entry).
   2. _set_bot_commands builds its BotCommand list from COMMAND_MENU_SPEC (same order).
   3. The generated /help body lists the same commands in the same order.
   4. Hidden commands (start, claim, usageretry) are NOT in COMMAND_MENU_SPEC.
@@ -38,25 +39,34 @@ Asserts that:
 """
 
 import asyncio
+import re
+import sys
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from bridge.bot import COMMAND_MENU_SPEC, TelegramBot
 from bridge import messages
 from bridge.i18n import en, ko
 
+REPO_ROOT = Path(__file__).resolve().parents[4]
+# The region lint lives in the canonical repo's tests/, outside the bridge
+# tree: the OSS artifact and the extract gate-3 harness do not ship it, so the
+# OSS-stripped-order check runs only where it exists (DGN-1779).
+_REGION_LINT = REPO_ROOT / "tests" / "dgn818_ownership_lint.py"
+
 
 # ---------------------------------------------------------------------------
-# Locked spec: the authoritative ordered list (DGN-919 owner lock 2026-08-17,
-# amended by DGN-986 D1 owner directive 2026-08-21: + health before help).
+# Locked spec: the authoritative ordered list (DGN-1771 owner reorder
+# 2026-09-28: new/stop/usage/update/model first, rest keep relative order).
 # ---------------------------------------------------------------------------
 EXPECTED_SPEC = [
     "new",
     "stop",
-    "btw",
     "usage",
-    "queue",
     "model",
+    "btw",
+    "queue",
     "skills",
     "resume",
     "restart",
@@ -64,6 +74,11 @@ EXPECTED_SPEC = [
     # carried here until the rewrite re-adds it; see module docstring.
     "help",
 ]
+
+# The OSS mirror strips the DGN-1417 estate region, so /update never
+# ships there (DGN-1771 note: strip must still yield new, stop, usage, model,
+# btw, queue, skills, resume, restart, help).
+EXPECTED_SPEC_OSS_STRIPPED = [c for c in EXPECTED_SPEC if c != "update"]
 
 # authsync retired from the menu by DGN-1050 (still registered off-menu, see
 # test_dgn759_authsync_command.py's test_authsync_not_in_command_menu_spec).
@@ -74,11 +89,10 @@ FORBIDDEN_COMMANDS = {"kill"}
 class TestCommandMenuSpec(unittest.TestCase):
     """COMMAND_MENU_SPEC structure and content."""
 
-    def test_spec_has_exactly_ten_entries(self):
-        # DGN-986 D1 had raised this to 11 (+ /health); DGN-1435 (2026-09-12)
-        # pulled /health back off the surface, so canonical and public build
-        # now agree at 10 again -- see module docstring.
-        self.assertEqual(len(COMMAND_MENU_SPEC), 10)
+    def test_spec_has_exactly_expected_entries(self):
+        # The expected list is independent of the production spec and shares
+        # its extraction boundary, so both builds retain an exact count.
+        self.assertEqual(len(COMMAND_MENU_SPEC), len(EXPECTED_SPEC))
 
     def test_spec_order_matches_locked_list(self):
         names = [cmd for cmd, _ in COMMAND_MENU_SPEC]
@@ -135,11 +149,9 @@ class TestBotCommandMenuOrder(unittest.TestCase):
                          f"  menu: {menu_names}\n"
                          f"  spec: {spec_names}")
 
-    def test_menu_has_exactly_ten_entries(self):
+    def test_menu_has_exactly_expected_entries(self):
         commands = self._run_set_bot_commands()
-        # DGN-1435 (2026-09-12): /health pulled off the surface -- see
-        # module docstring and test_spec_has_exactly_ten_entries.
-        self.assertEqual(len(commands), 10)
+        self.assertEqual(len(commands), len(EXPECTED_SPEC))
 
     def test_menu_descriptions_match_spec(self):
         commands = self._run_set_bot_commands()
@@ -250,6 +262,29 @@ class TestI18nKeyParity(unittest.TestCase):
                              f"ko.STRINGS should not have {key!r} (hidden command)")
             self.assertNotIn(key, en.STRINGS,
                              f"en.STRINGS should not have {key!r} (hidden command)")
+
+
+@unittest.skipUnless(_REGION_LINT.exists(), "region lint not shipped here")
+class TestOssStrippedOrder(unittest.TestCase):
+    """The OSS mirror (ESTATE regions stripped) keeps the DGN-1771 order."""
+
+    def test_stripped_command_menu_spec_order(self):
+        sys.path.insert(0, str(_REGION_LINT.parent))
+        from dgn818_ownership_lint import parse_regions, strip_regions
+        bot_py = REPO_ROOT / "agents" / ".template" / "bridge" / "bot.py"
+        lines = bot_py.read_text(encoding="utf-8").split("\n")
+        regions, violations = parse_regions("bridge/bot.py", lines,
+                                             comment_only=None, tokenized=False)
+        self.assertFalse(violations, f"ESTATE region violations: {violations}")
+        stripped_lines = strip_regions(lines, regions)
+        stripped_src = "\n".join(stripped_lines)
+        m = re.search(r"COMMAND_MENU_SPEC = \[(.*?)\n\]", stripped_src, re.DOTALL)
+        self.assertIsNotNone(m, "COMMAND_MENU_SPEC not found in stripped source")
+        names = re.findall(r'\("(\w+)",', m.group(1))
+        self.assertEqual(names, EXPECTED_SPEC_OSS_STRIPPED,
+                         f"OSS-stripped COMMAND_MENU_SPEC order mismatch.\n"
+                         f"  got:      {names}\n"
+                         f"  expected: {EXPECTED_SPEC_OSS_STRIPPED}")
 
 
 if __name__ == "__main__":

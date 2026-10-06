@@ -29,7 +29,7 @@ from claude_agent_sdk import (
 )
 
 from bridge import messages
-from bridge.config import CLAUDE_CLI_PATH, CLAUDE_MAX_BUFFER_SIZE, PROCESS_TIMEOUT
+from bridge.config import CLAUDE_MAX_BUFFER_SIZE, PROCESS_TIMEOUT, resolve_claude_cli
 from bridge.sdk_bridge import PROJECT_ROOT as _PROJECT_ROOT
 from bridge.sdk_bridge import (
     ALLOWED_TOOLS,
@@ -227,8 +227,9 @@ class BtwForkManager:
             "fork_session": True,
             "resume": session_id,
         }
-        if CLAUDE_CLI_PATH:
-            opts["cli_path"] = CLAUDE_CLI_PATH
+        cli_path = resolve_claude_cli()  # DGN-1814: same CLI as the main session
+        if cli_path:
+            opts["cli_path"] = cli_path
         return ClaudeSDKClient(options=ClaudeAgentOptions(**opts))
 
     async def run_fork_turn(

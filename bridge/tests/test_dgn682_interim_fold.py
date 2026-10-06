@@ -457,8 +457,13 @@ class TestFoldReaderLoop(_ReaderHarness):
 
     def test_d7_reader_loop_single_chunk_near_limit(self):
         big_final = "F" * 3700
+        # DGN-1838: 2000 chars of narration as 20 short progress lines (one
+        # 2000-char block would be promoted out of the fold as an answer).
         msgs = [
-            _make_assistant_msg("tool_use", [_make_text_block("n" * 2000)]),
+            *(
+                _make_assistant_msg("tool_use", [_make_text_block("n" * 100)])
+                for _ in range(20)
+            ),
             _make_assistant_msg("end_turn", [_make_text_block(big_final)]),
             _make_result_msg(result=big_final),
         ]

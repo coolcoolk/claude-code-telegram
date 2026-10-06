@@ -8,7 +8,6 @@ from user-facing text.
 """
 
 import re
-import shutil
 import subprocess
 import unicodedata
 from typing import List, Optional, Tuple
@@ -466,6 +465,78 @@ def strip_consumed_options(
     return display, options
 
 
+def _norm_ws(s: str) -> str:
+    return re.sub(r"\s+", " ", s or "").strip()
+
+
+def keyboard_labels(text: str) -> List[str]:
+    """Labels of the keyboard an AUTHORED [[OPTIONS]] marker would build.
+
+    Same source priority as the seat (_send_smart -> strip_consumed_options):
+    marker-declared labels first, then the last numbered run. [] when the
+    text carries no marker or the marker yields no labels.
+    """
+    if not has_options_marker(text):
+        return []
+    labels = extract_marker_labels(text) or extract_options(
+        strip_options_marker(text)[0]
+    )
+    return [_norm_ws(label) for label in labels if _norm_ws(label)]
+
+
+def _drop_keyboard(text: str) -> str:
+    """The text with its marker lines and verbatim label block removed."""
+    clean, _ = strip_options_marker(text)
+    labels = extract_marker_labels(text) or extract_options(clean)
+    if labels:
+        clean = _strip_verbatim_label_block(clean, labels)
+    return clean.strip()
+
+
+def subtract_delivered(content: str, delivered: Optional[str]) -> str:
+    """DGN-1732: drop from a turn's final text what the turn already delivered.
+
+    The dispatch-return result-first push (DGN-1687/1715) puts the turn's
+    first text on the owner's screen before the turn ends; the finalize then
+    must not send it again. Same lossless rule as the DGN-947 fold drop:
+    only paragraphs that EXACTLY reproduce a delivered paragraph
+    (whitespace-normalized, full-paragraph match, containment forbidden) are
+    removed; every new paragraph survives in order.
+
+    Keyboards: a final keyboard whose labels equal the delivered keyboard's
+    labels is the same menu the owner can already tap -- its marker and label
+    block are removed, so one turn never builds the same keyboard twice. A
+    keyboard with different labels is new content and is kept intact.
+
+    Returns "" when nothing new remains. ``delivered`` None/empty -> content
+    unchanged (a plain turn). Never raises (content unchanged on error).
+    """
+    try:
+        if not content or not delivered or not delivered.strip():
+            return content
+        delivered_labels = keyboard_labels(delivered)
+        same_keyboard = bool(delivered_labels) and (
+            keyboard_labels(content) == delivered_labels
+        )
+        body = _drop_keyboard(content) if same_keyboard else content
+        seen = {
+            _norm_ws(p)
+            for src in (
+                (delivered, _drop_keyboard(delivered))
+                if delivered_labels else (delivered,)
+            )
+            for p in re.split(r"\n\s*\n", src)
+            if _norm_ws(p)
+        }
+        kept = [
+            p for p in re.split(r"\n\s*\n", body)
+            if _norm_ws(p) and _norm_ws(p) not in seen
+        ]
+        return "\n\n".join(p.strip("\n") for p in kept).strip()
+    except Exception:
+        return content
+
+
 def resolve_choice(data: str, inline_keyboard: Optional[list]) -> str:
     """Resolve the full option label from the tapped button's own text (DGN-665).
 
@@ -581,9 +652,11 @@ def _shorten_button_label(label: str) -> str:
 # Applied before display-width trimming so markdown syntax never counts toward
 # the width budget or leaks into the Telegram button surface.
 _LABEL_MD_BOLD_STAR = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
-_LABEL_MD_BOLD_UNDER = re.compile(r"__(.+?)__", re.DOTALL)
+# Underscore emphasis only at word boundaries (CommonMark: intraword "_" is
+# literal) -- ALLOW_OUTSIDE_ONCE / my_file must keep their underscores.
+_LABEL_MD_BOLD_UNDER = re.compile(r"(?<![0-9A-Za-z])__(.+?)__(?![0-9A-Za-z])", re.DOTALL)
 _LABEL_MD_ITALIC_STAR = re.compile(r"\*(.+?)\*", re.DOTALL)
-_LABEL_MD_ITALIC_UNDER = re.compile(r"_(.+?)_", re.DOTALL)
+_LABEL_MD_ITALIC_UNDER = re.compile(r"(?<![0-9A-Za-z])_(.+?)_(?![0-9A-Za-z])", re.DOTALL)
 _LABEL_MD_CODE = re.compile(r"`(.+?)`", re.DOTALL)
 _LABEL_MD_HEADER = re.compile(r"^#{1,6}\s+")
 
@@ -608,8 +681,34 @@ def strip_markdown_label(text: str) -> str:
     return text
 
 
-def build_option_keyboard(options: List[str]) -> Optional[InlineKeyboardMarkup]:
-    """Build inline buttons; callback 'opt:{i}. {label}' with 'opt:{i}' fallback.
+def body_lists_options(body: str, options: List[str]) -> bool:
+    """True when `body` shows a numbered 1..N run the buttons can point at (DGN-1813).
+
+    The "N. " button prefix only helps when the visible body refers to the
+    options by number. Judged on the body as SENT (after the DGN-665 strip):
+    the last contiguous 1..N run outside code fences must have exactly as
+    many lines as there are options. An unrelated list of another length
+    (steps, a status run) does not count -- numbering the buttons against it
+    would point at the wrong lines. A lone button is never numbered.
+    """
+    if not body or len(options or []) < 2:
+        return False
+    run = _last_option_run(_option_line_entries(body))
+    return len(run) == len(options)
+
+
+def build_option_keyboard(
+    options: List[str], numbered: Optional[bool] = None
+) -> Optional[InlineKeyboardMarkup]:
+    """Build inline buttons; callback 'opt:{text}' with 'opt:{i}' fallback.
+
+    DGN-1813: `numbered` decides the "N. " prefix. None (direct callers
+    without a body) means "number only when there is more than one button"
+    -- a lone button never shows "1. ". The reply paths pass the explicit
+    answer from body_lists_options: the number is shown only when the body
+    carries the matching numbered list. Unnumbered buttons show the bare
+    label and never degrade to a number handle (a handle points at a body
+    line that does not exist); the full label rides the button.
 
     DGN-1092: the degrade decision is bundle-level, not per-button. A first
     pass checks _overflows_to_handle across every reconstructed "{i}. {label}"
@@ -625,12 +724,21 @@ def build_option_keyboard(options: List[str]) -> Optional[InlineKeyboardMarkup]:
     """
     if not options:
         return None
-    labels = [f"{i}. {strip_markdown_label(opt)}" for i, opt in enumerate(options, 1)]
-    degrade_all = any(_overflows_to_handle(label) for label in labels)
+    if numbered is None:
+        numbered = len(options) > 1
+    plain = [strip_markdown_label(opt) for opt in options]
+    if numbered:
+        labels = [f"{i}. {label}" for i, label in enumerate(plain, 1)]
+        degrade_all = any(_overflows_to_handle(label) for label in labels)
+    else:
+        labels = plain
+        degrade_all = False
     buttons = []
     for i, label in enumerate(labels, 1):
         cb_data = f"opt:{label}"
-        if len(cb_data.encode("utf-8")) > 64:
+        # DGN-1813: an unnumbered digit-only label ("2") would collide with
+        # another button's index fallback "opt:2" -- give it its own index.
+        if len(cb_data.encode("utf-8")) > 64 or label.strip().isdigit():
             cb_data = f"opt:{i}"
         button_text = _number_handle_label(i) if degrade_all else label
         buttons.append([InlineKeyboardButton(button_text, callback_data=cb_data)])
@@ -654,7 +762,12 @@ def classify_is_choice(prev: str, asst: str, cli_path: Optional[str] = None) -> 
         if not asst_clean:
             return False
         prompt = _PROMPT_V3.format(prev=prev_clean, asst=asst_clean)
-        claude_bin = cli_path or shutil.which("claude")
+        if not cli_path:
+            # DGN-1814: the shared resolver (lazy: config needs PROJECT_ROOT).
+            from bridge.config import resolve_claude_cli
+
+            cli_path = resolve_claude_cli()
+        claude_bin = cli_path
         if not claude_bin:
             return False
         proc = subprocess.run(

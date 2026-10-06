@@ -18,6 +18,7 @@ from bridge.machine_gate import (  # noqa: E402
     MACHINE_SIGNAL_MARKER,
     RAIL_UNKNOWN,
     apply_machine_line_gate,
+    strip_no_push_sentinel,
 )
 
 logger = logging.getLogger(__name__)
@@ -500,6 +501,8 @@ def strip_display_markers(text: str) -> str:
     if not text:
         return text
     text = strip_toolcall_markup(text)
+    # DGN-1732: live drafts / streamed-edit bubbles never show NO_PUSH either.
+    text, _ = strip_no_push_sentinel(text)
     lines = text.split("\n")
     kept = [
         ln
@@ -1775,6 +1778,127 @@ def _fold_quote_lines(text: str) -> str:
         else:
             out.append("> " + ln)
     return "\n".join(out)
+
+
+# --- DGN-1838: substantive interim answer promotion --------------------------
+#
+# The live SDK stream marks no AssistantMessage terminal (stop_reason=None,
+# see sdk_bridge STOP_HOOK_FEEDBACK_PREFIX), so in fold mode EVERY text block
+# is captured as interim and only the turn's LAST message becomes the final
+# body. An owner-facing answer written before more tool calls (or before a
+# Stop-hook continuation) was therefore collapsed into the progress quote
+# while the final bubble carried only a short status (measured 2026-10-03
+# 09:32 KST: a 9-step answer folded, a 403-char supplement delivered).
+#
+# The fold keeps short progress lines. A block that is a substantive answer
+# is promoted out of it and delivered as its own normal message, ahead of the
+# final answer. Thresholds measured on 3,659 interim blocks from a dev agent (5,339
+# turns): median 50 chars, p90 163; plain single-paragraph blocks of 200+
+# chars are still worker narration, while 200+ char blocks carrying a list,
+# a heading, a code fence or 3+ paragraphs are owner-facing answers. Any
+# block of PROMOTE_LONG_CHARS+ is promoted regardless of shape.
+PROMOTE_MIN_CHARS = 200
+PROMOTE_LONG_CHARS = 600
+# A block counts as restated when this share of its (normalized) text
+# reappears in the reference -- line containment or a near-identical line.
+PROMOTE_RESTATED_SHARE = 0.6
+_PROMOTE_LINE_SIMILAR = 0.8
+
+_PROMOTE_LIST_RE = re.compile(r"^[ \t]*(?:[-*•]|\d{1,2}[.)])[ \t]+\S", re.M)
+_PROMOTE_HEADING_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+\S|[^\w\s*]{0,3}[ \t]*\*\*[^*\n]{2,80}\*\*[ \t]*[:：]?[ \t]*$)",
+    re.M,
+)
+_PROMOTE_MARKUP_RE = re.compile(r"[*_`]+")
+_PROMOTE_LEAD_RE = re.compile(r"^(?:>+!?|#{1,6}|[-*•]|\d{1,2}[.)])\s*")
+
+
+def is_substantive_interim(text: str) -> bool:
+    """DGN-1838: True when an interim block reads as an owner-facing answer."""
+    t = (text or "").strip()
+    n = len(t)
+    if n >= PROMOTE_LONG_CHARS:
+        return True
+    if n < PROMOTE_MIN_CHARS:
+        return False
+    if len(_PROMOTE_LIST_RE.findall(t)) >= 2 or _PROMOTE_HEADING_RE.search(t):
+        return True
+    if "```" in t:
+        return True
+    return len([p for p in re.split(r"\n\s*\n", t) if p.strip()]) >= 3
+
+
+def _promote_norm_lines(text: str) -> List[str]:
+    out: List[str] = []
+    for ln in (text or "").split("\n"):
+        s = _PROMOTE_LEAD_RE.sub("", ln.strip())
+        s = re.sub(r"\s+", " ", _PROMOTE_MARKUP_RE.sub("", s)).strip().lower()
+        if len(s) >= 2:
+            out.append(s)
+    return out
+
+
+def interim_restated(text: str, reference: str) -> bool:
+    """DGN-1838: does `reference` restate `text`? (content similarity)
+
+    Char-weighted share of text's normalized lines that reappear in the
+    reference, either contained in it or as a near-identical line. Markdown
+    emphasis, list/quote/heading leads and whitespace are ignored, so a
+    re-formatted restatement still counts. Only ever decides whether a block
+    is PROMOTED -- it never removes anything from the final answer.
+    """
+    import difflib
+
+    lines = _promote_norm_lines(text)
+    ref_lines = _promote_norm_lines(reference)
+    if not lines or not ref_lines:
+        return False
+    blob = "\n".join(ref_lines)
+    total = sum(len(ln) for ln in lines)
+    covered = 0
+    for ln in lines:
+        if (len(ln) >= 8 and ln in blob) or ln in ref_lines:
+            covered += len(ln)
+            continue
+        for r in ref_lines:
+            sm = difflib.SequenceMatcher(None, ln, r)
+            if (
+                sm.real_quick_ratio() >= _PROMOTE_LINE_SIMILAR
+                and sm.quick_ratio() >= _PROMOTE_LINE_SIMILAR
+                and sm.ratio() >= _PROMOTE_LINE_SIMILAR
+            ):
+                covered += len(ln)
+                break
+    return covered >= PROMOTE_RESTATED_SHARE * total
+
+
+def split_promoted_interim(
+    blocks: List[str], final_text: str
+) -> Tuple[List[str], List[str]]:
+    """DGN-1838: split captured interim blocks into (promoted, kept_in_fold).
+
+    Promoted: substantive (is_substantive_interim) and NOT restated by the
+    final answer -- a restated block stays in the fold, so the owner reads it
+    once and the final answer is never edited. When a later promoted block
+    restates an earlier one (the agent re-wrote its answer mid-turn), only the
+    later one is promoted; the earlier version stays in the progress record.
+    Both lists keep turn order. Never raises (nothing promoted on error).
+    """
+    try:
+        blocks = list(blocks or [])
+        cand = [
+            i for i, b in enumerate(blocks)
+            if is_substantive_interim(b) and not interim_restated(b, final_text or "")
+        ]
+        chosen = {
+            i for k, i in enumerate(cand)
+            if not any(interim_restated(blocks[i], blocks[j]) for j in cand[k + 1:])
+        }
+        promoted = [b for i, b in enumerate(blocks) if i in chosen]
+        kept = [b for i, b in enumerate(blocks) if i not in chosen]
+        return promoted, kept
+    except Exception:
+        return [], list(blocks or [])
 
 
 # --- DGN-699: growing fold (2-phase live render) -----------------------------
