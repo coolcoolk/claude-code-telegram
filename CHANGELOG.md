@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [2.1.1] - 2026-10-07
+
+### Log in again from the chat
+- `/login` signs Claude back in without a terminal: the bot sends a login link,
+  you sign in and paste the code it shows back into the chat. It works in a
+  private chat only, and it is in the command menu.
+- If the login cannot finish from the chat, the bot says so and shows how to log
+  in from Terminal instead.
+
+### This repository is generated
+- Every file here is produced by the release step. A check (in CI, and as an
+  optional `pre-push` hook: `git config core.hooksPath .githooks`) fails any
+  commit that edits the tree directly. Changes are made at the source and arrive
+  with the next release.
+
 ## [2.1.0] - 2026-10-06
 
 Minor release: everything the bridge gained since 2.0.2, generated from the

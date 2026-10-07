@@ -1,0 +1,10 @@
+# This repository is generated; a commit that edits it directly fails here.
+# See .githooks/check-generated.py.
+name: generated-only
+on: [push, pull_request]
+jobs:
+  check-generated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 .githooks/check-generated.py --rev HEAD

@@ -198,6 +198,11 @@ _file_state_desc() {
 # itself cannot serve a token is diagnosed -- and even then, an expired
 # Keychain access token is routinely self-healing as long as the refresh
 # token behind it is still valid.
+#
+# all of this (credential read + the one API call) lives in
+# _live_fetch so it runs ONLY when the machine-wide snapshot below decides a
+# refresh is due -- a snapshot hit never touches the credential stores.
+_live_fetch() {
 _creds_file="${HOME}/.claude/.credentials.json"
 _file_rc=0
 _live_calm=0
@@ -284,6 +289,160 @@ if [[ -z "$_live_err" ]]; then
     fi
   fi
 fi
+}
+
+# ============================================================
+# SECTION 1b: MACHINE-WIDE USAGE SNAPSHOT
+# ============================================================
+# Every reader on this machine (each workspace's usage-gate.py / usage-gate.sh,
+# the bridge's /usage and retry preflight, external pollers) comes through
+# this script, so the snapshot lives HERE: one file under ~/.dogany (one
+# Claude account per macOS user), refreshed by a single lock holder at most
+# once per TTL. Before this, each workspace cached on its own and this script
+# had no cache at all, so N agents + pollers hit the endpoint in parallel and
+# drew HTTP 429 -- which then deferred every dispatch.
+#   fresh (age <= TTL)        -> served, no credential read, no API call
+#   due + lock won            -> one live call; 200 rewrites the snapshot
+#   due + lock held elsewhere -> recent snapshot served, else wait for holder
+#   429                       -> machine-wide back-off; no caller hits the API
+#                                until it ends
+#   any live failure          -> the last snapshot is served WITH its age while
+#                                it is within STALE_MAX; older -> failure as
+#                                before (fail-closed callers keep their rule)
+# STALE_MAX defaults to usage-gate.sh's existing cache-fallback cap (900s,
+# DGN-1706) and TTL to usage-gate.py's existing CACHE_TTL_SEC (300s): no new
+# policy numbers, only one place that applies them.
+SNAP_DIR="${DOGANY_USAGE_SNAPSHOT_DIR:-$HOME/.dogany/usage}"
+SNAP_FILE="$SNAP_DIR/snapshot.json"
+SNAP_BACKOFF_FILE="$SNAP_DIR/backoff-until"
+SNAP_LOCK="$SNAP_DIR/refresh.lock"
+SNAP_TTL_SEC="${DOGANY_USAGE_SNAPSHOT_TTL_SEC:-300}"
+SNAP_STALE_MAX_SEC="${DOGANY_USAGE_SNAPSHOT_STALE_MAX_SEC:-900}"
+SNAP_BACKOFF_SEC="${DOGANY_USAGE_BACKOFF_SEC:-300}"
+SNAP_LOCK_WAIT_SEC=11   # holder's curl is capped at 10s
+SNAP_LOCK_STALE_SEC=30  # a lock older than this is a dead holder's
+
+_snap_source=""   # live | cache | stale (empty = nothing to serve)
+_snap_age=""
+_snap_lock_held=0
+
+_snap_mtime() {
+  python3 -c 'import os,sys; print(int(os.path.getmtime(sys.argv[1])))' "$1" 2>/dev/null
+}
+
+# _snap_age_now -> prints the snapshot age in seconds; nonzero if absent/empty
+_snap_age_now() {
+  [[ -s "$SNAP_FILE" ]] || return 1
+  local _m
+  _m=$(_snap_mtime "$SNAP_FILE") || return 1
+  echo $(( $(date +%s) - _m ))
+}
+
+_snap_in_backoff() {
+  [[ -f "$SNAP_BACKOFF_FILE" ]] || return 1
+  local _until
+  _until=$(tr -cd '0-9' < "$SNAP_BACKOFF_FILE" 2>/dev/null)
+  [[ -n "$_until" ]] && (( $(date +%s) < _until ))
+}
+
+# _snap_serve <source> <max_age> -> loads the snapshot into _resp_body when its
+# age is within max_age; nonzero otherwise.
+_snap_serve() {
+  local _a
+  _a=$(_snap_age_now) || return 1
+  (( _a <= $2 )) || return 1
+  _resp_body=$(cat "$SNAP_FILE" 2>/dev/null) || return 1
+  [[ -n "$_resp_body" ]] || return 1
+  _snap_source="$1"
+  _snap_age="$_a"
+}
+
+_snap_lock_take() {
+  mkdir -p "$SNAP_DIR" 2>/dev/null || return 1
+  if mkdir "$SNAP_LOCK" 2>/dev/null; then
+    _snap_lock_held=1
+    return 0
+  fi
+  local _m
+  _m=$(_snap_mtime "$SNAP_LOCK") || return 1
+  if (( $(date +%s) - _m > SNAP_LOCK_STALE_SEC )); then
+    rmdir "$SNAP_LOCK" 2>/dev/null
+    if mkdir "$SNAP_LOCK" 2>/dev/null; then
+      _snap_lock_held=1
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_snap_lock_release() {
+  if [[ "$_snap_lock_held" == "1" ]]; then
+    rmdir "$SNAP_LOCK" 2>/dev/null || true
+    _snap_lock_held=0
+  fi
+}
+trap '_snap_lock_release' EXIT
+
+# _snap_write -> atomically replaces the snapshot with a 200 body that parses
+# as a JSON object (garbage is never cached).
+_snap_write() {
+  local _tmp
+  _tmp=$(mktemp "$SNAP_DIR/.snapshot.XXXXXX" 2>/dev/null) || return 1
+  if printf '%s' "$_resp_body" > "$_tmp" \
+      && python3 -c 'import json,sys; assert isinstance(json.load(open(sys.argv[1])), dict)' "$_tmp" 2>/dev/null \
+      && mv -f "$_tmp" "$SNAP_FILE"; then
+    rm -f "$SNAP_BACKOFF_FILE"
+    return 0
+  fi
+  rm -f "$_tmp"
+  return 1
+}
+
+_resp_body=""
+_live_err=""
+_live_calm=0
+if _snap_serve cache "$SNAP_TTL_SEC"; then
+  :  # fresh machine-wide snapshot
+elif _snap_in_backoff; then
+  _live_err="API returned HTTP 429 (backing off until $(date -r "$(tr -cd '0-9' < "$SNAP_BACKOFF_FILE")" '+%H:%M' 2>/dev/null || date -d "@$(tr -cd '0-9' < "$SNAP_BACKOFF_FILE")" '+%H:%M' 2>/dev/null || echo '?'))"
+  _snap_serve stale "$SNAP_STALE_MAX_SEC" || true
+elif _snap_lock_take; then
+  # re-check under the lock: the previous holder may have just refreshed
+  if ! _snap_serve cache "$SNAP_TTL_SEC"; then
+    _live_fetch
+    if [[ -z "$_live_err" ]]; then
+      _snap_source="live"
+      _snap_age=0
+      _snap_write || true
+    else
+      if [[ "${_resp_code:-}" == "429" ]]; then
+        printf '%s\n' "$(( $(date +%s) + SNAP_BACKOFF_SEC ))" > "$SNAP_BACKOFF_FILE" 2>/dev/null || true
+      fi
+      _snap_serve stale "$SNAP_STALE_MAX_SEC" || true
+    fi
+  fi
+  _snap_lock_release
+else
+  # another process is refreshing right now
+  if ! _snap_serve stale "$SNAP_STALE_MAX_SEC"; then
+    _waited=0
+    while [[ -d "$SNAP_LOCK" ]] && (( _waited < SNAP_LOCK_WAIT_SEC * 5 )); do
+      sleep 0.2
+      _waited=$(( _waited + 1 ))
+    done
+    _snap_serve cache "$SNAP_TTL_SEC" \
+      || _live_err="usage refresh in progress elsewhere (timed out waiting)"
+  fi
+fi
+_access_token=""  # clear from memory as soon as the fetch is over
+_tok_cfg=""
+# A served snapshot answers the lookup; a live-failure cause stays in
+# _snap_err so the report can still say why it is not fresh.
+_snap_err=""
+if [[ -n "$_snap_source" ]]; then
+  _snap_err="$_live_err"
+  _live_err=""
+fi
 
 # --json: emit the raw usage JSON for machine consumers and stop (DGN-546).
 if [[ "$JSON_OUT" == "1" ]]; then
@@ -293,7 +452,24 @@ if [[ "$JSON_OUT" == "1" ]]; then
     echo "[claude-usage] live lookup unavailable (${_live_err})" >&2
     exit 1
   fi
-  printf '%s\n' "$_resp_body"
+  # additive "_snapshot" key (source / fetched_at / age_sec / error)
+  # so machine consumers know how old the numbers are. Readers use .get(), so
+  # older consumers are unaffected; a non-object body passes through raw.
+  printf '%s' "$_resp_body" | python3 -c '
+import json, sys, time
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+    if not isinstance(d, dict):
+        raise ValueError
+except ValueError:
+    print(raw)
+    sys.exit(0)
+age = int(sys.argv[2] or 0)
+d["_snapshot"] = {"source": sys.argv[1], "age_sec": age,
+                  "fetched_at": int(time.time()) - age, "error": sys.argv[3]}
+print(json.dumps(d))
+' "$_snap_source" "$_snap_age" "$_snap_err"
   exit 0
 fi
 
@@ -304,7 +480,7 @@ if [[ -z "$_live_err" ]]; then
   # python string could break on quotes in the body.
   _resp_file="$(mktemp "${TMPDIR:-/tmp}/claude-usage-resp.XXXXXX")"
   printf '%s' "$_resp_body" > "$_resp_file"
-  python3 - "$_resp_file" <<'PYEOF2'
+  python3 - "$_resp_file" "$_snap_source" "$_snap_age" <<'PYEOF2'
 import json, sys
 from datetime import datetime, timezone, timedelta
 
@@ -323,6 +499,20 @@ _T = {
     "ko": {"title": "Claude 사용 한도", "h5": "5시간", "hw": "주간", "reset": "리셋"},
     "en": {"title": "Claude Usage Limits", "h5": "5h", "hw": "weekly", "reset": "reset"},
 }[_loc]
+# Snapshot-age lines. Owner-approved wording (2026-10-06).
+_T.update({
+    "ko": {"as_of": "({age} 전 조회값)",
+           "stale": "(최신 조회 실패 -- {age} 전 마지막 값)",
+           "min": "{n}분", "sec": "{n}초"},
+    "en": {"as_of": "(as of {age} ago)",
+           "stale": "(live lookup failed -- last value from {age} ago)",
+           "min": "{n} min", "sec": "{n}s"},
+}[_loc])
+_src = sys.argv[2] if len(sys.argv) > 2 else "live"
+try:
+    _age = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+except ValueError:
+    _age = 0
 
 def pctstr(v):
     try:
@@ -377,6 +567,14 @@ def _row(label, pct, reset_iso):
     print("%s %s" % (_T["reset"], _reset(reset_iso)))
 
 print(_T["title"])
+# a snapshot-served report says how old it is (a fresh live read and
+# a sub-minute cache hit print nothing extra).
+_age_txt = (_T["min"].format(n=_age // 60) if _age >= 60
+            else _T["sec"].format(n=_age))
+if _src == "stale":
+    print(_T["stale"].format(age=_age_txt))
+elif _src == "cache" and _age >= 60:
+    print(_T["as_of"].format(age=_age_txt))
 print("─" * 27)
 
 five_hour = data.get("five_hour", {})
@@ -398,6 +596,9 @@ for lim in data.get("limits", []):
 print("─" * 27)
 PYEOF2
   rm -f "$_resp_file"
+  if [[ -n "$_snap_err" ]]; then
+    echo "[Live Rate-Limit] ${_snap_err}"
+  fi
   _access_token=""  # clear from memory after use
   _tok_cfg=""
 else
