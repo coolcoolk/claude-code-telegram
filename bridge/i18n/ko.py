@@ -20,8 +20,8 @@ STRINGS = {
     "no_permission_callback": "이 기능을 사용할 권한이 없습니다",
     # Expired-button tap alert (STALE gate made visible).
     # Confirmed -- owner 2026-10-02 08:17 (verbatim copy): name the expiry
-    # window and point to typing in the chat. {minutes} = STALE window.
-    # Both keys share the value -- call sites unchanged.
+    # window and point to typing in the chat. {minutes} = the declaring
+    # button kind's TTL (CALLBACK_TTL_SECONDS, dec-272). Both keys share the value -- call sites unchanged.
     "stale_callback_expired": "{minutes}분이 지나서 만료된 버튼입니다. 필요하신 내용을 채팅에 입력해주세요.",
     "stale_callback_expired_nolabel": "{minutes}분이 지나서 만료된 버튼입니다. 필요하신 내용을 채팅에 입력해주세요.",
     # --- Born-locked ownership / claim flow ---
@@ -142,6 +142,8 @@ STRINGS = {
     # DGN-1050: cmd_desc_authsync removed -- /authsync retired, off-menu.
     # DGN-997: owner-only explicit restart command.
     "cmd_desc_restart": "봇 재시작",
+    # DGN-1112: /login menu row (on the menu since the dec-266 copy approval).
+    "cmd_desc_login": "Claude Code 로그인",  # owner-approved 2026-10-06 17:35 (dec-268)
     # DGN-986 D1: owner amendment of the 10-command lock -- /health sits
     # right before help (authsync, the D1 anchor, was retired by DGN-1050
     # after D1 was decided -- see COMMAND_MENU_SPEC comment). Copy = dec-094
@@ -181,6 +183,46 @@ STRINGS = {
     # new bridge terminal-closes the restart instead. Copy OWNER-APPROVED
     # 2026-08-22 09:12 (DGN-1240/DGN-1249 U1).
     "restart_backstop_notice": "재시작 완료",
+    # --- /login (DGN-1112) ---
+    # Copy OWNER-APPROVED 2026-10-06 16:54 (dec-266), all 16 keys verbatim
+    # as reviewed in the DGN-1112 login-relay review record -- do not reword.
+    # login_url takes {url} and {minutes}.
+    # login_failed / login_no_cli are LEAD lines: messages.py appends the
+    # owner-confirmed error_auth_relogin terminal guide after them (dec-257);
+    # after login_no_cli the guide drops its first sentence (dec-266).
+    "login_preparing": "로그인 링크를 만들고 있어요. 잠시만 기다려 주세요.",
+    "login_url": (
+        "아래 링크를 열어 Claude에 로그인해 주세요.\n"
+        "로그인이 끝나면 화면에 코드가 나와요. 그 코드를 복사해서 이 대화창에 그대로 보내 주세요.\n"
+        "{minutes}분 안에 보내 주셔야 해요. 그만두려면 /cancel 을 보내 주세요.\n\n"
+        "{url}"
+    ),
+    "login_code_received": "코드를 받았어요. 로그인을 확인하고 있어요.",
+    "login_wait": "로그인을 처리하고 있어요. 잠시만 기다려 주세요.",
+    "login_code_invalid": (
+        "코드 형식이 맞지 않아요. 로그인 화면에 나온 코드를 그대로 복사해서 보내 주세요. "
+        "그만두려면 /cancel 을 보내 주세요."
+    ),
+    "login_code_mismatch": (
+        "이번 로그인 링크에서 받은 코드가 아니에요. "
+        "방금 보내 드린 링크로 로그인한 뒤 나온 코드를 보내 주세요."
+    ),
+    "login_code_attempts": "코드가 여러 번 맞지 않아서 로그인을 취소했어요. 다시 하려면 /login 을 보내 주세요.",
+    "login_success": "로그인됐어요. 다음 메시지부터 새 로그인으로 대화할게요.",
+    "login_failed": "로그인하지 못했어요. /login 으로 다시 시도하거나, 아래 안내대로 터미널에서 로그인해 주세요.",
+    "login_timeout": "코드가 오지 않아서 로그인을 취소했어요. 다시 하려면 /login 을 보내 주세요.",
+    "login_cancelled": "로그인을 취소했어요.",
+    "login_already_pending": (
+        "이미 로그인을 진행하고 있어요. 앞서 보내 드린 링크로 로그인한 뒤 코드를 보내 주세요. "
+        "취소하려면 /cancel 을 보내 주세요."
+    ),
+    "login_busy": "이 컴퓨터에서 다른 로그인이 진행 중이에요. 끝난 뒤에 다시 시도해 주세요.",
+    "login_private_only": "/login 은 저와의 1:1 대화에서만 쓸 수 있어요.",
+    "login_env_token": (
+        "이 컴퓨터에는 환경 변수로 넣은 Claude 인증 정보가 먼저 적용되고 있어요. "
+        "그래서 여기서 로그인해도 바뀌지 않아요. 컴퓨터에서 그 설정을 먼저 확인해 주세요."
+    ),
+    "login_no_cli": "Claude 프로그램을 찾지 못해서 여기서는 로그인할 수 없어요. 아래 안내대로 터미널에서 로그인해 주세요.",
     # --- Usage report (/usage -> routines/claude-usage.sh) ---
     # DGN-1362: public as of OSS 2.0.1 -- the script ships at the instance root.
     "usage_script_missing": "사용량 스크립트를 찾을 수 없습니다 (routines/claude-usage.sh).",

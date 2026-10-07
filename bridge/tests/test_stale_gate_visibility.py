@@ -1,4 +1,8 @@
-"""The 20-min STALE gate must never drop a tap SILENTLY (btnstale, 2026-09-10).
+"""The STALE gate must never drop a tap SILENTLY (btnstale, 2026-09-10).
+
+Since dec-272 (DGN-841) a callback is only age-gated when its kind declares a
+TTL (CALLBACK_TTL_SECONDS); the tests below make opt: declare one (fixture).
+The default no-expiry behavior is pinned in test_dgn841_button_expiry.py.
 
 Defect: _check_access dropped any update whose message was older than
 STALE_MESSAGE_SECONDS with a bare `return False` -- no log line, and for a
@@ -70,10 +74,24 @@ class _FakeMessage:
 
 
 
+# dec-272 (DGN-841): buttons no longer expire by default -- only a kind that
+# declares a TTL in CALLBACK_TTL_SECONDS does. Every test here exercises the
+# expiry path, so the opt: kind is made to DECLARE one (45 min, deliberately
+# not the 20-min plain-message window: the alert's {minutes} must come from
+# the declaring kind's TTL, not from STALE_MESSAGE_SECONDS).
+OPT_TTL_MINUTES = 45
+
+
+@pytest.fixture(autouse=True)
+def _opt_declares_ttl():
+    with patch.dict(bot_mod.CALLBACK_TTL_SECONDS, {"opt:": OPT_TTL_MINUTES * 60}):
+        yield
+
+
 # Rendered copy (owner 2026-10-02): the window in minutes, no raw slots.
-_EXPIRED = messages.STALE_CALLBACK_EXPIRED.format(choice="", minutes=20)
-_EXPIRED_NOLABEL = messages.STALE_CALLBACK_EXPIRED_NOLABEL.format(minutes=20)
-assert "20" in _EXPIRED and "{" not in _EXPIRED
+_EXPIRED = messages.STALE_CALLBACK_EXPIRED.format(choice="", minutes=OPT_TTL_MINUTES)
+_EXPIRED_NOLABEL = messages.STALE_CALLBACK_EXPIRED_NOLABEL.format(minutes=OPT_TTL_MINUTES)
+assert str(OPT_TTL_MINUTES) in _EXPIRED and "{" not in _EXPIRED
 
 def _keyboard(*pairs):
     """Minimal inline_keyboard stand-in: (text, callback_data) rows."""

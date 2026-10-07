@@ -15,8 +15,9 @@ STRINGS = {
     "no_permission_callback": "No permission to use this feature",
     # Expired-button tap alert (STALE gate made visible).
     # Confirmed -- owner 2026-10-02 08:17: name the expiry window and point
-    # to typing in the chat. {minutes} = STALE window. Both keys share the
-    # value -- call sites unchanged.
+    # to typing in the chat. {minutes} = the declaring button kind's TTL
+    # (CALLBACK_TTL_SECONDS, dec-272). Both keys share the value -- call
+    # sites unchanged.
     "stale_callback_expired": "This button expired after {minutes} minutes. Please type what you need in the chat.",
     "stale_callback_expired_nolabel": "This button expired after {minutes} minutes. Please type what you need in the chat.",
     # --- Born-locked ownership / claim flow ---
@@ -145,6 +146,8 @@ STRINGS = {
     # DGN-1050: cmd_desc_authsync removed -- /authsync retired, off-menu.
     # DGN-997: owner-only explicit restart command.
     "cmd_desc_restart": "Restart the bot",
+    # DGN-1112: /login menu row (on the menu since the dec-266 copy approval).
+    "cmd_desc_login": "Log in to Claude Code",  # owner-approved 2026-10-06 17:35 (dec-268)
     # DGN-986 D1: owner amendment of the 10-command lock -- /health sits
     # right before help (authsync, the D1 anchor, was retired by DGN-1050
     # after D1 was decided -- see COMMAND_MENU_SPEC comment). Copy = dec-094
@@ -186,6 +189,46 @@ STRINGS = {
     # new bridge terminal-closes the restart instead. Copy OWNER-APPROVED
     # 2026-08-22 09:12 (DGN-1240/DGN-1249 U1).
     "restart_backstop_notice": "Restart complete",
+    # --- /login (DGN-1112) ---
+    # Copy OWNER-APPROVED 2026-10-06 16:54 (dec-266), all 16 keys verbatim
+    # as reviewed in the DGN-1112 login-relay review record -- do not reword.
+    # login_url takes {url} and {minutes}.
+    # login_failed / login_no_cli are LEAD lines: messages.py appends the
+    # owner-confirmed error_auth_relogin terminal guide after them (dec-257);
+    # after login_no_cli the guide drops its first sentence (dec-266).
+    "login_preparing": "Preparing a login link -- one moment.",
+    "login_url": (
+        "Open the link below and sign in to Claude.\n"
+        "When you finish, the page shows a code. Copy it and send it here exactly as shown.\n"
+        "Please send it within {minutes} minutes. Send /cancel to stop.\n\n"
+        "{url}"
+    ),
+    "login_code_received": "Got the code -- checking the login.",
+    "login_wait": "Still working on the login -- one moment.",
+    "login_code_invalid": (
+        "That doesn't look like a login code. Copy the code from the login page "
+        "and send it exactly as shown, or send /cancel to stop."
+    ),
+    "login_code_mismatch": (
+        "That code belongs to a different login link. Sign in with the link I just "
+        "sent and send the code it shows."
+    ),
+    "login_code_attempts": "Too many codes didn't match, so I cancelled the login. Send /login to start again.",
+    "login_success": "You're logged in. Your next message will use the new login.",
+    "login_failed": "The login didn't go through. Send /login to try again, or log in from Terminal as below.",
+    "login_timeout": "No code arrived, so I cancelled the login. Send /login to start again.",
+    "login_cancelled": "Login cancelled.",
+    "login_already_pending": (
+        "A login is already in progress. Sign in with the link I sent and send the code, "
+        "or send /cancel to stop."
+    ),
+    "login_busy": "Another login is already running on this computer. Please try again after it finishes.",
+    "login_private_only": "/login only works in a private chat with me.",
+    "login_env_token": (
+        "Claude credentials set in an environment variable take priority on this computer, "
+        "so logging in here would not change anything. Please check that setting on the computer first."
+    ),
+    "login_no_cli": "I couldn't find the Claude program, so I can't log in from here. Log in from Terminal as below.",
     # --- Usage report (/usage -> routines/claude-usage.sh) ---
     # DGN-1362: public as of OSS 2.0.1 -- the script ships at the instance root.
     "usage_script_missing": "Usage script not found (routines/claude-usage.sh).",

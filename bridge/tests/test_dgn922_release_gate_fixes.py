@@ -5,8 +5,9 @@ Four fixes, four tests:
   FIX 1 [911] /stop soft path must discard _user_pending_texts.
     Ghost merged turn after soft-stop must not occur.
 
-  FIX 2 [915] cdn:done callback bypasses the 20-min stale gate.
-    A completion button on a >20-min-old message must be tappable.
+  FIX 2 [915] cdn:done callback is tappable on an aged message.
+    A completion button on a >20-min-old message must be tappable
+    (dec-272: no callback is age-gated unless its kind declares a TTL).
 
   FIX 3 [920] btw send path: long output splits + plain-text degrade.
     A >4096-char fork response must be split and delivered;
@@ -186,69 +187,45 @@ async def test_fix1_soft_stop_discards_pending_buffer_no_ghost_turn(monkeypatch)
 # ---------------------------------------------------------------------------
 # FIX 2: cdn:done tappable on an aged (>20 min) message
 #
-# Scenario: _handle_callback receives a cdn:done: callback from a message
-# that is older than STALE_MESSAGE_SECONDS (20 min).  The normal stale gate
-# must NOT block it; _check_access must be called with skip_stale=True.
+# Scenario: a cdn:done: callback arrives from a message far older than
+# STALE_MESSAGE_SECONDS (20 min).  Originally pinned via a skip_stale=True
+# special case in _handle_callback; since dec-272 (DGN-841) callbacks are not
+# age-gated by default and cdn:done: declares no TTL, so the special case is
+# gone (B6) and the REAL gate is exercised here instead of a spy.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_fix2_cdn_done_bypasses_stale_gate(monkeypatch):
-    """FIX 2: a cdn:done tap on a >20-min-old message reaches the handler."""
+async def test_fix2_cdn_done_passes_the_gate_when_aged():
+    """FIX 2: a cdn:done tap on a 24-h-old message passes _check_access."""
     b = _make_bot()
     user_id = 923
+    stale_date = datetime.now(timezone.utc) - timedelta(hours=24)
+    upd = _upd(user_id=user_id, ts=stale_date, callback_data=f"{CDN_DONE_PREFIX}42")
 
-    # Callback from a message sent 25 minutes ago (older than 20-min gate).
-    stale_date = datetime.now(timezone.utc) - timedelta(minutes=25)
-    cdn_data = f"{CDN_DONE_PREFIX}42"
-    upd = _upd(user_id=user_id, ts=stale_date, callback_data=cdn_data)
+    assert bot_mod._callback_ttl(f"{CDN_DONE_PREFIX}42") is None
+    with patch.object(bot_mod.config, "allowed_user_ids", [user_id]):
+        allowed = await b._check_access(upd)
 
-    # Record whether _check_access was called and with what skip_stale value.
-    access_calls = []
-    original_check_access = b._check_access
-
-    async def spy_check_access(update, *, skip_stale=False):
-        access_calls.append(skip_stale)
-        return True  # always allow
-
-    monkeypatch.setattr(b, "_check_access", spy_check_access)
-
-    # Stub edit_message_reply_markup as AsyncMock so the cdn:done handler
-    # can await it without crashing (it swallows all failures anyway).
-    b.application.bot.edit_message_reply_markup = AsyncMock()
-
-    ctx = MagicMock()
-    await b._handle_callback(upd, ctx)
-
-    # _check_access must have been called exactly once with skip_stale=True.
-    assert access_calls == [True], (
-        f"cdn:done tap must call _check_access with skip_stale=True; got {access_calls}"
-    )
+    assert allowed is True
+    upd.callback_query.answer.assert_not_awaited()  # no expiry alert
 
 
 @pytest.mark.asyncio
-async def test_fix2_non_cdn_done_still_hits_stale_gate(monkeypatch):
-    """FIX 2 guard: non-cdn:done callbacks still go through the stale gate."""
+async def test_fix2_cdn_done_handler_runs_without_special_case():
+    """B6: _handle_callback no longer peeks at callback_data before the gate
+    -- _check_access is called with the update alone."""
     b = _make_bot()
-    user_id = 924
+    upd = _upd(user_id=924, ts=datetime.now(timezone.utc) - timedelta(hours=3),
+               callback_data=f"{CDN_DONE_PREFIX}42")
+    access = AsyncMock(return_value=True)
+    upd.callback_query.edit_message_reply_markup = AsyncMock()
 
-    stale_date = datetime.now(timezone.utc) - timedelta(minutes=25)
-    # A regular opt: callback (not cdn:done:).
-    upd = _upd(user_id=user_id, ts=stale_date, callback_data="opt:1")
+    with patch.object(b, "_check_access", new=access):
+        await b._handle_callback(upd, MagicMock())
 
-    access_calls = []
-
-    async def spy_check_access(update, *, skip_stale=False):
-        access_calls.append(skip_stale)
-        return False  # stale -> deny
-
-    monkeypatch.setattr(b, "_check_access", spy_check_access)
-
-    ctx = MagicMock()
-    await b._handle_callback(upd, ctx)
-
-    # _check_access must have been called with skip_stale=False.
-    assert access_calls == [False], (
-        f"opt: tap must call _check_access with skip_stale=False; got {access_calls}"
+    access.assert_awaited_once_with(upd)
+    upd.callback_query.edit_message_reply_markup.assert_awaited_once_with(
+        reply_markup=None
     )
 
 

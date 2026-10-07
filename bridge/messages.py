@@ -81,6 +81,7 @@ CMD_DESC_HELP = t("cmd_desc_help")
 CMD_DESC_BTW = t("cmd_desc_btw")
 CMD_DESC_QUEUE = t("cmd_desc_queue")
 CMD_DESC_RESTART = t("cmd_desc_restart")  # DGN-997
+CMD_DESC_LOGIN = t("cmd_desc_login")  # DGN-1112
 # DGN-986 D1: /health menu entry (owner amendment of the DGN-919 10-cmd lock).
 CMD_DESC_HEALTH = t("cmd_desc_health")
 
@@ -115,6 +116,24 @@ RESTART_ACK = t("restart_ack")
 # when the self_restart.sh worker died before its own terminal push (pending
 # marker unclaimed + worker pid dead). Copy status: 미확정 (형님 확인 대기).
 RESTART_BACKSTOP_NOTICE = t("restart_backstop_notice")
+
+# --- /login (DGN-1112): terminal-free Claude re-login. Copy owner-approved
+# 2026-10-06 (dec-266). LOGIN_URL takes {url} and {minutes}. LOGIN_FAILED and
+# LOGIN_NO_CLI are composed below, after ERROR_AUTH_RELOGIN.
+LOGIN_PREPARING = t("login_preparing")
+LOGIN_URL = t("login_url")
+LOGIN_CODE_RECEIVED = t("login_code_received")
+LOGIN_WAIT = t("login_wait")
+LOGIN_CODE_INVALID = t("login_code_invalid")
+LOGIN_CODE_MISMATCH = t("login_code_mismatch")
+LOGIN_CODE_ATTEMPTS = t("login_code_attempts")
+LOGIN_SUCCESS = t("login_success")
+LOGIN_TIMEOUT = t("login_timeout")
+LOGIN_CANCELLED = t("login_cancelled")
+LOGIN_ALREADY_PENDING = t("login_already_pending")
+LOGIN_BUSY = t("login_busy")
+LOGIN_PRIVATE_ONLY = t("login_private_only")
+LOGIN_ENV_TOKEN = t("login_env_token")
 
 # --- Usage report (/usage -> routines/claude-usage.sh) ---
 # DGN-1362: public as of OSS 2.0.1 -- /usage and its script both ship.
@@ -211,6 +230,18 @@ ERROR_RETRY_BUTTON = t("error_retry_button")
 ERROR_RETRYING = t("error_retrying")
 ERROR_RETRY_EXPIRED = t("error_retry_expired")
 
+# DGN-1112 (dec-257): a /login the bot cannot finish falls back to the
+# owner-confirmed DGN-1857 terminal guide, appended after an approved lead
+# line. The guide carries `code` spans: the bot sends these two as HTML.
+# dec-266: after login_no_cli the guide drops its first sentence ("Claude
+# 로그인이 만료됐어요." / "Your Claude login has expired.") -- with no CLI the
+# login may not have expired -- and the terminal steps follow directly. The
+# steps are cut from the locked guide, never retyped, so they cannot drift.
+ERROR_AUTH_RELOGIN_STEPS = ERROR_AUTH_RELOGIN.split(". ", 1)[1]
+LOGIN_FAILED = t("login_failed") + "\n\n" + ERROR_AUTH_RELOGIN
+LOGIN_NO_CLI = t("login_no_cli") + "\n\n" + ERROR_AUTH_RELOGIN_STEPS
+LOGIN_GUIDE_NOTICES = frozenset({LOGIN_FAILED, LOGIN_NO_CLI})
+
 # --- File send failure (send_file:: retry exhausted) ---
 # DGN-649: reason-specific variants -- SEND_FILE_FAILED keeps the network
 # wording and now fires only for network-classified failures.
@@ -275,6 +306,7 @@ SYSTEM_PROMPT_FOLD_FRAGMENT = (
     "the user as its own normal message just before your final message, "
     "so it is never lost and needs no repeat."
 )
+
 
 # DGN-429 hybrid leg 1: output-language rule template appended to the system
 # prompt by sdk_bridge._compose_system_prompt(). Carries a {language}

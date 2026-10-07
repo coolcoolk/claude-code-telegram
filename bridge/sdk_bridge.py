@@ -1480,6 +1480,9 @@ class _UserStreamState:
     # stashes one entry per killed task here -- its owner-facing name, or ""
     # (DGN-1593 r2, _owner_task_name); pop_interrupt_killed() reads + clears.
     interrupt_killed_descriptions: List[str] = field(default_factory=list)
+    # DGN-1112: SdkBridge._cred_gen at creation. A /login bumps the bridge
+    # counter; _get_or_create_stream recreates an idle stream whose value lags.
+    cred_gen: int = 0
 
 
 def _bg_job_notice():
@@ -1537,6 +1540,7 @@ class SdkBridge:
         self.project_root = PROJECT_ROOT
         self._streams: Dict[int, _UserStreamState] = {}
         self._stream_init_locks: Dict[int, asyncio.Lock] = {}
+        self._cred_gen = 0
         logger.info("SdkBridge initialized for %s", self.project_root)
         if not TASK_LIFECYCLE_AVAILABLE:
             # Silence here would be the DGN-1015 failure mode: the guard is
@@ -1760,10 +1764,25 @@ class SdkBridge:
             if state and (new_session or state.model != model):
                 await self._disconnect_user_stream(user_id)
                 state = None
+            cred_gen = getattr(self, "_cred_gen", 0)
+            if state and state.cred_gen != cred_gen and not state.pending:
+                # DGN-1112: a /login replaced the stored credential. The CLI
+                # child behind this client authenticated with the old one;
+                # a fresh child reads the store anew. Only at an idle
+                # boundary (nothing pending), so no in-flight turn is cut.
+                logger.info("Credentials renewed; recreating idle stream for user %s", user_id)
+                await self._disconnect_user_stream(user_id)
+                state = None
             if not state:
                 state = await self._create_user_stream(user_id, model)
+                state.cred_gen = cred_gen
                 self._streams[user_id] = state
             return state
+
+    def mark_credentials_renewed(self) -> None:
+        """DGN-1112: a /login stored a new credential. Every live stream is
+        recreated at its next idle request boundary; no bridge restart."""
+        self._cred_gen = getattr(self, "_cred_gen", 0) + 1
 
     async def _typing_keepalive_loop(self, user_id: int, state: _UserStreamState) -> None:
         try:

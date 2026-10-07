@@ -172,6 +172,22 @@ def fw_reference(root: Path) -> str:
     return built_version(root)
 
 
+def installed_build(root: Path) -> str:
+    """The FULL installed framework build (mirror of version-check.py
+    _installed_build): the consumed tag while its X.Y.Z still equals the
+    base version, else the base version. "" when nothing is stamped -- the
+    caller then claims no version at all (DGN-1886)."""
+    base = _norm(built_version(root))
+    tag = _norm(fw_reference(root))
+
+    def core(v: str) -> str:
+        return v.split("-", 1)[0].split("+", 1)[0]
+
+    if base and tag and core(tag) == core(base):
+        return tag
+    return base
+
+
 def _pid_alive(pid) -> Optional[bool]:
     try:
         if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:

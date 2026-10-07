@@ -67,5 +67,10 @@
 # owner-send belt, ...). MINOR: it adds public surface. Set here first because
 # gate V refuses a tree that misreports itself; landing and pushing the OSS
 # commit remain separate owner-gated acts.
-__oss_base__ = "2.1.0"
+# DGN-1112 (OSS 2.1.1, dec-265): /login, terminal-free Claude re-login relayed
+# over Telegram, ships in the public tree (generic bridge feature). Cut number
+# 2.1.1 per the owner's dec-265 dispatch; its 16 strings were owner-approved
+# 2026-10-06 (dec-266) and /login joined the command menu. Landing and
+# pushing remain owner-gated acts.
+__oss_base__ = "2.1.1"
 __version__ = __oss_base__

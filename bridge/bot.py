@@ -59,6 +59,7 @@ from bridge.config import (
     config,
     log_claude_cli_resolution,
     notify_silent,
+    resolve_claude_cli,
 )
 from bridge import ownership
 from bridge.formatting import (
@@ -118,6 +119,7 @@ from bridge.permissions import (
     outside_path_deny_message,
 )
 from bridge import notice_spool
+from bridge.auth_login import LoginManager
 from bridge.sdk_bridge import ChatResponse, PROJECT_ROOT, TYPING_INTERVAL, sdk_bridge
 from bridge.session import session_manager
 from bridge.dashboard import DashboardSync
@@ -137,6 +139,10 @@ logger = logging.getLogger(__name__)
 #                 A post-ownership "/claim x" falls through to the catch-all
 #                 MessageHandler and is forwarded to the model as a slash cmd.
 #   kill       -- no handler at all; must not appear anywhere.
+#   /login     -- DGN-1112: on the menu since the owner approved its copy
+#                 (dec-266, 2026-10-06). /cancel
+#                 has NO CommandHandler: _handle_skill_command claims it only
+#                 while a login is pending, otherwise it still reaches the model.
 #   /authsync  -- RETIRED (DGN-1050): its file->keychain overwrite re-injected
 #                 superseded refresh tokens after CLI runtime rotations and
 #                 killed the whole estate's auth. A hidden CommandHandler stub
@@ -210,25 +216,69 @@ COMMAND_MENU_SPEC = [
     ("resume",   lambda: messages.CMD_DESC_RESUME),
     # DGN-997: owner-only explicit restart command.
     ("restart",  lambda: messages.CMD_DESC_RESTART),
+    # DGN-1112: terminal-free Claude re-login (copy approved dec-266).
+    ("login",    lambda: messages.CMD_DESC_LOGIN),
     ("help",     lambda: messages.CMD_DESC_HELP),
 ]
 
 STALE_MESSAGE_SECONDS = 20 * 60
-# ^ NO recorded rationale. A 2026-09-10 census (bot.py history, bridge/*.md,
-# CHANGELOG, releases/, worklog tickets, the OSS mirror) found the constant
-# with zero explanatory comment in every tree it exists in, and no ticket that
-# introduced or justified it -- only downstream code that ASSUMES it
-# (DGN-841 / DGN-922 / DGN-966 / DGN-1050 comments below). What it actually
-# protects today is narrow: process first boot already drops every queued
-# update Telegram-side (start_polling drop_pending_updates=first_boot), so
-# this gate only covers updates replayed on an IN-PROCESS polling
-# re-establish (network loss / laptop sleep-wake).
-# It is a poor fit for CALLBACK updates: a notification button is normally
-# tapped hours later (measured 2026-09-10: 5 h 57 m), and the age it measures
-# is the NOTIFICATION's, not the tap's. Whether callbacks should keep this
-# number, get their own, or be exempt entirely is an open product decision
-# (DGN-841's third checkbox). What did NOT wait for that decision: a drop is
-# no longer SILENT -- see _announce_stale_drop below.
+# ^ Replayed PLAIN-message gate only (dec-272 / DGN-841). No original
+# rationale was ever recorded (2026-09-10 census); what it protects is narrow:
+# process first boot already drops every queued update Telegram-side
+# (start_polling drop_pending_updates=first_boot), so this gate only covers
+# messages replayed on an IN-PROCESS polling re-establish (network loss /
+# laptop sleep-wake). It does NOT apply to callback (button) updates: the age
+# it measures is the NOTIFICATION's, not the tap's, and a notification button
+# is normally tapped hours later (measured 2026-09-10: 5 h 57 m).
+#
+# dec-272 (owner 2026-10-07: drop button expiry, make it a variable so only
+# the buttons that truly need one get one): buttons do not expire by default.
+# A button kind that genuinely needs an age limit declares its own TTL here,
+# keyed by callback_data prefix; None = never expires by age. A kind whose
+# handler already validates its own state (token / ledger / arm file /
+# session) needs no TTL: a late tap gets that handler's own "expired" answer,
+# which is more accurate than an age guess. Prefixes not listed here default
+# to None (see _callback_ttl).
+# The expired-tap alert renders its {minutes} from the declaring kind's TTL.
+CALLBACK_TTL_SECONDS: Dict[str, Optional[int]] = {
+    # Numbered option -> sends the label to the model as a user message. The
+    # owner's late answer to a notification is the main reason for dec-272.
+    "opt:": None,
+    # Outside-root file send grant. The button carries no token binding it to
+    # the pending set it was shown for (session pending_external_files is
+    # overwritten by the next prompt), so a late tap would grant whatever is
+    # pending NOW -- same F7 rationale as OUTSIDE_APPROVAL_TTL. Keeps 20 min.
+    "extsend:": 20 * 60,
+    # One-shot session token (pending_resume); mismatch -> RESUME_EXPIRED.
+    "resume:": None,
+    # One-shot session token (pending_retry); mismatch -> ERROR_RETRY_EXPIRED.
+    "retry:": None,
+    # Countdown completion affordance (DGN-915/922): only clears its own
+    # keyboard; countdowns run up to 24 h.
+    CDN_DONE_PREFIX: None,
+    # Model picker (DGN-1814): an explicit owner choice, confirmed in place;
+    # a same-model tap is already a no-op.
+    model_picker.CB_MODEL: None,
+    model_picker.CB_VENDOR: None,
+    model_picker.CB_FOREIGN: None,
+}
+
+
+def _callback_ttl(data: Optional[str]) -> Optional[int]:
+    """Declared TTL (seconds) for a callback_data, or None = no age limit.
+
+    Longest matching prefix wins, so a sub-kind (e.g. "upd:c:") can declare
+    its own TTL under a broader entry. Unknown prefixes default to None.
+    """
+    if not data:
+        return None
+    best = None
+    for prefix in CALLBACK_TTL_SECONDS:
+        if data.startswith(prefix) and (best is None or len(prefix) > len(best)):
+            best = prefix
+    return CALLBACK_TTL_SECONDS[best] if best is not None else None
+
+
 # DGN-616: cap on concurrent turns per user for the CONTROL path only
 # (/stop, /new, /model, opt: and resume: callbacks route through
 # _enqueue_user_task). Regular messages (text/voice/photo/document) are
@@ -692,6 +742,11 @@ class TelegramBot:
                     # (Conflict/NetworkError) keep their turns alive and must
                     # not collapse live folds.
                     await sdk_bridge.flush_folds_for_shutdown()
+                    # DGN-1112: a pending login child runs in its own session
+                    # and would outlive the bridge; end it with the bridge.
+                    login_manager = getattr(self, "_login_manager", None)
+                    if login_manager is not None:
+                        await login_manager.shutdown()
                 await self._graceful_shutdown()
         logger.info("Bot stopped")
 
@@ -1063,6 +1118,8 @@ class TelegramBot:
         # DGN-997: owner-only explicit restart command (the missing surface
         # that made an agent announce a non-existent /restart in the first place).
         app.add_handler(CommandHandler("restart", self._cmd_restart))
+        # DGN-1112: terminal-free Claude re-login, handled here, never by the model.
+        app.add_handler(CommandHandler("login", self._cmd_login))
         app.add_handler(CommandHandler("btw", self._cmd_btw))
         app.add_handler(CommandHandler("help", self._cmd_help))
         # Catch-all: any other /foo is forwarded to the agent as a slash command
@@ -1120,24 +1177,33 @@ class TelegramBot:
 
     # --- access control ---
 
-    async def _check_access(self, update: Update, *, skip_stale: bool = False) -> bool:
-        # DGN-922 FIX 2: skip_stale=True exempts the caller from the 20-min
-        # stale-message drop.  Used exclusively for cdn:done: callbacks so a
-        # countdown completion affordance button stays tappable regardless of
-        # how long the countdown ran (MAX_SECONDS = 24 h).  All other callers
-        # pass the default skip_stale=False and see the original gate unchanged.
-        if not skip_stale:
-            msg = update.message or (update.callback_query and update.callback_query.message)
-            if msg and msg.date:
-                age = (datetime.now(timezone.utc) - msg.date).total_seconds()
-                if age > STALE_MESSAGE_SECONDS:
-                    # The drop used to be TOTALLY silent: no log line, and for a
-                    # callback no query.answer() either, so the owner's tap did
-                    # nothing at all on screen and left no server-side trace
-                    # (measured 2026-09-10, health-observer opt: button tapped
-                    # ~6 h after the notification). Announce before returning.
-                    await self._announce_stale_drop(update, age)
-                    return False
+    async def _check_access(self, update: Update) -> bool:
+        # Age gate (dec-272 / DGN-841). A plain message older than
+        # STALE_MESSAGE_SECONDS is a polling-replay leftover and is dropped. A
+        # callback is age-gated ONLY when its kind declares a TTL in
+        # CALLBACK_TTL_SECONDS; by default a button works however late it is
+        # tapped. The age is the button message's (Telegram carries no tap
+        # time), i.e. "time since the button was shown".
+        # (The DGN-922 skip_stale parameter that exempted cdn:done -- and,
+        # later, the upd: notice taps -- is gone: with no default callback
+        # gate there is nothing left to skip; both now declare None.)
+        query = update.callback_query
+        if query is not None:
+            msg = query.message
+            limit = _callback_ttl(query.data)
+        else:
+            msg = update.message
+            limit = STALE_MESSAGE_SECONDS
+        if limit is not None and msg and msg.date:
+            age = (datetime.now(timezone.utc) - msg.date).total_seconds()
+            if age > limit:
+                # The drop used to be TOTALLY silent: no log line, and for a
+                # callback no query.answer() either, so the owner's tap did
+                # nothing at all on screen and left no server-side trace
+                # (measured 2026-09-10, health-observer opt: button tapped
+                # ~6 h after the notification). Announce before returning.
+                await self._announce_stale_drop(update, age, limit)
+                return False
         user = update.effective_user
         if not user:
             return False
@@ -1204,7 +1270,7 @@ class TelegramBot:
     # owner would type, so it is stripped before quoting.
     _OPT_NUMBER_PREFIX_RE = re.compile(r"^\s*\d+\s*[.)]\s*")
 
-    def _stale_callback_alert_text(self, query) -> str:
+    def _stale_callback_alert_text(self, query, ttl: int) -> str:
         """Wording for the expired-tap alert; quotes the button label if usable.
 
         The label IS the sentence the tap would have sent (options.resolve_choice
@@ -1212,25 +1278,28 @@ class TelegramBot:
         a re-issue path that needs no knowledge of the bridge: type that.
         Degrades to the label-free wording whenever the label cannot be
         recovered (keyboard gone / no match) or is a number handle (DGN-881).
+        `ttl` is the declaring kind's CALLBACK_TTL_SECONDS value (dec-272); the
+        confirmed copy's {minutes} is rendered from it.
         """
+        minutes = max(1, ttl // 60)
         data = getattr(query, "data", None)
         message = getattr(query, "message", None)
         markup = getattr(message, "reply_markup", None)
         keyboard = getattr(markup, "inline_keyboard", None)
         if not data or not keyboard:
             return messages.STALE_CALLBACK_EXPIRED_NOLABEL.format(
-                minutes=STALE_MESSAGE_SECONDS // 60)
+                minutes=minutes)
         label = resolve_choice(data, keyboard)
         label = self._OPT_NUMBER_PREFIX_RE.sub("", label or "").strip()
         if not label or is_number_handle(label):
             return messages.STALE_CALLBACK_EXPIRED_NOLABEL.format(
-                minutes=STALE_MESSAGE_SECONDS // 60)
+                minutes=minutes)
         if len(label) > self._STALE_ALERT_LABEL_MAX:
             label = label[: self._STALE_ALERT_LABEL_MAX - 1].rstrip() + "…"
         return messages.STALE_CALLBACK_EXPIRED.format(
-            choice=label, minutes=STALE_MESSAGE_SECONDS // 60)
+            choice=label, minutes=minutes)
 
-    async def _announce_stale_drop(self, update: Update, age: float) -> None:
+    async def _announce_stale_drop(self, update: Update, age: float, limit: int) -> None:
         """Make a STALE-gate drop observable instead of silent.
 
         Two effects, deliberately asymmetric:
@@ -1257,20 +1326,20 @@ class TelegramBot:
             logger.info(
                 "STALE drop: message from user %s in chat %s, age %.0fs > %ds",
                 getattr(user, "id", None), getattr(chat, "id", None),
-                age, STALE_MESSAGE_SECONDS,
+                age, limit,
             )
             return
         logger.warning(
             "STALE drop: callback %r from user %s in chat %s, age %.0fs > %ds "
             "-- button tap not executed",
             getattr(query, "data", None), getattr(user, "id", None),
-            getattr(chat, "id", None), age, STALE_MESSAGE_SECONDS,
+            getattr(chat, "id", None), age, limit,
         )
         if not self._is_owner_user(user):
             return
         try:
             await query.answer(
-                self._stale_callback_alert_text(query), show_alert=True
+                self._stale_callback_alert_text(query, limit), show_alert=True
             )
         except Exception as e:
             logger.warning("STALE drop alert failed (ignored): %s", e)
@@ -2788,6 +2857,60 @@ class TelegramBot:
         # self_restart.sh sends after the worker finishes -- no duplicate.
         await self._reply_guaranteed(update, messages.RESTART_ACK)
 
+    def _get_login_manager(self) -> LoginManager:
+        manager = getattr(self, "_login_manager", None)
+        if manager is None:
+            manager = LoginManager(
+                send=self._send_login_notice,
+                cli_resolver=resolve_claude_cli,
+                on_success=sdk_bridge.mark_credentials_renewed,
+            )
+            self._login_manager = manager
+        return manager
+
+    async def _send_login_notice(self, chat_id: int, text: str) -> None:
+        # The terminal-guide fallbacks carry `code` spans; render them the
+        # way sdk_bridge renders the same guide. Every other notice (the
+        # relayed URL included) goes out as plain text, untouched.
+        extra = {}
+        if text in messages.LOGIN_GUIDE_NOTICES:
+            text, extra = markdown_to_telegram_html(text), {"parse_mode": "HTML"}
+        await self.application.bot.send_message(
+            chat_id=chat_id, text=text, disable_web_page_preview=True, **extra
+        )
+
+    async def _cmd_login(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """DGN-1112: /login -- re-login to Claude without a terminal.
+
+        Owner-only (_check_access) and private-chat-only: the relayed URL and
+        the pasted code must not pass through a group. auth_login.LoginManager
+        runs the installed CLI's `auth login` on pipes, relays the manual URL,
+        and takes the owner's next message as the code (see
+        _maybe_consume_login_code). The model never sees any of it.
+        """
+        if not await self._check_access(update):
+            return
+        chat = update.effective_chat
+        if getattr(chat, "type", None) != "private":
+            await update.message.reply_text(messages.LOGIN_PRIVATE_ONLY)
+            return
+        await self._get_login_manager().start(update.effective_user.id, chat.id)
+
+    async def _maybe_consume_login_code(self, update: Update, user_id: int, text: str) -> bool:
+        manager = getattr(self, "_login_manager", None)
+        if manager is None or manager.pending_for(user_id, update.message.chat_id) is None:
+            return False
+        if not await manager.submit(user_id, update.message.chat_id, text):
+            return False
+        # Best effort: take the code out of the Telegram chat history too.
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.info("login: could not delete the code message: %s", e)
+        return True
+
     async def _cmd_btw(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -3276,6 +3399,10 @@ class TelegramBot:
         text = update.message.text
         parts = text.split(maxsplit=1)
         cmd_name = parts[0].lstrip("/").split("@")[0]
+        if cmd_name == "cancel":
+            manager = getattr(self, "_login_manager", None)
+            if manager is not None and await manager.cancel(update.effective_user.id):
+                return
         for handler in self.application.handlers.get(0, []):
             if isinstance(handler, CommandHandler) and cmd_name in handler.commands:
                 return
@@ -3412,6 +3539,11 @@ class TelegramBot:
             return
         user_id = update.effective_user.id
         text = message.text
+        # DGN-1112: a pending /login owns the owner's next message -- it is
+        # the auth code. Claimed before every other route (split-merge,
+        # fast-path, the model), and never logged or stored.
+        if await self._maybe_consume_login_code(update, user_id, text):
+            return
         session = await session_manager.get_session(user_id)
 
         resume_list = session.get("resume_list")
@@ -4453,13 +4585,9 @@ class TelegramBot:
             # discipline. Also covers the pre-existing streamed+code case.
             bot = message.get_bot()
             chat_id = message.chat.id
-            for mid in (draft_message_ids or []):
-                try:
-                    await bot.delete_message(chat_id, mid)
-                except Exception as e:
-                    logger.warning("Failed to delete streamed draft %s: %s", mid, e)
             body_receipts = await self._send_text_body(
                 message, display, preview, reply_to=reply_to)
+            await self._retire_drafts(bot, chat_id, draft_message_ids)
             body_was_loud = True
         elif consumed_options and draft_message_ids:
             # DGN-665: the terminal AssistantMessage live-streams into drafts, so
@@ -4469,11 +4597,6 @@ class TelegramBot:
             # strips to whitespace-only (the SELECT_PROMPT+buttons carries it).
             bot = message.get_bot()
             chat_id = message.chat.id
-            for mid in draft_message_ids:
-                try:
-                    await bot.delete_message(chat_id, mid)
-                except Exception as e:
-                    logger.warning("Failed to delete streamed draft %s: %s", mid, e)
             if display.strip():
                 body_receipts = await self._send_text_body(
                     message, display, preview, reply_to=reply_to)
@@ -4482,6 +4605,7 @@ class TelegramBot:
                 # Streamed draft was the loud carrier before the turn finalized;
                 # the draft notification already fired at create_draft() time.
                 body_was_loud = True
+            await self._retire_drafts(bot, chat_id, draft_message_ids)
         elif draft_message_ids and display.strip():
             # DGN-376 v1.1 (M1): streamed prose-only reply. The final draft
             # bubble streamed as plain text; re-render it in place as HTML via
@@ -4529,13 +4653,9 @@ class TelegramBot:
                         "rich final (%s): draft swap with reply link",
                         ",".join(rich),
                     )
-                for mid in draft_message_ids:
-                    try:
-                        await bot.delete_message(chat_id, mid)
-                    except Exception as e:
-                        logger.warning("Failed to delete streamed draft %s: %s", mid, e)
                 body_receipts = await self._send_text_body(
                     message, display, preview, reply_to=reply_to)
+                await self._retire_drafts(bot, chat_id, draft_message_ids)
             # In-place edit or re-send: draft already notified at creation.
             body_was_loud = True
         if notice_meta is not None:
@@ -4550,6 +4670,22 @@ class TelegramBot:
             body_was_loud=body_was_loud, body=display,
             carrier_id=self._body_carrier_id(body_receipts, edited_message_id),
         )
+
+    @staticmethod
+    async def _retire_drafts(bot, chat_id: int, draft_ids: Optional[List[int]]) -> None:
+        """DGN-1890: remove the streamed draft bubbles of a SWAPPED final.
+
+        Called only AFTER the replacement body went out: the owner never sees
+        an empty gap between the draft vanishing and the new message landing
+        (a slow send used to leave the chat blank for seconds). A send that
+        raises never reaches this call, so the draft keeps the text on screen.
+        A failed delete only logs -- the final is already delivered.
+        """
+        for mid in (draft_ids or []):
+            try:
+                await bot.delete_message(chat_id, mid)
+            except Exception as e:
+                logger.warning("Failed to delete streamed draft %s: %s", mid, e)
 
     async def _send_text_body(
         self,
@@ -4897,8 +5033,8 @@ class TelegramBot:
             # ONLY on the model-turn path, where the owner is mid-conversation
             # right now. The bare-chat_id rail (_send_smart -- fast-path AND
             # proactive/cron push) has no such live turn: a confirm button
-            # sent there either fires unattended or dies at the 20-min STALE
-            # gate (_check_access) with nobody around to tap it (measured:
+            # sent there either fires unattended or dies at its 20-min TTL
+            # (CALLBACK_TTL_SECONDS) with nobody around to tap it (measured:
             # a cron push at an odd hour would leave a dead-end prompt AND
             # never actually deliver the file). Never silently drop (that IS
             # the DGN-966 defect class) -- log loud + a plain no-button
@@ -5107,26 +5243,18 @@ class TelegramBot:
         elif has_code and (force_options or draft_message_ids):
             # DGN-085: same backstop as _reply_smart -- code+options coexistence
             # forces clean re-send via HTML segments so code/tables render correctly.
-            for mid in (draft_message_ids or []):
-                try:
-                    await bot.delete_message(chat_id, mid)
-                except Exception as e:
-                    logger.warning("Failed to delete streamed draft %s: %s", mid, e)
             body_receipts = await self._send_text_body_chat(
                 chat_id, display, preview, rail=rail)
+            await self._retire_drafts(bot, chat_id, draft_message_ids)
             body_was_loud = True
         elif options and draft_message_ids:
             # DGN-665: streamed decision-ask -- the draft baked in the unstripped
             # list. Delete the draft(s) and re-send the stripped body so the list
             # shows only as buttons; skip the send when the body is whitespace.
-            for mid in draft_message_ids:
-                try:
-                    await bot.delete_message(chat_id, mid)
-                except Exception as e:
-                    logger.warning("Failed to delete streamed draft %s: %s", mid, e)
             if display.strip():
                 body_receipts = await self._send_text_body_chat(
                     chat_id, display, preview, rail=rail)
+            await self._retire_drafts(bot, chat_id, draft_message_ids)
             # Streamed draft was the loud carrier; notification fired at
             # create_draft() time.
             body_was_loud = True
@@ -5144,13 +5272,9 @@ class TelegramBot:
             ):
                 edited_message_id = draft_message_ids[0]
             else:
-                for mid in draft_message_ids:
-                    try:
-                        await bot.delete_message(chat_id, mid)
-                    except Exception as e:
-                        logger.warning("Failed to delete streamed draft %s: %s", mid, e)
                 body_receipts = await self._send_text_body_chat(
                     chat_id, display, preview, rail=rail)
+                await self._retire_drafts(bot, chat_id, draft_message_ids)
             # Draft was loud at creation; in-place edit inherits that.
             body_was_loud = True
         if notice_meta is not None:
@@ -5375,16 +5499,13 @@ class TelegramBot:
     # --- callbacks ---
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        # DGN-922 FIX 2: cdn:done: callbacks must bypass the 20-min stale gate.
-        # Countdowns can run up to MAX_SECONDS=24h; a completion button tapped
-        # after 20 min would silently die without this exemption.  Peek at the
-        # raw callback_data here (before _check_access) to select the right
-        # gate; all other prefixes still go through the normal stale check.
+        # DGN-922 FIX 2 used to peek at callback_data here to exempt cdn:done:
+        # (and later the DGN-1417 upd: notice taps) from the 20-min gate via
+        # _check_access(skip_stale=True). Removed (dec-272, B6): callbacks are
+        # no longer age-gated by default, and both kinds declare None in
+        # CALLBACK_TTL_SECONDS, so the special case had nothing left to do.
         query = update.callback_query
-        cdn_done_tap = bool(
-            query and query.data and query.data.startswith(CDN_DONE_PREFIX)
-        )
-        if not await self._check_access(update, skip_stale=cdn_done_tap):
+        if not await self._check_access(update):
             return
         # D1 (DGN-515): spinner-dismiss failure must never kill the handler.
         # Telegram API blips (ConnectTimeout, QueryExpired) are non-fatal here.
@@ -5623,7 +5744,7 @@ class TelegramBot:
         # DGN-1050: the DGN-994 "authsync:restart" CTA branch is retired with
         # /authsync itself. A tap on a leftover CTA button in old chat history
         # falls through all branches below and no-ops (query already answered
-        # above; the 20-min stale gate drops most of them before that).
+        # above).
 
         # DGN-1814 r3 two-step picker: a vendor tap opens its family step; a
         # family of a vendor the bridge cannot run says so (no switch).

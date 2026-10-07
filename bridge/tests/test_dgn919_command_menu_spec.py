@@ -28,8 +28,8 @@ Locked list history:
     rewrite to consult, not as a currently-true count.
 
 Asserts that:
-  1. COMMAND_MENU_SPEC matches the explicit ordered list (11 canonical,
-     10 public after stripping the DGN-1417 estate-only /update entry).
+  1. COMMAND_MENU_SPEC matches the explicit ordered list (12 canonical,
+     11 public after stripping the DGN-1417 estate-only /update entry).
   2. _set_bot_commands builds its BotCommand list from COMMAND_MENU_SPEC (same order).
   3. The generated /help body lists the same commands in the same order.
   4. Hidden commands (start, claim, usageretry) are NOT in COMMAND_MENU_SPEC.
@@ -70,6 +70,9 @@ EXPECTED_SPEC = [
     "skills",
     "resume",
     "restart",
+    # DGN-1112: /login joins the menu after the owner approved its copy
+    # (dec-266, 2026-10-06); slotted after restart, help stays last.
+    "login",
     # health pulled off the command surface (DGN-1435, 2026-09-12) -- not
     # carried here until the rewrite re-adds it; see module docstring.
     "help",
@@ -77,7 +80,7 @@ EXPECTED_SPEC = [
 
 # The OSS mirror strips the DGN-1417 estate region, so /update never
 # ships there (DGN-1771 note: strip must still yield new, stop, usage, model,
-# btw, queue, skills, resume, restart, help).
+# btw, queue, skills, resume, restart, login, help).
 EXPECTED_SPEC_OSS_STRIPPED = [c for c in EXPECTED_SPEC if c != "update"]
 
 # authsync retired from the menu by DGN-1050 (still registered off-menu, see

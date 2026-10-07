@@ -941,6 +941,73 @@ def _strip_md_thematic_breaks(text: str) -> str:
     return "\n".join(ln for ln in lines if not _MD_THEMATIC_BREAK_RE.match(ln))
 
 
+# DGN-1889: a confirmed table whose cells carry natural language is NOT sent as
+# a <pre> grid. CJK is double-width in a monospace block, so the pipes drift
+# and the grid breaks (owner screenshot 2026-10-06 17:14, twice that day); the
+# vendor contract (vendors/telegram.md, Tables) already routes such content to
+# Tier 2, the blockquote list. The bridge enforces it here, at the one seam
+# every prose send passes: one numbered head line per data row (its first
+# cell) + one child line per remaining non-empty cell ("header: value").
+# Every cell is kept. Values-only tables (Tier 1) keep the DGN-775 <pre>.
+_MD_TABLE_CJK_RE = re.compile(r"[\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u4e00-\u9fff\uac00-\ud7a3]")
+_MD_TABLE_WORD_RE = re.compile(r"[^\W\d_]{2,}")
+# A data cell of this many words reads as a sentence, not a status token.
+_MD_TABLE_PROSE_WORDS = 3
+
+
+def _md_table_cells(row: str) -> List[str]:
+    """Split one table row into stripped cells; an escaped pipe stays text."""
+    body = row.strip()
+    if body.startswith("|"):
+        body = body[1:]
+    if body.endswith("|") and not body.endswith("\\|"):
+        body = body[:-1]
+    cells = re.split(r"(?<!\\)\|", body)
+    return [c.replace("\\|", "|").strip() for c in cells]
+
+
+def _md_table_is_prose(run: List[str]) -> bool:
+    """DGN-1889: True when a confirmed table carries natural-language cells."""
+    if any(_MD_TABLE_CJK_RE.search(ln) for ln in run):
+        return True
+    for ln in run:
+        if _MD_TABLE_SEP_RE.match(ln):
+            continue
+        for cell in _md_table_cells(ln):
+            if len([w for w in cell.split() if _MD_TABLE_WORD_RE.search(w)]) >= _MD_TABLE_PROSE_WORDS:
+                return True
+    return False
+
+
+def _md_table_to_quote_list(run: List[str]) -> List[str]:
+    """DGN-1889: render a prose table as `> ` blockquote-list lines."""
+    header: List[str] = []
+    rows: List[List[str]] = []
+    seen_sep = False
+    for ln in run:
+        if _MD_TABLE_SEP_RE.match(ln):
+            seen_sep = True
+            continue
+        if seen_sep:
+            rows.append(_md_table_cells(ln))
+        elif not header:
+            header = _md_table_cells(ln)
+        else:
+            # A second pre-separator line is not header material: treat it
+            # as data so no cell is ever dropped.
+            rows.append(_md_table_cells(ln))
+    out: List[str] = []
+    child = "  " + _BULLET_GLYPHS[0] + " "
+    for n, cells in enumerate(rows, 1):
+        out.append("> {}. {}".format(n, cells[0] if cells else ""))
+        for k, cell in enumerate(cells[1:], 1):
+            if not cell:
+                continue
+            label = header[k] if k < len(header) else ""
+            out.append("> " + child + ("{}: {}".format(label, cell) if label else cell))
+    return out
+
+
 def _wrap_md_tables(text: str) -> str:
     """DGN-775: detect markdown table blocks and wrap each one in <pre>...</pre>.
 
@@ -978,7 +1045,10 @@ def _wrap_md_tables(text: str) -> str:
                     has_sep = True
                 i += 1
             run = lines[run_start:i]
-            if has_sep:
+            if has_sep and _md_table_is_prose(run):
+                # DGN-1889: natural-language cells -> Tier 2 blockquote list.
+                out.extend(_md_table_to_quote_list(run))
+            elif has_sep:
                 # Confirmed table: join lines as a pre-formatted block.
                 # Use literal markers here; markdown_to_telegram_html will stash
                 # them via the _stash callback passed in by the caller.
