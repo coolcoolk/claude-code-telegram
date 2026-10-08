@@ -540,6 +540,77 @@ def _observe_live_model(msg: Any) -> None:
         live_model.observe(data.get("model"), live_model.state_path(config.bot_data_dir))
 
 
+# HF48 (dec-329 form 1): harness-tag next-turn leak. The model sometimes
+# keeps writing past its own answer and fabricates the NEXT turn inside its
+# text block: a "user ..." line, then a "system" line carrying a harness tag
+# (<total_tokens>N tokens left</total_tokens> or <system-reminder>). Measured
+# 5x in 30 days, 3 of them in interim text right before a tool call. Harness
+# tags never belong in persona prose, so a line carrying one outside code is
+# the cut point; the cut runs to the end of the text block.
+_HARNESS_LEAK_TAGS = ("<total_tokens>", "<system-reminder>")
+_HARNESS_LEAK_USER_RE = re.compile(r"\s*user(?![a-z])", re.IGNORECASE)
+_HARNESS_LEAK_SYSTEM_RE = re.compile(r"\s*system(?![a-z])", re.IGNORECASE)
+_FENCE_RE = re.compile(r"\s*(```|~~~)")
+
+
+def _harness_tag_outside_code(line: str) -> Optional[str]:
+    """Return the first harness tag on `line` that sits outside inline code."""
+    for tag in _HARNESS_LEAK_TAGS:
+        start = line.find(tag)
+        while start != -1:
+            if line.count("`", 0, start) % 2 == 0:
+                return tag
+            start = line.find(tag, start + 1)
+    return None
+
+
+def _harness_leak_cut(text: str) -> str:
+    """HF48: cut a fabricated next-turn block from its harness-tag line.
+
+    The cut starts at the first line (outside fenced code, outside inline
+    code) that contains a harness tag, widened backwards over an immediately
+    preceding fabricated "system" role line and "user ..." line (blank lines
+    between them are skipped), and runs to the end of the text. Unlike the
+    signature scan below, a cut may empty the text: a block that is nothing
+    but a fabricated turn has no owner content to keep. One canary WARNING
+    is logged per cut.
+    """
+    if not any(tag in text for tag in _HARNESS_LEAK_TAGS):
+        return text
+    lines = text.splitlines(keepends=True)
+    in_fence = False
+    for i, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        tag = _harness_tag_outside_code(line)
+        if tag is None:
+            continue
+        cut = i
+        j = i - 1
+        while j >= 0 and not lines[j].strip():
+            j -= 1
+        if j >= 0 and _HARNESS_LEAK_SYSTEM_RE.match(lines[j]) and len(
+            lines[j].strip()
+        ) <= len("system:"):
+            cut = j
+            j -= 1
+            while j >= 0 and not lines[j].strip():
+                j -= 1
+        if j >= 0 and _HARNESS_LEAK_USER_RE.match(lines[j]):
+            cut = j
+        kept = "".join(lines[:cut]).rstrip()
+        logger.warning(
+            "HF48 harness-leak canary: cut fabricated next-turn block "
+            "(tag=%s, line=%d, dropped %d chars, kept %d chars)",
+            tag, cut + 1, len(text) - len(kept), len(kept),
+        )
+        return kept
+    return text
+
+
 def _scaffold_guard(text: str) -> str:
     """Truncate outgoing user-facing text at the first scaffold-signature line.
 
@@ -548,8 +619,14 @@ def _scaffold_guard(text: str) -> str:
     quote the signatures set it to 0). On truncation a WARNING with the
     dropped tail length is logged. If truncation would empty the text, the
     original is returned unchanged: the guard never blanks out a message.
+    The HF48 harness-tag cut (_harness_leak_cut) runs first and is the one
+    exception: a block that is wholly a fabricated next turn comes back "".
     """
     if not BRIDGE_SCAFFOLD_GUARD or not text:
+        return text
+    # HF48: the harness-tag next-turn cut runs first (see _harness_leak_cut).
+    text = _harness_leak_cut(text)
+    if not text:
         return text
     lines = text.splitlines(keepends=True)
     for i, line in enumerate(lines):
